@@ -25,6 +25,7 @@ mod icons;
 mod island;
 mod layout;
 mod menu;
+mod morph;
 mod pins;
 mod render;
 mod safety;

@@ -114,6 +114,15 @@ pub struct IslandView {
     /// Small clock inside the collapsed pill.
     pub clock: Option<Vec<u16>>,
     pub text: D2D1_COLOR_F,
+    /// App icon inside the pill while an app goes in / comes out.
+    pub badge: Option<Badge>,
+}
+
+pub struct Badge {
+    pub icon: Icon,
+    /// Icon box in bar space (DIPs); drawn at the icon's pixel size, centered.
+    pub rect: D2D_RECT_F,
+    pub opacity: f32,
 }
 
 impl Scene<'_> {
@@ -346,7 +355,7 @@ impl Renderer {
         }
 
         let opacity = match &scene.island {
-            Some(island) => self.draw_island(&target, island),
+            Some(island) => self.draw_island(&mut target, island, dpi),
             None => 1.0,
         };
         if opacity > 0.0 {
@@ -390,7 +399,7 @@ impl Renderer {
 
     /// The island panel (pill, or the bar while morphing). Returns the opacity
     /// of the bar content to draw on top (0 while collapsed).
-    fn draw_island(&self, target: &Target, island: &IslandView) -> f32 {
+    fn draw_island(&self, target: &mut Target, island: &IslandView, dpi: f32) -> f32 {
         let rounded = D2D1_ROUNDED_RECT {
             rect: island.panel,
             radiusX: island.radius,
@@ -421,7 +430,22 @@ impl Renderer {
                     .DrawRoundedRectangle(&raw const inner, &target.brush, 1.0, None);
             }
         }
-        if let Some(clock) = &island.clock
+        if let Some(badge) = &island.badge
+            && badge.opacity > 0.0
+            && let Some(bitmap) = Self::icon_bitmap(target, &badge.icon)
+        {
+            let px = badge.icon.px as f32;
+            let rect = layout::pixel_square(&badge.rect, px, 0.0, dpi);
+            unsafe {
+                target.rt.DrawBitmap(
+                    &bitmap,
+                    Some(&raw const rect),
+                    badge.opacity,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
+        } else if let Some(clock) = &island.clock
             && island.content_opacity == 0.0
         {
             self.draw_text(

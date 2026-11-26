@@ -81,6 +81,8 @@ pub struct BarConfig {
     pub expand_delay_ms: u32,
     pub collapse_delay_ms: u32,
     pub island_show_clock: bool,
+    /// Minimizing a window pours it into the island; restoring grows it back out.
+    pub window_animation: bool,
 }
 
 impl Default for BarConfig {
@@ -99,6 +101,7 @@ impl Default for BarConfig {
             expand_delay_ms: 100,
             collapse_delay_ms: 600,
             island_show_clock: false,
+            window_animation: true,
         }
     }
 }
@@ -193,6 +196,10 @@ island_height = 8            # (DIP, 4..40)
 expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
 island_show_clock = false    # hiện giờ nhỏ trong viên
+
+# Thu nhỏ cửa sổ: cửa sổ co lại, tối dần rồi "chui" vào island (viên nảy lên, hiện icon app);
+# bấm nút trên thanh để khôi phục thì cửa sổ bung ra từ đó. false = hiệu ứng của Windows.
+window_animation = true
 
 [colors]
 # Để trống = theo theme Windows. Định dạng "#RRGGBB" hoặc "#RRGGBBAA".

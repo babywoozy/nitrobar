@@ -42,6 +42,7 @@ use crate::tasks::AppId;
 use windows::Win32::Foundation::HWND;
 
 /// A decoded icon. `id` is unique per load so the renderer can cache bitmaps.
+#[derive(Clone)]
 pub struct Icon {
     pub id: u64,
     pub bitmap: IWICBitmap,

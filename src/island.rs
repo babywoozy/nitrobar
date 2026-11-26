@@ -1,7 +1,8 @@
 //! "Island" mode: the bar collapses into a small pill and expands on hover.
 //!
-//! - `Island` is the animation state (0 = pill, 1 = full bar), advanced by a 16 ms
-//!   timer that only runs while moving: idle CPU stays at zero.
+//! - `Island` is the animation state (0 = pill, 1 = full bar), advanced once per
+//!   display frame by `morph::start_clock`, which only runs while something moves:
+//!   idle CPU stays at zero.
 //! - Geometry is in "bar space": DIPs relative to the full bar rectangle at the
 //!   screen edge. While collapsed the window shrinks to the pill (plus a small hit
 //!   margin), so it never covers clicks elsewhere and reserves no screen space.
@@ -28,6 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::config::BarConfig;
+use crate::icons::Icon;
+use crate::morph::spring;
 use crate::tasks;
 
 /// Posted by the edge sensor to the bar: wParam 1 = pointer entered, 0 = left.
@@ -37,12 +40,20 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 pub const EXPAND_DURATION: Duration = Duration::from_millis(180);
 pub const COLLAPSE_DURATION: Duration = Duration::from_millis(200);
-/// Animation frame interval (~60 fps; the system timer granularity is ~15.6 ms).
-pub const FRAME_MS: u32 = 16;
 /// Gap between the pill and the screen edge, DIPs.
 const PILL_GAP: f32 = 4.0;
 /// Extra hover area around the pill, DIPs.
 const HIT_MARGIN: f32 = 8.0;
+/// "Activity" pill shown while an app goes into / comes out of the island: grows
+/// by this much in width, to this height (DIPs), and holds for `PULSE_HOLD`.
+const ACTIVITY_EXTRA_WIDTH: f32 = 48.0;
+const ACTIVITY_HEIGHT: f32 = 34.0;
+pub const PULSE_HOLD: Duration = Duration::from_millis(1500);
+/// Springs (rad/s, damping ratio): a lively bounce out, a calmer return.
+const PULSE_OUT: (f32, f32) = (20.0, 0.42);
+const PULSE_BACK: (f32, f32) = (18.0, 0.75);
+/// Time the return spring needs to settle.
+const PULSE_SETTLE: f32 = 0.55;
 /// Minimum pill size when it shows the clock, DIPs.
 const CLOCK_PILL_WIDTH: f32 = 64.0;
 const CLOCK_PILL_HEIGHT: f32 = 20.0;
@@ -142,6 +153,46 @@ impl Island {
     }
 }
 
+/// The island "swallowing" a window (or spitting one out): the pill bounces up
+/// to the activity size with the app's icon, holds, then springs back.
+pub struct Pulse {
+    start: Instant,
+    pub icon: Option<Icon>,
+}
+
+impl Pulse {
+    pub fn new(icon: Option<Icon>, now: Instant) -> Self {
+        Self { start: now, icon }
+    }
+
+    /// 0 = plain pill, 1 = activity size (overshoots both ways while springing).
+    pub fn value(&self, now: Instant) -> f32 {
+        let t = now.saturating_duration_since(self.start).as_secs_f32();
+        let hold = PULSE_HOLD.as_secs_f32();
+        if t < hold {
+            spring(t, PULSE_OUT.0, PULSE_OUT.1)
+        } else {
+            1.0 - spring(t - hold, PULSE_BACK.0, PULSE_BACK.1)
+        }
+    }
+
+    pub fn started(&self) -> Instant {
+        self.start
+    }
+
+    pub fn done(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.start).as_secs_f32()
+            > PULSE_HOLD.as_secs_f32() + PULSE_SETTLE
+    }
+
+    /// Whether the bounce is moving (the hold in between is still).
+    pub fn moving(&self, now: Instant) -> bool {
+        let t = now.saturating_duration_since(self.start).as_secs_f32();
+        let hold = PULSE_HOLD.as_secs_f32();
+        t < PULSE_SETTLE.max(0.6) || t > hold
+    }
+}
+
 /// Island geometry in bar space (DIPs; the full bar is `0, 0, width, height`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geometry {
@@ -150,6 +201,15 @@ pub struct Geometry {
     /// Window rectangle while collapsed: the pill plus a hover margin, reaching
     /// the screen edge.
     pub hit: D2D_RECT_F,
+    /// The pill grown for an app going in / out (`Pulse`), and the window rect
+    /// that holds it with its overshoot.
+    pub activity: D2D_RECT_F,
+    pub activity_hit: D2D_RECT_F,
+}
+
+/// The pill at pulse value `v` (may overshoot past the activity size).
+pub fn pulsed_pill(g: &Geometry, v: f32) -> D2D_RECT_F {
+    lerp_rect(&g.pill, &g.activity, v)
 }
 
 pub fn geometry(width: f32, height: f32, config: &BarConfig, at_top: bool) -> Geometry {
@@ -186,7 +246,39 @@ pub fn geometry(width: f32, height: f32, config: &BarConfig, at_top: bool) -> Ge
             height
         },
     };
+    let act_w = (pill_w + ACTIVITY_EXTRA_WIDTH).min(width);
+    let act_h = ACTIVITY_HEIGHT.max(pill_h).min(height - PILL_GAP);
+    let act_left = ((width - act_w) / 2.0).round();
+    let act_top = if at_top {
+        PILL_GAP
+    } else {
+        height - PILL_GAP - act_h
+    };
+    let activity = D2D_RECT_F {
+        left: act_left,
+        top: act_top,
+        right: act_left + act_w,
+        bottom: act_top + act_h,
+    };
+    // Room for the bounce overshoot (~20% past the activity size).
+    let over_w = (act_w - pill_w) * 0.25 + HIT_MARGIN;
+    let activity_hit = D2D_RECT_F {
+        left: (activity.left - over_w).max(0.0),
+        top: if at_top {
+            0.0
+        } else {
+            (activity.top - (act_h - pill_h) * 0.25).max(0.0)
+        },
+        right: (activity.right + over_w).min(width),
+        bottom: if at_top {
+            (activity.bottom + (act_h - pill_h) * 0.25).min(height)
+        } else {
+            height
+        },
+    };
     Geometry {
+        activity,
+        activity_hit,
         bar: D2D_RECT_F {
             left: 0.0,
             top: 0.0,
@@ -401,5 +493,35 @@ mod tests {
         };
         let g = geometry(1920.0, 48.0, &clock, false);
         assert!(g.pill.bottom - g.pill.top >= CLOCK_PILL_HEIGHT);
+    }
+
+    #[test]
+    fn activity_holds_the_pill_and_its_bounce() {
+        let g = geometry(1920.0, 48.0, &BarConfig::default(), false);
+        let inside = |a: &D2D_RECT_F, b: &D2D_RECT_F| {
+            a.left >= b.left && a.top >= b.top && a.right <= b.right && a.bottom <= b.bottom
+        };
+        assert!(inside(&g.pill, &g.activity));
+        assert!(inside(&g.hit, &g.activity_hit));
+        // 20% overshoot still fits the window.
+        assert!(inside(&pulsed_pill(&g, 1.2), &g.activity_hit));
+        assert_eq!(g.activity.bottom, g.pill.bottom, "grows away from the edge");
+    }
+
+    #[test]
+    fn pulse_bounces_holds_and_returns() {
+        let t0 = Instant::now();
+        let pulse = Pulse::new(None, t0);
+        assert_eq!(pulse.value(t0), 0.0);
+        let at = |ms: u64| pulse.value(t0 + Duration::from_millis(ms));
+        let peak = (0..400).step_by(10).map(at).fold(0.0f32, f32::max);
+        assert!(peak > 1.05, "springy overshoot: {peak}");
+        assert!((at(1400) - 1.0).abs() < 0.02, "holds");
+        assert!(
+            !pulse.moving(t0 + Duration::from_millis(1000)),
+            "no frames while holding"
+        );
+        assert!(pulse.done(t0 + PULSE_HOLD + Duration::from_millis(600)));
+        assert!(at(1500 + 600).abs() < 0.05, "back to the pill");
     }
 }

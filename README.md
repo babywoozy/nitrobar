@@ -12,6 +12,11 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
   Không thu lại khi đang mở menu chuột phải, Start, Quick Settings, trung tâm thông báo hay đang kéo
   thả. App cần chú ý thì viên đổi sang màu cam. Đang chơi game / xem video toàn màn hình thì viên ẩn
   đi và chạm mép không làm thanh bung ra.
+- **Hiệu ứng thu nhỏ kiểu Dynamic Island**: bấm nút thu nhỏ (—) của bất kỳ cửa sổ nào thì cửa sổ co
+  lại, bo tròn và tối dần thành một khối đen rồi "chui" vào island; viên nảy lên như nuốt vào và hiện
+  icon app ~1,5 giây. Bấm nút app trên thanh để khôi phục thì cửa sổ bung ngược ra từ đó (khôi phục
+  bằng Alt+Tab thì chỉ có viên nảy). Chạy theo tần số màn hình (60/120/144 Hz). Tắt "Animation
+  effects" của Windows hoặc đặt `window_animation = false` thì không có hiệu ứng.
 - **Chế độ full**: thanh luôn hiện ở đáy (hoặc đỉnh), đăng ký AppBar: cửa sổ phóng to không đè lên thanh.
 - Nút Start (mở Start menu của Windows), app đang chạy gom nhóm theo ứng dụng với icon thật.
   Vạch ngắn = đang chạy, vạch dài màu nhấn = đang mở, nền cam = app cần chú ý.
@@ -78,6 +83,7 @@ island_height = 8            # (DIP, 4..40)
 expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
 island_show_clock = false    # hiện giờ nhỏ trong viên
+window_animation = true      # thu nhỏ cửa sổ "chui" vào island; false = hiệu ứng của Windows
 
 [colors]                     # để trống = theo theme Windows; "#RRGGBB" hoặc "#RRGGBBAA"
 background = ""
@@ -110,7 +116,11 @@ ghim thêm trong nitrobar. nitrobar không sửa danh sách ghim của Windows; 
 - [x] Giai đoạn 5: ghim app, menu chuột phải đầy đủ, file cấu hình TOML áp dụng trực tiếp
 - [x] Ghim theo taskbar gốc, icon nét, nền trong suốt, sửa lỗi thanh đen
 - [x] Chế độ island: viên thu gọn, bung ra khi rê chuột / chạm mép / nhấn Win, có hiệu ứng
+- [x] Hiệu ứng thu nhỏ / khôi phục cửa sổ vào island (DWM thumbnail + viên nảy)
 
 Chưa có: khay hệ thống (icon app chạy nền), xem trước cửa sổ khi hover, nhiều màn hình
 (thanh chỉ ở màn hình chính). Ở chế độ island, `background = "blur"` / `"acrylic"` chỉ còn lớp màu
-(không làm mờ), vì hiệu ứng mờ của Windows không đi theo được khung bo tròn đang co giãn.
+(không làm mờ), vì hiệu ứng mờ của Windows không đi theo được khung bo tròn đang co giãn. Hiệu ứng
+thu nhỏ: góc bo của ảnh cửa sổ hơi răng cưa (DWM không cho bo góc thumbnail, phải cắt bằng region),
+cửa sổ biến mất ~1-2 khung hình trước khi hiệu ứng bắt đầu, và khi khôi phục có thể thấy một khung
+tối lúc app vẽ lại.

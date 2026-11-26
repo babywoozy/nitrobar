@@ -13,8 +13,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
+    BeginPaint, CreateRectRgn, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT,
+    ScreenToClient, SetWindowRgn,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindCloseChangeNotification,
@@ -45,7 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE,
+    GetCursorPos, GetWindowRect, IsIconic, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE,
     PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, PM_REMOVE, PeekMessageW,
     QS_ALLINPUT, SW_HIDE, SWP_SHOWWINDOW, WM_DWMCOLORIZATIONCOLORCHANGED, WM_DWMCOMPOSITIONCHANGED,
     WM_MBUTTONUP, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED, WM_WTSSESSION_CHANGE,
@@ -55,10 +56,11 @@ use windows::core::{HSTRING, PCWSTR, Result, w};
 
 use crate::config::{self, Alignment, Background, BarMode, Config, Position, ThemeMode};
 use crate::icons::IconLoader;
-use crate::island::{self, EdgeSensor, Island};
+use crate::island::{self, EdgeSensor, Island, Pulse};
 use crate::layout::{BarLayout, Hit, Metrics};
+use crate::morph::{self, Morph};
 use crate::pins::{self, Pins};
-use crate::render::IslandView;
+use crate::render::{Badge, IslandView};
 use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
 use crate::status::{self, Status};
 use crate::tasks::AppId;
@@ -71,16 +73,28 @@ use crate::{appbar, clock, layout, menu, safety, shell, taskbar, winpins};
 const WM_APP_CONFIG: u32 = WM_APP + 5;
 /// Posted by the message loop when the native taskbar's pin list changed.
 const WM_APP_PINS: u32 = WM_APP + 6;
+/// Posted to ourselves after `HSHELL_GETMINRECT` for a window that minimized (wParam).
+const WM_APP_MINIMIZED: u32 = WM_APP + 9;
 
 const CLASS_NAME: PCWSTR = w!("NitrobarWindow");
 const TIMER_CLOCK: usize = 1;
 /// Island: hover delay before expanding, delay before collapsing, animation frames.
 const TIMER_EXPAND: usize = 2;
 const TIMER_COLLAPSE: usize = 3;
-const TIMER_ANIM: usize = 4;
+/// One-shot: the island pulse's hold ends (frames are not needed while it holds).
+const TIMER_PULSE: usize = 4;
+/// A restore we started ourselves still gets its own `HSHELL_GETMINRECT`; ignore it.
+const OWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Glass opacity of the expanded island bar with `background = "clear"` (it lies
 /// over app windows; the collapsed pill uses the lighter `palette.island`).
 const ISLAND_EXPANDED_ALPHA: f32 = 0.85;
+/// The pill while an app goes in / out: black, like the blob it swallows.
+const PULSE_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.03,
+    g: 0.03,
+    b: 0.035,
+    a: 0.96,
+};
 /// Sent once after creation to run setup inside the window procedure.
 const WM_APP_INIT: u32 = WM_APP + 2;
 /// `HSHELL_REDRAW | HSHELL_HIGHBIT`: a window is flashing for attention.
@@ -101,6 +115,8 @@ struct ShellHookInfo {
 thread_local! {
     /// The registered "SHELLHOOK" message, readable without borrowing `App`.
     static SHELL_HOOK_MSG: Cell<u32> = const { Cell::new(0) };
+    /// `[bar] window_animation`, readable without borrowing `App`.
+    static WINDOW_ANIMATION: Cell<bool> = const { Cell::new(true) };
     /// Minimize target used when `App` is busy: the island pill / the bar.
     static MIN_RECT: Cell<RECT> = const { Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }) };
 }
@@ -151,6 +167,12 @@ struct App {
     bar_rect: RECT,
     /// Where the window sits inside bar space, DIPs (non-zero for the island pill).
     origin: (f32, f32),
+    /// Island: the part of the window that takes the pointer (screen pixels).
+    hit_rect: RECT,
+    /// Minimize / restore animation overlay.
+    morph: Option<Morph>,
+    /// A window we are restoring ourselves (after the grow-out animation).
+    own_restore: Option<(HWND, Instant)>,
 }
 
 struct IslandState {
@@ -158,6 +180,8 @@ struct IslandState {
     sensor: Option<EdgeSensor>,
     /// The window is currently shrunk to the pill.
     small_window: bool,
+    /// An app went into / came out of the island: the pill bounces with its icon.
+    pulse: Option<Pulse>,
 }
 
 /// One app button: a pinned app, a running app, or a pinned app that is running.
@@ -273,6 +297,9 @@ fn run_window(options: Options) -> Result<()> {
             monitor_rect: RECT::default(),
             bar_rect: RECT::default(),
             origin: (0.0, 0.0),
+            hit_rect: RECT::default(),
+            morph: None,
+            own_restore: None,
         };
         SHELL_HOOK_MSG.set(app.msg_shell_hook);
         let cell = Box::into_raw(Box::new(RefCell::new(app)));
@@ -387,9 +414,20 @@ fn on_get_min_rect(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let Some(info) = (unsafe { (lparam.0 as *mut ShellHookInfo).as_mut() }) else {
         return LRESULT(0);
     };
-    let rc = with_app(hwnd, |app| app.min_rect(info.hwnd))
-        .flatten()
-        .unwrap_or_else(|| MIN_RECT.get());
+    let rc = match with_app(hwnd, |app| {
+        app.config
+            .bar
+            .window_animation
+            .then(|| app.on_min_rect(info.hwnd))
+    }) {
+        // Animation turned off: let Explorer answer (Windows' own animation).
+        Some(None) => return LRESULT(0),
+        Some(Some(rc)) => rc,
+        None => (WINDOW_ANIMATION.get()).then(|| MIN_RECT.get()),
+    };
+    let Some(rc) = rc else {
+        return LRESULT(0);
+    };
     if rc.right <= rc.left {
         return LRESULT(0);
     }
@@ -513,7 +551,17 @@ impl App {
                 self.begin_expand();
             }
             WM_TIMER if wparam.0 == TIMER_COLLAPSE => self.on_collapse_timer(),
-            WM_TIMER if wparam.0 == TIMER_ANIM => self.animate(),
+            WM_TIMER if wparam.0 == TIMER_PULSE => {
+                self.kill_timer(TIMER_PULSE);
+                self.start_frames();
+            }
+            morph::WM_APP_FRAME => self.on_frame(),
+            WM_APP_MINIMIZED => {
+                let target = HWND(wparam.0 as *mut _);
+                if let Some(rc) = self.min_rect(target) {
+                    self.start_minimize(target, rc);
+                }
+            }
             island::WM_APP_EDGE => {
                 // The pointer touched the screen edge (not over a fullscreen game / video).
                 let entered = wparam.0 != 0;
@@ -599,6 +647,7 @@ impl App {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.status = Some(Status::new(self.hwnd));
+        self.morph = Morph::new();
         self.pins.load_icons(&self.icons, self.icon_px, false);
         self.refresh_tasks();
         self.tick_clock();
@@ -632,15 +681,21 @@ impl App {
         // mode stays registered without a position, only to hear ABN_FULLSCREENAPP.
         appbar::unregister(self.hwnd);
         appbar::register(self.hwnd);
-        for timer in [TIMER_EXPAND, TIMER_COLLAPSE, TIMER_ANIM] {
+        for timer in [TIMER_EXPAND, TIMER_COLLAPSE, TIMER_PULSE] {
             self.kill_timer(timer);
         }
         self.island = island.then(|| IslandState {
             anim: Island::collapsed(),
             sensor: EdgeSensor::new(self.hwnd),
             small_window: true,
+            pulse: None,
         });
         self.origin = (0.0, 0.0);
+        if !island {
+            // Drop the island's window region (full mode uses the whole window).
+            self.hit_rect = RECT::default();
+            unsafe { SetWindowRgn(self.hwnd, None, true) };
+        }
     }
 
     fn apply_native_taskbar(&mut self) {
@@ -825,7 +880,15 @@ impl App {
             Some(Hit::Task(index)) => match self.items().get(index).copied() {
                 Some(BarItem {
                     group: Some(group), ..
-                }) => self.tasks.click(group),
+                }) => {
+                    let target = self.tasks.click_target(group);
+                    let animated = target.is_some_and(|hwnd| {
+                        unsafe { IsIconic(hwnd) }.as_bool() && self.start_restore(hwnd)
+                    });
+                    if !animated {
+                        self.tasks.click(group);
+                    }
+                }
                 Some(item @ BarItem { pin: Some(_), .. }) => self.launch(item),
                 _ => {}
             },
@@ -939,6 +1002,7 @@ impl App {
         }
         self.place_island();
         MIN_RECT.set(self.default_min_rect().unwrap_or_default());
+        WINDOW_ANIMATION.set(self.config.bar.window_animation);
         let icon_px = scale(self.metrics.icon_size, self.dpi) as u32;
         if icon_px != self.icon_px {
             self.icon_px = icon_px;
@@ -1163,6 +1227,10 @@ impl App {
             let _ = GetCursorPos(&raw mut pt);
             let _ = GetWindowRect(self.hwnd, &raw mut rc);
         }
+        // The island window may be larger than its hover area (window region).
+        if self.island.is_some() && self.hit_rect.right > self.hit_rect.left {
+            rc = self.hit_rect;
+        }
         pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
     }
 
@@ -1247,7 +1315,7 @@ impl App {
             state.small_window = false;
             self.place_island();
         }
-        self.set_timer(TIMER_ANIM, island::FRAME_MS);
+        self.start_frames();
         // Leave detection for an expansion not started by the pointer (Win key).
         self.track_mouse();
     }
@@ -1258,29 +1326,216 @@ impl App {
         };
         if state.anim.set_target(false, Instant::now()) {
             self.set_hover(None);
-            self.set_timer(TIMER_ANIM, island::FRAME_MS);
+            self.start_frames();
         }
     }
 
-    /// One animation frame (only runs while the island moves).
-    fn animate(&mut self) {
-        let Some(state) = &mut self.island else {
-            self.kill_timer(TIMER_ANIM);
-            return;
-        };
-        let moving = state.anim.tick(Instant::now());
-        let collapsed = state.anim.is_collapsed();
-        if collapsed {
-            state.small_window = true;
-        }
-        if !moving {
-            self.kill_timer(TIMER_ANIM);
-            if collapsed {
+    fn start_frames(&self) {
+        morph::start_clock(self.hwnd);
+    }
+
+    /// One display frame while anything moves: island expand / collapse, the
+    /// pulse, the minimize / restore overlay. Stops the frame clock when all rest.
+    fn on_frame(&mut self) {
+        morph::frame_handled();
+        let now = Instant::now();
+        let mut running = false;
+        let mut repaint = false;
+
+        if let Some(state) = &mut self.island
+            && state.anim.animating()
+        {
+            let moving = state.anim.tick(now);
+            if state.anim.is_collapsed() {
+                state.small_window = true;
+            }
+            if moving {
+                running = true;
+                repaint = true;
+            } else if state.small_window {
+                // Fully collapsed: shrink the window back (paints too).
                 self.place_island();
-                return;
+            } else {
+                repaint = true;
             }
         }
-        self.invalidate();
+
+        if let Some(state) = &mut self.island
+            && let Some(pulse) = &state.pulse
+        {
+            if pulse.done(now) {
+                state.pulse = None;
+                if state.small_window {
+                    self.place_island();
+                }
+            } else {
+                repaint = true;
+                if pulse.moving(now) {
+                    running = true;
+                } else {
+                    // Holding still: sleep until the return bounce.
+                    let hold_end = island::PULSE_HOLD
+                        .saturating_sub(now.saturating_duration_since(pulse.started()));
+                    self.set_timer(TIMER_PULSE, hold_end.as_millis() as u32);
+                }
+            }
+        }
+
+        if let Some(morph) = &mut self.morph {
+            let tick = morph.tick(now);
+            running |= tick.running;
+            if tick.swallowed
+                && let Some((target, _)) = morph.target()
+            {
+                self.start_pulse(target);
+                running = true;
+            }
+            if let Some(hwnd) = tick.show {
+                tasks::activate(hwnd);
+            }
+        }
+
+        if repaint {
+            self.paint();
+        }
+        if !running {
+            morph::stop_clock();
+        }
+    }
+
+    /// `HSHELL_GETMINRECT` for `target`: answer with the island / button rect and
+    /// start our animation. Windows asks *after* switching the state: a window
+    /// that is minimizing is already iconic, a restoring one no longer is.
+    fn on_min_rect(&mut self, target: HWND) -> Option<RECT> {
+        let rc = self.min_rect(target)?;
+        if unsafe { IsIconic(target) }.as_bool() {
+            // Start after answering, once Windows has hidden the window (showing
+            // the overlay while it minimizes makes Windows' own minimize visible).
+            unsafe {
+                let _ = PostMessageW(
+                    Some(self.hwnd),
+                    WM_APP_MINIMIZED,
+                    WPARAM(target.0 as usize),
+                    LPARAM(0),
+                );
+            }
+        } else {
+            // Restoring. Ours already animated; others just make the island bounce.
+            let own = self
+                .own_restore
+                .is_some_and(|(h, at)| h == target && at.elapsed() < OWN_RESTORE_GRACE);
+            if !own {
+                self.start_pulse(target);
+            }
+        }
+        Some(rc)
+    }
+
+    /// Work area and DPI of the monitor `hwnd` is (or restores) on.
+    fn window_monitor(hwnd: HWND) -> Option<(RECT, u32)> {
+        unsafe {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &raw mut info).as_bool() {
+                return None;
+            }
+            let (mut x, mut y) = (96, 96);
+            let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut x, &raw mut y);
+            Some((info.rcWork, x))
+        }
+    }
+
+    /// `target` was just minimized: pour its picture into the island / its button.
+    fn start_minimize(&mut self, target: HWND, to: RECT) {
+        if self.fullscreen() || !morph::system_allows() {
+            return;
+        }
+        let Some((work, dpi)) = Self::window_monitor(target) else {
+            return;
+        };
+        let Some((frame, source)) = morph::restored_frame(target, &work, dpi) else {
+            return;
+        };
+        if frame.right <= frame.left || frame.bottom <= frame.top {
+            return;
+        }
+        let Some(morph) = &mut self.morph else {
+            return;
+        };
+        if morph.start(
+            morph::Kind::Minimize,
+            target,
+            frame,
+            source,
+            to,
+            self.hwnd,
+            self.dpi,
+        ) {
+            self.start_frames();
+        }
+    }
+
+    /// Grows `hwnd` (minimized) out of the island / its button, then restores it.
+    fn start_restore(&mut self, hwnd: HWND) -> bool {
+        if !self.config.bar.window_animation || self.fullscreen() || !morph::system_allows() {
+            return false;
+        }
+        let Some(from) = self.min_rect(hwnd) else {
+            return false;
+        };
+        let Some((work, dpi)) = Self::window_monitor(hwnd) else {
+            return false;
+        };
+        let Some((frame, source)) = morph::restored_frame(hwnd, &work, dpi) else {
+            return false;
+        };
+        let Some(morph) = &mut self.morph else {
+            return false;
+        };
+        if !morph.start(
+            morph::Kind::Restore,
+            hwnd,
+            frame,
+            source,
+            from,
+            self.hwnd,
+            self.dpi,
+        ) {
+            return false;
+        }
+        self.own_restore = Some((hwnd, Instant::now()));
+        self.start_pulse(hwnd);
+        self.start_frames();
+        true
+    }
+
+    /// The island bounces with `target`'s app icon (only while it is a pill).
+    fn start_pulse(&mut self, target: HWND) {
+        if self.fullscreen() {
+            return;
+        }
+        let icon = self
+            .tasks
+            .groups
+            .iter()
+            .find(|g| g.contains(target))
+            .and_then(|g| g.icon.clone());
+        let Some(state) = &mut self.island else {
+            return;
+        };
+        if state.anim.expanded() {
+            return;
+        }
+        state.pulse = Some(Pulse::new(icon, Instant::now()));
+        let small = state.small_window;
+        self.kill_timer(TIMER_PULSE);
+        if small {
+            self.place_island();
+        }
+        self.start_frames();
     }
 
     /// Sizes / shows the island window for its state: the pill area when collapsed,
@@ -1291,20 +1546,34 @@ impl App {
             return;
         };
         let small = state.small_window;
+        let pulsing = state.pulse.is_some();
         let hidden = self.fullscreen_app || self.foreground_fullscreen;
         let geometry = self.island_geometry();
         let bar = self.bar_rect;
         let to_px = |dip: f32| scale(dip, self.dpi);
+        let to_screen = |r: &D2D_RECT_F| RECT {
+            left: bar.left + to_px(r.left),
+            top: bar.top + to_px(r.top),
+            right: bar.left + to_px(r.right),
+            bottom: bar.top + to_px(r.bottom),
+        };
+        // Collapsed, the window always has room for the pulse; a window region
+        // limits it to the pill's hover area otherwise. Changing the region keeps
+        // the drawn surface in place (resizing / moving the window shows the old
+        // frame at the new position for a frame).
         let rc = if small {
-            RECT {
-                left: bar.left + to_px(geometry.hit.left),
-                top: bar.top + to_px(geometry.hit.top),
-                right: bar.left + to_px(geometry.hit.right),
-                bottom: bar.top + to_px(geometry.hit.bottom),
-            }
+            to_screen(&geometry.activity_hit)
         } else {
             bar
         };
+        let hit = if !small {
+            bar
+        } else if pulsing {
+            rc
+        } else {
+            to_screen(&geometry.hit)
+        };
+        self.hit_rect = hit;
         let px_to_dip = 96.0 / self.dpi as f32;
         self.origin = (
             (rc.left - bar.left) as f32 * px_to_dip,
@@ -1318,27 +1587,49 @@ impl App {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 return;
             }
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOPMOST),
-                rc.left,
-                rc.top,
-                rc.right - rc.left,
-                rc.bottom - rc.top,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
+            let mut current = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &raw mut current);
+            let resize = current != rc;
+            if resize {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    rc.left,
+                    rc.top,
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+            let region = (hit != rc).then(|| {
+                CreateRectRgn(
+                    hit.left - rc.left,
+                    hit.top - rc.top,
+                    hit.right - rc.left,
+                    hit.bottom - rc.top,
+                )
+            });
+            // The system owns the region from here on.
+            SetWindowRgn(self.hwnd, region, true);
+            if !resize {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            }
         }
         self.paint();
     }
 
     fn on_fullscreen_changed(&mut self) {
         if self.fullscreen_app || self.foreground_fullscreen {
-            for timer in [TIMER_EXPAND, TIMER_COLLAPSE, TIMER_ANIM] {
+            for timer in [TIMER_EXPAND, TIMER_COLLAPSE, TIMER_PULSE] {
                 self.kill_timer(timer);
             }
             if let Some(state) = &mut self.island {
                 state.anim = Island::collapsed();
                 state.small_window = true;
+                state.pulse = None;
+            }
+            if let Some(morph) = &mut self.morph {
+                morph.finish();
             }
         }
         self.place_island();
@@ -1398,13 +1689,26 @@ impl App {
             full = palette.island;
             full.a = ISLAND_EXPANDED_ALPHA;
         }
+        // An app going in / out: the pill grows (with spring overshoot), turns
+        // black like the blob that slid into it, and shows the app's icon.
+        let now = Instant::now();
+        let pulse = state.pulse.as_ref().map_or(0.0, |p| p.value(now));
+        let deep = pulse.clamp(0.0, 1.0);
+        let pill_rect = island::pulsed_pill(&g, pulse);
+        pill = D2D1_COLOR_F {
+            r: island::lerp(pill.r, PULSE_FILL.r, deep),
+            g: island::lerp(pill.g, PULSE_FILL.g, deep),
+            b: island::lerp(pill.b, PULSE_FILL.b, deep),
+            a: island::lerp(pill.a, PULSE_FILL.a, deep),
+        };
         let mix = |a: f32, b: f32| island::lerp(a, b, t);
-        let pill_radius = (g.pill.bottom - g.pill.top) / 2.0;
+        let pill_radius = (pill_rect.bottom - pill_rect.top) / 2.0;
         let mut border = palette.island_border;
+        border.a *= 1.0 - deep;
         // The hairline stays (fainter) on the expanded bar as its edge toward the windows.
         border.a *= if attention { 0.0 } else { 1.0 - 0.5 * t };
         Some(IslandView {
-            panel: island::lerp_rect(&g.pill, &g.bar, t),
+            panel: island::lerp_rect(&pill_rect, &g.bar, t),
             radius: mix(pill_radius, 0.0),
             fill: D2D1_COLOR_F {
                 r: mix(pill.r, full.r),
@@ -1421,6 +1725,15 @@ impl App {
                 .island_show_clock
                 .then(|| clock.time.clone()),
             text: palette.text,
+            badge: state
+                .pulse
+                .as_ref()
+                .and_then(|p| p.icon.clone())
+                .map(|icon| Badge {
+                    icon,
+                    rect: layout::centered_square(&pill_rect, self.metrics.icon_size, 0.0),
+                    opacity: ((pulse - 0.45) / 0.45).clamp(0.0, 1.0) * (1.0 - 3.0 * t).max(0.0),
+                }),
         })
     }
 
@@ -1430,6 +1743,8 @@ impl App {
         }
         self.cleaned_up = true;
         tasks::remove_hooks();
+        morph::stop_clock();
+        self.morph = None;
         self.island = None;
         if let Some(mut status) = self.status.take() {
             status.shutdown();

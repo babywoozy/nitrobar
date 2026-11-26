@@ -278,7 +278,7 @@ pub fn app_id_for(hwnd: HWND) -> AppId {
     AppId { aumid, exe }
 }
 
-fn activate(hwnd: HWND) {
+pub fn activate(hwnd: HWND) {
     unsafe {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindowAsync(hwnd, SW_RESTORE);
@@ -389,6 +389,18 @@ impl TaskList {
 
     pub fn group_index(&self, key: &str) -> Option<usize> {
         self.groups.iter().position(|g| g.key == key)
+    }
+
+    /// The window a click on group `index` would bring up (`None`: it would minimize).
+    pub fn click_target(&self, index: usize) -> Option<HWND> {
+        let group = self.groups.get(index)?;
+        let foreground = unsafe { GetForegroundWindow() };
+        match group.windows.iter().position(|&h| h == foreground) {
+            Some(_) if group.windows.len() == 1 => None,
+            Some(pos) => Some(group.windows[(pos + 1) % group.windows.len()]),
+            None if group.contains(group.last_active) => Some(group.last_active),
+            None => group.windows.first().copied(),
+        }
     }
 
     /// Taskbar click: focus the app, minimize it if already focused, cycle if it has several windows.

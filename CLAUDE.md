@@ -18,7 +18,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.5 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB); chống thanh đen 12.6 MB; island 8.6 MB thu gọn / ~14.5 MB sau khi bung, exe 589 KB.
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.5 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB); chống thanh đen 12.6 MB; island 8.6 MB thu gọn / ~14.5 MB sau khi bung, exe 589 KB; hiệu ứng thu nhỏ 9.0 MB (sau thu nhỏ + khôi phục), ~14.7 MB sau nhiều lần bung, exe 603 KB.
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -58,7 +58,9 @@ src/
   config.rs   %APPDATA%\nitrobar\config.toml: parse + clamp, file mặc định có chú thích, màu
   pins.rs     danh sách ghim = ghim của Windows + pins.toml ([[pin]] thêm, [[hide]] bỏ), mở app
   winpins.rs  đọc ghim của taskbar gốc (blob Taskband\Favorites -> PIDL), theo dõi registry
-  island.rs   chế độ island: hiệu ứng (ease-out), hình học viên, cửa sổ cảm biến mép, flyout, fullscreen
+  island.rs   chế độ island: hiệu ứng (ease-out), hình học viên + "activity" (Pulse), cảm biến mép,
+              flyout, fullscreen
+  morph.rs    hiệu ứng thu nhỏ / khôi phục: overlay + DWM thumbnail, đồng hồ khung hình (DwmFlush)
 ```
 
 ### Cấu hình và ghim (config.rs, pins.rs)
@@ -173,15 +175,23 @@ src/
 - `[bar] mode = "island"` (mặc định) | `"full"`. Island = KHÔNG đặt vị trí AppBar (chỉ `ABM_NEW`,
   để vẫn nhận `ABN_FULLSCREENAPP`); đổi mode thì `ABM_REMOVE` + `ABM_NEW` để nhả chỗ đã giữ.
   Island ngầm ẩn taskbar gốc (`wants_native_hidden`), nếu không cửa sổ phóng to không tràn xuống đáy.
-- Không gian vẽ = "bar space" (DIP của cả dải thanh). Khi thu gọn, cửa sổ chỉ còn vùng viên +
-  lề hover (`Geometry::hit`), nên không chặn click chỗ khác; `App::origin` là độ lệch của cửa sổ
-  trong bar space, renderer `SetTransform(-origin)`, `hit_at` cộng origin. Lúc bung / đang co cửa
-  sổ là cả dải; về hẳn trạng thái thu gọn mới thu cửa sổ lại. Đổi kích thước xong gọi `paint()`
-  ngay (không để DWM hiện khung cũ / đen). KHÔNG `UpdateWindow` trong lúc đang mượn `App`.
+- Không gian vẽ = "bar space" (DIP của cả dải thanh). Khi thu gọn, cửa sổ = `Geometry::activity_hit`
+  (đủ chỗ cho viên phồng khi nảy) nhưng có window region = `Geometry::hit` (viên + lề hover), nên
+  không chặn click chỗ khác; lúc nảy thì bỏ giới hạn region. Đổi region KHÔNG dời hình đã vẽ; đổi
+  kích thước / vị trí cửa sổ thì DWM hiện khung cũ ở vị trí mới trong 1 frame (viên nhảy lên trên,
+  đã thấy) => tránh resize khi chỉ cần đổi vùng nhận chuột. `App::hit_rect` = vùng đó (cho
+  `cursor_inside`). `App::origin` là độ lệch của cửa sổ trong bar space, renderer
+  `SetTransform(-origin)`, `hit_at` cộng origin. Lúc bung / đang co cửa sổ là cả dải; về hẳn trạng
+  thái thu gọn mới thu cửa sổ lại. Đổi kích thước xong gọi `paint()` ngay. KHÔNG `UpdateWindow` trong
+  lúc đang mượn `App`. Về mode full thì `SetWindowRgn(None)`.
 - Phát hiện chạm mép: `EdgeSensor` = cửa sổ layered alpha 1/255 cao 1 px dọc mép (alpha 0 thì không
   được hit-test), chỉ hiện khi thu gọn; post `WM_APP_EDGE`. Không quét chuột: chỉ `WM_MOUSEMOVE`,
-  `TrackMouseEvent(TME_LEAVE)` và 3 timer: `TIMER_EXPAND` (trễ bung), `TIMER_COLLAPSE` (trễ thu; nếu
-  bị chặn thì hẹn lại, chỉ khi đang mở và bị chặn), `TIMER_ANIM` 16 ms chỉ chạy khi đang chuyển động.
+  `TrackMouseEvent(TME_LEAVE)` và timer one-shot: `TIMER_EXPAND` (trễ bung), `TIMER_COLLAPSE` (trễ thu;
+  nếu bị chặn thì hẹn lại, chỉ khi đang mở và bị chặn), `TIMER_PULSE` (hết lúc viên giữ yên).
+- Khung hình: `morph::start_clock` = thread `nitrobar-frames` gọi `DwmFlush` (chờ lần compose kế
+  tiếp = theo tần số màn hình, 60/120/144 Hz) rồi post `WM_APP_FRAME` (tối đa 1 message đang chờ).
+  Dùng chung cho bung/thu, viên nảy, overlay thu nhỏ; `on_frame` dừng thread khi mọi thứ đứng yên.
+  `DwmFlush` có thể trả về ngay khi DWM không có gì để vẽ => ngủ 4 ms nếu < 3 ms (không quay CPU).
 - Bung ra không do chuột (phím Win) thì gọi `track_mouse()` ngay: con trỏ không ở trên thanh =>
   `WM_MOUSELEAVE` lập tức => hẹn thu lại. Hết giờ thu mà con trỏ đã quay lại (chưa có
   `WM_MOUSEMOVE`) thì chỉ track lại, không thu.
@@ -201,6 +211,10 @@ src/
   (thanh đè lên cửa sổ app, trong suốt hẳn thì chữ lẫn vào nội dung bên dưới).
 - Đo: thu gọn 8.6 MB, sau nhiều lần bung/thu ~14.5 MB; CPU 0 khi đứng yên; ~57 ms CPU cho mỗi lần
   chuyển động ~180 ms (software render cả dải 60 fps).
+- "Activity" (`Pulse`): app vào / ra island => viên phồng tới `Geometry::activity` (+48 DIP rộng, cao
+  34 DIP, giữ mép dưới) bằng lò xo (`morph::spring`, vượt ~20%), đổi màu đen (`PULSE_FILL`), hiện icon
+  app (`render::Badge`, vẽ đúng cỡ pixel), giữ `PULSE_HOLD` 1.5 s (không vẽ frame nào, chỉ
+  `TIMER_PULSE`), rồi lò xo về. Chỉ khi đang là viên (bung ra thì không).
 
 ### Hiệu ứng thu nhỏ / khôi phục cửa sổ
 
@@ -210,7 +224,32 @@ src/
 - Đã đo trên Win11 26300: cửa sổ shell hook nào trả lời trước thì thắng; nitrobar trả lời =>
   Explorer không được hỏi và Windows KHÔNG chạy hiệu ứng nào (cửa sổ biến mất / hiện ra ngay), dù
   rect ở đâu, to hay nhỏ. Không thể bắt hiệu ứng gốc bay vào island; bỏ qua (trả 0) thì hiệu ứng
-  gốc bay về nút của taskbar gốc đang ẩn.
+  gốc bay về nút của taskbar gốc đang ẩn. Hệ quả tốt: KHÔNG cần tắt "Animate windows when minimizing"
+  (không đụng cài đặt hệ thống). `[bar] window_animation = false` => không trả lời (hiệu ứng gốc).
+- Windows hỏi SAU khi đổi trạng thái: thu nhỏ => `IsIconic` đã true; khôi phục => đã false.
+- Thu nhỏ (`morph.rs`): KHÔNG làm gì nặng trong `GETMINRECT`: có DWM thumbnail của cửa sổ trong lúc nó
+  đang thu nhỏ (kể cả chỉ `DwmRegisterThumbnail`) thì hiệu ứng gốc LẠI HIỆN (một bóng cửa sổ bay
+  trước overlay, đã tái hiện). => post `WM_APP_MINIMIZED`, đăng ký thumbnail sau khi cửa sổ đã ẩn.
+  Thumbnail của cửa sổ đã thu nhỏ vẫn có nội dung (khung cuối). Giá: cửa sổ biến mất ~1-2 frame
+  (17-33 ms, đo bằng GetPixel) trước khi overlay hiện.
+- Rect cửa sổ: `GetWindowPlacement` (toạ độ workspace = cộng góc work area của màn hình đó; trừ viền
+  resize vô hình `SM_CXSIZEFRAME + SM_CXPADDEDBORDER`; `WPF_RESTORETOMAXIMIZED` => work area).
+- Overlay `Morph`: cửa sổ layered, click xuyên qua, nền đen (class brush), cố định bằng hợp của
+  đường đi; mỗi frame chỉ đổi region bo tròn (`CreateRoundRectRgn`, clip cả thumbnail => bo góc được,
+  nhưng răng cưa), rect / opacity của thumbnail (mờ dần trên nền đen = tối dần), alpha cả cửa sổ.
+  Nằm ngay dưới cửa sổ thanh (khối đen trượt xuống dưới viên). Ease in-out 400 ms; tới 78% thì viên
+  bắt đầu nảy ("nuốt"). Giữ tỉ lệ ảnh trong khối.
+- Khôi phục có hiệu ứng chỉ khi bấm nút trên thanh (`tasks::click_target` là cửa sổ đang thu nhỏ):
+  overlay bung từ viên / nút (ease-out 380 ms), XONG mới `tasks::activate`. App cần ~50-250 ms để vẽ
+  lại sau khi khôi phục; trong lúc đó cả cửa sổ lẫn thumbnail của nó trống (đo bằng GetPixel: 1 frame
+  đen rồi trong suốt). Ẩn overlay ngay => lộ màn hình phía sau; giữ nguyên => lộ nền đen. Nên overlay
+  mờ dần 160 ms (`LINGER_FADE`), ở lại ít nhất tới khi cửa sổ hết iconic, tối đa 700 ms. Còn 1 frame
+  tối không tránh được. Không ẩn được cửa sổ của process khác trong lúc nó hiện ra (cloak chỉ
+  cho cửa sổ của mình, layered thì có thể làm hỏng app DirectX) => khôi phục từ nơi khác (Alt+Tab,
+  app tự mở) chỉ có viên nảy. `own_restore` bỏ qua `GETMINRECT` của lần khôi phục do mình làm.
+- Tôn trọng cài đặt Windows: `SPI_GETANIMATION` (iMinAnimate) / `SPI_GETCLIENTAREAANIMATION` tắt => không
+  có overlay. Không hiệu ứng khi có app toàn màn hình.
+- Đo: hiệu ứng thu nhỏ + khôi phục (kèm 2 lần nảy) ~60-80 ms CPU; đứng yên 0 ms/5 s.
 
 ## Bất biến an toàn: taskbar gốc PHẢI hiện lại
 
