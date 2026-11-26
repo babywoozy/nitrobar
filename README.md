@@ -8,6 +8,8 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
 - Thanh ở đáy (hoặc đỉnh) màn hình, đăng ký AppBar: cửa sổ phóng to không đè lên thanh.
 - Nút Start (mở Start menu của Windows), app đang chạy gom nhóm theo ứng dụng với icon thật.
   Vạch ngắn = đang chạy, vạch dài màu nhấn = đang mở, nền cam = app cần chú ý.
+- Icon nét như taskbar gốc: lấy đúng cỡ pixel theo DPI, giữ kênh alpha (viền mượt), không phóng to
+  icon nhỏ; app Store lấy logo từ package.
 - Bấm app để chuyển tới / thu nhỏ; app nhiều cửa sổ thì bấm để xoay vòng; chuột giữa mở thêm cửa sổ mới.
 - App ghim lấy thẳng từ taskbar gốc của Windows, đúng thứ tự (cả app Store), tự cập nhật khi
   bạn ghim / bỏ ghim trên taskbar gốc. App ghim chưa chạy hiện icon không vạch, bấm để mở;

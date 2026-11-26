@@ -170,6 +170,22 @@ pub fn centered_square(rect: &D2D_RECT_F, size: f32, y_offset: f32) -> D2D_RECT_
     }
 }
 
+/// Square of exactly `size_px` device pixels centered in `rect` (DIPs), with its
+/// edges on whole pixels so a bitmap of that size is drawn 1:1, without blur.
+pub fn pixel_square(rect: &D2D_RECT_F, size_px: f32, y_offset: f32, dpi: f32) -> D2D_RECT_F {
+    let scale = dpi / 96.0;
+    let cx = (rect.left + rect.right) / 2.0 * scale;
+    let cy = ((rect.top + rect.bottom) / 2.0 + y_offset) * scale;
+    let left = (cx - size_px / 2.0).round();
+    let top = (cy - size_px / 2.0).round();
+    D2D_RECT_F {
+        left: left / scale,
+        top: top / scale,
+        right: (left + size_px) / scale,
+        bottom: (top + size_px) / scale,
+    }
+}
+
 /// The small pill on the screen-edge side of a button.
 pub fn indicator(rect: &D2D_RECT_F, width: f32, at_top: bool) -> D2D_RECT_F {
     let left = (rect.left + rect.right - width) / 2.0;
@@ -215,6 +231,24 @@ mod tests {
         let layout = BarLayout::new(600.0, 100, 130.0, &m);
         let last = layout.tasks.last().unwrap();
         assert!(last.right <= layout.status.left);
+    }
+
+    #[test]
+    fn icons_land_on_whole_pixels() {
+        let m = Metrics::default();
+        let layout = BarLayout::new(1536.0, 5, 130.0, &m);
+        for dpi in [96.0_f32, 120.0, 144.0, 168.0] {
+            let scale = dpi / 96.0;
+            let px = (m.icon_size * scale).round();
+            for rect in &layout.tasks {
+                let icon = pixel_square(rect, px, -1.0, dpi);
+                for edge in [icon.left, icon.top, icon.right, icon.bottom] {
+                    let device = edge * scale;
+                    assert!((device - device.round()).abs() < 1e-3, "{dpi}: {device}");
+                }
+                assert!(((icon.right - icon.left) * scale - px).abs() < 1e-3);
+            }
+        }
     }
 
     #[test]

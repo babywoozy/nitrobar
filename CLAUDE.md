@@ -18,7 +18,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell).
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB.
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -47,7 +47,7 @@ src/
   clock.rs    chuỗi giờ / ngày theo locale người dùng
   layout.rs   hình học (DIP) dùng chung cho vẽ và hit-test
   tasks.rs    danh sách cửa sổ, gom nhóm theo AppId, WinEvent hook, click/minimize
-  icons.rs    icon thật -> IWICBitmap (AUMID/AppsFolder, WM_GETICON, icon file exe)
+  icons.rs    icon thật -> IWICBitmap PBGRA đúng cỡ pixel (AUMID, relaunch icon, exe, WM_GETICON)
   menu.rs     menu chuột phải (TrackPopupMenu, chạy NGOÀI borrow của App)
   theme.rs    sáng/tối + màu accent từ registry, Palette, nền acrylic (DWM), menu tối
   shell.rs    mở UI của Windows bằng phím tắt giả lập (Start = Win, Quick Settings = Win+A,
@@ -125,6 +125,16 @@ src/
   `WM_APP_REFRESH`). Refresh = EnumWindows + diff, chỉ vẽ lại khi chữ ký thay đổi.
 - Bấm: app đang focus + 1 cửa sổ -> thu nhỏ; nhiều cửa sổ -> xoay vòng; khác -> kích hoạt
   cửa sổ dùng gần nhất. Dùng `ShowWindowAsync` cho cửa sổ của process khác (không treo nếu app treo).
+- Icon (icons.rs), thứ tự: AUMID -> `shell:AppsFolder` (logo package) -> `RelaunchIconResource` của
+  cửa sổ (Chrome: icon profile có huy hiệu) -> icon của exe đúng cỡ pixel (resource 24/32/48 vẽ
+  tay, nét hơn thu nhỏ icon 32 của cửa sổ) -> icon cửa sổ (`WM_GETICON`, cho exe "host" như java,
+  python, rundll32).
+- HBITMAP của `IShellItemImageFactory::GetImage` thường là alpha THẲNG (không premultiplied), đôi khi
+  premultiplied, icon cũ thì alpha toàn 0: `classify_alpha` xem pixel (màu > alpha => thẳng). Coi
+  nhầm alpha thẳng là premultiplied => góc trong suốt sáng lên thành viền rỗ.
+- Không phóng to icon nhỏ (`Icon::px` <= cỡ yêu cầu, vẽ đúng cỡ đó). Vẽ icon bằng
+  `layout::pixel_square`: cạnh rơi đúng pixel thiết bị ở mọi DPI => bitmap chép 1:1, không nhoè.
+  So độ nét: chụp màn hình phóng to 4x nearest-neighbor cạnh taskbar gốc.
 - `WM_GETICON` gửi bằng `SendMessageTimeoutW(SMTO_ABORTIFHUNG | SMTO_BLOCK)`: không treo vì app
   treo, và không nhận message re-entrant trong lúc chờ.
 

@@ -274,7 +274,7 @@ impl Renderer {
         );
         let mut used = Vec::with_capacity(scene.buttons.len());
         for button in &scene.buttons {
-            Self::draw_button(&mut target, palette, &scene.metrics, button, &mut used);
+            Self::draw_button(&mut target, palette, &scene.metrics, dpi, button, &mut used);
         }
         target.bitmaps.retain(|id, _| used.contains(id));
         self.draw_status(&target, scene);
@@ -383,6 +383,7 @@ impl Renderer {
         target: &mut Target,
         palette: &Palette,
         metrics: &Metrics,
+        dpi: f32,
         button: &ButtonView,
         used: &mut Vec<u64>,
     ) {
@@ -406,7 +407,13 @@ impl Renderer {
         };
         // Nudge the icon away from the indicator side.
         let nudge = if metrics.at_top { 1.0 } else { -1.0 };
-        let icon_rect = layout::centered_square(&rect, icon_size, nudge);
+        // Icons are drawn at their own pixel size (never enlarged), on whole pixels:
+        // 1:1 copies stay sharp at every DPI.
+        let wanted_px = (icon_size * dpi / 96.0).round();
+        let icon_px = button
+            .icon
+            .map_or(wanted_px, |icon| wanted_px.min(icon.px as f32));
+        let icon_rect = layout::pixel_square(&rect, icon_px, nudge, dpi);
         let bitmap = button.icon.and_then(|icon| {
             used.push(icon.id);
             Self::icon_bitmap(target, icon)
