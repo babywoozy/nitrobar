@@ -54,10 +54,12 @@ use crate::tasks::AppId;
 use crate::tasks::{self, TaskList};
 use crate::theme::Palette;
 use crate::theme::{self, Theme};
-use crate::{appbar, clock, layout, menu, safety, shell, taskbar};
+use crate::{appbar, clock, layout, menu, safety, shell, taskbar, winpins};
 
 /// Posted by the message loop when a file in the config directory changed.
 const WM_APP_CONFIG: u32 = WM_APP + 5;
+/// Posted by the message loop when the native taskbar's pin list changed.
+const WM_APP_PINS: u32 = WM_APP + 6;
 
 const CLASS_NAME: PCWSTR = w!("NitrobarWindow");
 const TIMER_CLOCK: usize = 1;
@@ -233,17 +235,30 @@ fn watch_config_dir() -> Option<HANDLE> {
     .ok()
 }
 
-/// A normal message loop that also wakes up when the config directory changes.
+/// A normal message loop that also wakes up when the config directory or the
+/// native taskbar's pin list changes.
 fn message_loop(hwnd: HWND) {
     let watch = watch_config_dir();
-    let handles: Vec<HANDLE> = watch.into_iter().collect();
+    let pin_watch = winpins::Watcher::new();
+    // (handle, message posted when it is signaled)
+    let watched: Vec<(HANDLE, u32)> = watch
+        .map(|h| (h, WM_APP_CONFIG))
+        .into_iter()
+        .chain(pin_watch.as_ref().map(|w| (w.event, WM_APP_PINS)))
+        .collect();
+    let handles: Vec<HANDLE> = watched.iter().map(|(h, _)| *h).collect();
     let mut msg = MSG::default();
     unsafe {
         'outer: loop {
             let wait = MsgWaitForMultipleObjects(Some(&handles), false, INFINITE, QS_ALLINPUT);
-            if !handles.is_empty() && wait == WAIT_OBJECT_0 {
-                let _ = FindNextChangeNotification(handles[0]);
-                let _ = PostMessageW(Some(hwnd), WM_APP_CONFIG, WPARAM(0), LPARAM(0));
+            let index = wait.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+            if let Some(&(handle, message)) = watched.get(index) {
+                if message == WM_APP_CONFIG {
+                    let _ = FindNextChangeNotification(handle);
+                } else if let Some(w) = &pin_watch {
+                    w.rearm();
+                }
+                let _ = PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0));
             }
             while PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
@@ -306,20 +321,19 @@ fn show_context_menu(hwnd: HWND, lparam: LPARAM) {
         let _ = ScreenToClient(hwnd, &raw mut client);
         let _ = GetWindowRect(hwnd, &raw mut bar);
     }
-    // (key, app) of the right-clicked app button, plus the menu description.
+    // The right-clicked app button, plus the menu description. Lists may change
+    // while the menu is open, so the command re-finds the app by identity.
     let Some((target, ctx)) = with_app(hwnd, |app| {
-        let target = match app.hit_at(client.x, client.y) {
-            Some(Hit::Task(i)) => app.items().get(i).map(|item| app.item_app(*item)),
+        let item = match app.hit_at(client.x, client.y) {
+            Some(Hit::Task(i)) => app.items().get(i).copied(),
             _ => None,
         };
+        let target = item.map(|item| app.item_app(item));
         let ctx = menu::MenuContext {
             on_app: target.is_some(),
-            pinned: target
-                .as_ref()
-                .is_some_and(|(key, _)| app.pins.contains(key)),
-            window_count: target
-                .as_ref()
-                .and_then(|(key, _)| app.tasks.group_index(key))
+            pinned: item.is_some_and(|item| item.pin.is_some()),
+            window_count: item
+                .and_then(|item| item.group)
                 .map_or(0, |g| app.tasks.groups[g].windows.len()),
             config_error: app.config_error.clone(),
             at_top: app.metrics.at_top,
@@ -366,6 +380,12 @@ impl App {
         match msg {
             WM_APP_INIT => self.init(),
             WM_APP_CONFIG => self.reload_config(),
+            WM_APP_PINS => {
+                if self.pins.reload_native() {
+                    self.pins.load_icons(&self.icons, self.icon_px, false);
+                    self.invalidate();
+                }
+            }
             tasks::WM_APP_REFRESH => self.refresh_tasks(),
             status::WM_APP_STATUS => self.refresh_status(),
             WM_POWERBROADCAST => {
@@ -423,7 +443,7 @@ impl App {
                 if let Some(Hit::Task(i)) = self.hit_at(x, y)
                     && let Some(item) = self.items().get(i).copied()
                 {
-                    pins::launch(&self.item_app(item).1);
+                    self.launch(item);
                 }
             }
             WM_QUERYENDSESSION => return Some(LRESULT(1)),
@@ -520,31 +540,35 @@ impl App {
         palette
     }
 
-    /// Pinned apps first (in pin order, merged with their running windows), then
-    /// running apps that are not pinned.
+    /// Pinned apps first (in pin order, each sharing one button with its running
+    /// windows), then running apps that are not pinned.
     fn items(&self) -> Vec<BarItem> {
-        let mut items: Vec<BarItem> = self
-            .pins
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, pin)| BarItem {
+        let groups = &self.tasks.groups;
+        let mut taken = vec![false; groups.len()];
+        let mut items = Vec::with_capacity(self.pins.items.len() + groups.len());
+        for (i, pin) in self.pins.items.iter().enumerate() {
+            let group = (0..groups.len()).find(|&g| !taken[g] && pin.app.same_app(&groups[g].app));
+            if let Some(g) = group {
+                taken[g] = true;
+            }
+            items.push(BarItem {
                 pin: Some(i),
-                group: self.tasks.group_index(&pin.key),
-            })
-            .collect();
-        items.extend(
-            self.tasks
-                .groups
-                .iter()
-                .enumerate()
-                .filter(|(_, g)| !self.pins.contains(&g.key))
-                .map(|(i, _)| BarItem {
-                    pin: None,
-                    group: Some(i),
-                }),
-        );
+                group,
+            });
+        }
+        items.extend((0..groups.len()).filter(|&g| !taken[g]).map(|g| BarItem {
+            pin: None,
+            group: Some(g),
+        }));
         items
+    }
+
+    /// Starts (another instance of) an item's app.
+    fn launch(&self, item: BarItem) {
+        match item.pin.and_then(|p| self.pins.items.get(p)) {
+            Some(pin) => pins::launch_pin(pin),
+            None => pins::launch(&self.item_app(item).1),
+        }
     }
 
     /// Grouping key and identity of an item.
@@ -554,7 +578,7 @@ impl App {
         }
         item.pin
             .and_then(|p| self.pins.items.get(p))
-            .map(|pin| (pin.key.clone(), pin.app.clone()))
+            .map(|pin| (pin.app.key(), pin.app.clone()))
             .unwrap_or_default()
     }
 
@@ -564,7 +588,11 @@ impl App {
                 self.pins.pin(app);
                 self.pins.load_icons(&self.icons, self.icon_px, false);
             }
-            menu::Command::Unpin => self.pins.unpin(key),
+            menu::Command::Unpin => {
+                // Unpin whichever pin this app shares its button with.
+                let pinned = self.pins.find(&app).map(|p| self.pins.items[p].app.clone());
+                self.pins.unpin(&pinned.unwrap_or(app));
+            }
             menu::Command::CloseWindows => {
                 if let Some(index) = self.tasks.group_index(key) {
                     self.tasks.close_group(index);
@@ -620,11 +648,7 @@ impl App {
                 Some(BarItem {
                     group: Some(group), ..
                 }) => self.tasks.click(group),
-                Some(BarItem { pin: Some(pin), .. }) => {
-                    if let Some(pin) = self.pins.items.get(pin) {
-                        pins::launch(&pin.app);
-                    }
-                }
+                Some(item @ BarItem { pin: Some(_), .. }) => self.launch(item),
                 _ => {}
             },
             Some(Hit::Status) => shell::open_quick_settings(),

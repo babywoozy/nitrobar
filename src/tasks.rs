@@ -11,6 +11,7 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Threading::{
@@ -35,7 +36,7 @@ use crate::icons::{Icon, IconLoader};
 pub const WM_APP_REFRESH: u32 = WM_APP + 3;
 
 /// What identifies an application, used for grouping, icons and (later) pinning.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct AppId {
     /// Explicit AppUserModelID (packaged apps and many desktop apps).
     pub aumid: Option<String>,
@@ -52,7 +53,20 @@ impl AppId {
             (None, None) => String::from("unknown"),
         }
     }
+
+    /// Whether a pin and a running app are the same application: equal AUMIDs when
+    /// both have one (Chrome profiles share chrome.exe but not their AUMID), else
+    /// the same executable.
+    pub fn same_app(&self, other: &AppId) -> bool {
+        match (&self.aumid, &other.aumid) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => matches!((&self.exe, &other.exe), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)),
+        }
+    }
 }
+
+/// AUMID of File Explorer windows (they don't report one; the native pin uses it).
+const EXPLORER_AUMID: &str = "Microsoft.Windows.Explorer";
 
 pub struct AppGroup {
     pub key: String,
@@ -216,30 +230,47 @@ fn window_aumid(hwnd: HWND) -> Option<String> {
     }
 }
 
-fn window_exe(hwnd: HWND) -> Option<String> {
+/// Executable path of the window's process, and the process's package AUMID if it
+/// is a packaged (MSIX / Store) app. Packaged desktop apps (e.g. Electron apps from
+/// the Store) often set no AUMID on their windows; Windows then groups them by the
+/// package identity, which is also what their pins refer to.
+fn window_process(hwnd: HWND) -> (Option<String>, Option<String>) {
     unsafe {
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return (None, None);
+        };
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
+        let exe = QueryFullProcessImageNameW(
             process,
             PROCESS_NAME_WIN32,
             PWSTR(buf.as_mut_ptr()),
             &raw mut len,
-        );
+        )
+        .ok()
+        .map(|()| String::from_utf16_lossy(&buf[..len as usize]));
+        // APPMODEL_ERROR_NO_APPLICATION for ordinary (unpackaged) processes.
+        let mut len = buf.len() as u32;
+        let package =
+            GetApplicationUserModelId(process, &raw mut len, Some(PWSTR(buf.as_mut_ptr())))
+                .is_ok()
+                .then(|| String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]))
+                .filter(|s| !s.is_empty());
         let _ = CloseHandle(process);
-        ok.ok()?;
-        Some(String::from_utf16_lossy(&buf[..len as usize]))
+        (exe, package)
     }
 }
 
 pub fn app_id_for(hwnd: HWND) -> AppId {
-    AppId {
-        aumid: window_aumid(hwnd),
-        exe: window_exe(hwnd),
-    }
+    let (exe, package) = window_process(hwnd);
+    let aumid = window_aumid(hwnd).or(package).or_else(|| {
+        exe.as_deref()
+            .filter(|e| e.to_ascii_lowercase().ends_with("\\explorer.exe"))
+            .map(|_| EXPLORER_AUMID.to_string())
+    });
+    AppId { aumid, exe }
 }
 
 fn activate(hwnd: HWND) {

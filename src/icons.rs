@@ -64,12 +64,14 @@ impl IconLoader {
         Some(Icon { id, bitmap })
     }
 
-    /// Icon of an app that may not be running (pinned): AppsFolder entry, else the exe.
-    pub fn load_app(&self, app: &AppId, px: u32) -> Option<Icon> {
+    /// Icon of an app that may not be running (pinned): AppsFolder entry, else the
+    /// shortcut it was pinned through, else the exe.
+    pub fn load_app(&self, app: &AppId, link: Option<&str>, px: u32) -> Option<Icon> {
         let bitmap = app
             .aumid
             .as_deref()
             .and_then(|aumid| self.apps_folder_bitmap(aumid, px))
+            .or_else(|| link.and_then(|link| self.file_bitmap(link, px)))
             .or_else(|| app.exe.as_deref().and_then(|exe| self.file_bitmap(exe, px)))?;
         let id = self.next_id.get();
         self.next_id.set(id + 1);

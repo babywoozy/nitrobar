@@ -18,7 +18,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB.
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell).
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -55,7 +55,8 @@ src/
   status/     wifi / âm lượng / pin: mod.rs (gộp thông báo, StatusView), network.rs,
               volume.rs (COM callback), battery.rs
   config.rs   %APPDATA%\nitrobar\config.toml: parse + clamp, file mặc định có chú thích, màu
-  pins.rs     %APPDATA%\nitrobar\pins.toml (app tự ghi), mở app qua shell:AppsFolder / exe
+  pins.rs     danh sách ghim = ghim của Windows + pins.toml ([[pin]] thêm, [[hide]] bỏ), mở app
+  winpins.rs  đọc ghim của taskbar gốc (blob Taskband\Favorites -> PIDL), theo dõi registry
 ```
 
 ### Cấu hình và ghim (config.rs, pins.rs)
@@ -67,8 +68,19 @@ src/
   config cũ, lỗi hiện thành mục mờ trong menu chuột phải.
 - Kích thước lấy từ `layout::Metrics` (theo config), không dùng hằng số cố định cho thanh/nút/icon.
 - Pins tách khỏi config.toml để app ghi lại mà không xoá chú thích của người dùng.
-- Thứ tự nút: app ghim (theo thứ tự ghim, gộp với nhóm đang chạy cùng key) rồi app đang chạy
-  chưa ghim. `Hit::Task(i)` là chỉ số trong danh sách gộp này (`App::items()`).
+- Ghim của Windows: `HKCU\...\Explorer\Taskband\Favorites` = byte 0, rồi mỗi ghim `u32` size +
+  PIDL tuyệt đối + 1 byte (0 = còn tiếp, 0xFF = hết). App desktop trỏ tới .lnk trong
+  `Quick Launch\User Pinned\TaskBar`; app Store trỏ thẳng vào `shell:AppsFolder` (không có .lnk).
+  Định dạng không công khai: kiểm tra độ dài từng item, lỗi thì quay về đọc các .lnk trong thư mục.
+  Không bao giờ ghi vào danh sách của Windows. Key thay đổi -> `RegNotifyChangeKeyValue` (event
+  chờ trong message loop) -> `WM_APP_PINS`.
+- Ghim khớp với app đang chạy bằng `AppId::same_app`: cùng AUMID nếu cả hai có, nếu không thì cùng
+  exe. AUMID của cửa sổ: property store -> AUMID của package (`GetApplicationUserModelId`; app
+  MSIX/Electron từ Store không đặt AUMID cho cửa sổ) -> `Microsoft.Windows.Explorer` cho explorer.exe.
+- Thứ tự nút: app ghim (mỗi ghim gộp với một nhóm đang chạy khớp) rồi app đang chạy chưa ghim.
+  `Hit::Task(i)` là chỉ số trong danh sách gộp này (`App::items()`). Trong lúc menu mở, danh sách
+  có thể đổi: lệnh tìm lại app theo `AppId`, không theo chỉ số.
+- toml: mảng rỗng phải `skip_serializing_if` (ghi `x = []` sau `[[bảng]]` làm serializer lỗi).
 
 ### Trạng thái hệ thống (status/)
 
@@ -149,6 +161,10 @@ src/
 ## Kiểm thử thủ công
 
 - Mỗi lần chạy thử phải kết thúc bằng `nitrobar.exe --quit` (hoặc kiểm tra taskbar gốc hiện lại).
+- Mở menu rồi bấm phím trong CÙNG một script (menu tự đóng giữa hai lần gọi tool, phím rơi vào
+  cửa sổ khác). Vị trí nút tính bằng công thức layout (căn giữa, 44 + 4 DIP), không dò pixel.
+- Không đọc rồi ghi lại config.toml bằng `Get-Content` của PowerShell 5.1: nó đọc UTF-8 không BOM
+  như ANSI, ghi lại là hỏng chữ tiếng Việt. Dùng `[IO.File]::ReadAllText` / `WriteAllText`.
 - Thử tương tác bằng một cửa sổ riêng (ví dụ WinForms tiêu đề `nitrobar-test`), KHÔNG bấm vào
   cửa sổ thật của người dùng. Notepad Win11 là app đóng gói và tự mở lại tab cũ: không dùng để test.
 - Gửi click giả bằng `PostMessage(WM_LBUTTONDOWN/UP)` vào cửa sổ thanh; `WM_CONTEXTMENU` cho menu.
