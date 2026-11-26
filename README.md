@@ -14,6 +14,11 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
     ngắn dưới app đang mở, vạch dài màu nhấn dưới app đang active, chấm mờ dưới app đã thu nhỏ hết
     cửa sổ, nền cam khi app cần chú ý. Icon dưới con trỏ phóng to nhẹ như dock macOS. Wifi / âm lượng
     / pin / đồng hồ nằm cuối dải, ngăn cách bằng một vạch mờ. Rời chuột ~600 ms thì thu về viên.
+  - Bấm icon trên dải: app đang thu nhỏ thì cửa sổ tỏa ra từ đúng icon đó (khối tròn đen cỡ icon lớn
+    dần, sáng dần thành cửa sổ thật) rồi dải thu lại; app đang active thì cửa sổ co ngược vào đúng
+    icon và viên nảy lên với icon app; app đang mở nhưng ở sau thì được đưa lên trước và icon nảy
+    nhẹ; app chưa chạy (ghim) thì được mở; app có nhiều cửa sổ thì hiện ảnh xem trước (live) kèm
+    tiêu đề của từng cửa sổ phía trên dải để chọn, bấm lại icon để đóng.
   - Nhấn phím Win (mở Start) cũng làm thanh bung ra. Không thu lại khi đang mở menu chuột phải, Start,
     Quick Settings, trung tâm thông báo hay đang kéo thả. Đang chơi game / xem video toàn màn hình thì
     viên ẩn đi và chạm mép không làm thanh bung ra. Dải island không có nút Start (dùng phím Win).
@@ -118,6 +123,8 @@ ghim thêm trong nitrobar. nitrobar không sửa danh sách ghim của Windows; 
 - [x] Ghim theo taskbar gốc, icon nét, nền trong suốt, sửa lỗi thanh đen
 - [x] Chế độ island: viên thu gọn, bung ra khi rê chuột / chạm mép / nhấn Win, có hiệu ứng
 - [x] Hiệu ứng thu nhỏ / khôi phục cửa sổ vào island (DWM thumbnail + viên nảy)
+- [x] Thiết kế island kiểu Dynamic Island: viên nghỉ (icon app + giờ), dải icon khi hover (zoom kiểu
+  dock), bấm icon (tỏa ra / co vào icon, nhảy icon, xem trước nhiều cửa sổ)
 
 Chưa có: khay hệ thống (icon app chạy nền), nhiều màn hình (thanh chỉ ở màn hình chính). Ở chế độ
 island, `background` và `[colors]` không áp dụng: viên luôn đen (nền trong suốt hẳn không đọc được

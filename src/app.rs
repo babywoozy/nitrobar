@@ -46,11 +46,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, IsIconic, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, PM_REMOVE, PeekMessageW,
-    QS_ALLINPUT, SW_HIDE, SWP_SHOWWINDOW, WM_DWMCOLORIZATIONCOLORCHANGED, WM_DWMCOMPOSITIONCHANGED,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED, WM_WTSSESSION_CHANGE,
-    WTS_SESSION_UNLOCK,
+    GetCursorPos, GetForegroundWindow, GetWindowRect, IsIconic, MsgWaitForMultipleObjects,
+    PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE,
+    PM_REMOVE, PeekMessageW, QS_ALLINPUT, SW_HIDE, SWP_SHOWWINDOW, WM_DWMCOLORIZATIONCOLORCHANGED,
+    WM_DWMCOMPOSITIONCHANGED, WM_MBUTTONUP, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_QUIT,
+    WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
 };
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
@@ -60,6 +60,7 @@ use crate::island::{self, EdgeSensor, Island, Pulse};
 use crate::layout::{BarLayout, Hit, Metrics};
 use crate::morph::{self, Morph};
 use crate::pins::{self, Pins};
+use crate::preview::{self, Preview};
 use crate::render::{Badge, IslandView, RestView};
 use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
 use crate::status::{self, Status};
@@ -73,7 +74,7 @@ use crate::{appbar, clock, layout, menu, safety, shell, taskbar, winpins};
 const WM_APP_CONFIG: u32 = WM_APP + 5;
 /// Posted by the message loop when the native taskbar's pin list changed.
 const WM_APP_PINS: u32 = WM_APP + 6;
-/// Posted to ourselves after `HSHELL_GETMINRECT` for a window that minimized (wParam).
+/// Posted to ourselves after `HSHELL_GETMINRECT`: wParam = the window, lParam = 1 if it minimized, 0 if it restores.
 const WM_APP_MINIMIZED: u32 = WM_APP + 9;
 
 const CLASS_NAME: PCWSTR = w!("NitrobarWindow");
@@ -194,6 +195,16 @@ struct App {
     pointer_in: bool,
     zoom: f32,
     last_frame: Option<Instant>,
+    /// Island: window previews of an app with several windows, whether the
+    /// pointer is on them, the icon that bounces (group key) and since when.
+    preview: Option<Preview>,
+    preview_hover: bool,
+    bounce: Option<(String, Instant)>,
+    /// After a click the strip collapses and stays closed until the pointer has left once.
+    suppress_expand: bool,
+    /// Collapse the strip when the animation we started (restore / minimize) ends.
+    restore_collapse: bool,
+    min_collapse: bool,
     /// Minimize / restore animation overlay.
     morph: Option<Morph>,
     /// A window we are restoring ourselves (after the grow-out animation).
@@ -336,6 +347,12 @@ fn run_window(options: Options) -> Result<()> {
             pointer_in: false,
             zoom: 0.0,
             last_frame: None,
+            preview: None,
+            preview_hover: false,
+            bounce: None,
+            suppress_expand: false,
+            restore_collapse: false,
+            min_collapse: false,
             morph: None,
             own_restore: None,
         };
@@ -452,16 +469,18 @@ fn on_get_min_rect(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let Some(info) = (unsafe { (lparam.0 as *mut ShellHookInfo).as_mut() }) else {
         return LRESULT(0);
     };
+    let target = info.hwnd;
     let rc = match with_app(hwnd, |app| {
         app.config
             .bar
             .window_animation
-            .then(|| app.on_min_rect(info.hwnd))
+            .then(|| app.min_rect(target))
     }) {
         // Animation turned off: let Explorer answer (Windows' own animation).
         Some(None) => return LRESULT(0),
         Some(Some(rc)) => rc,
-        None => (WINDOW_ANIMATION.get()).then(|| MIN_RECT.get()),
+        // `App` is busy (we are inside its handler): use the last known rect.
+        None => WINDOW_ANIMATION.get().then(|| MIN_RECT.get()),
     };
     let Some(rc) = rc else {
         return LRESULT(0);
@@ -470,6 +489,17 @@ fn on_get_min_rect(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         return LRESULT(0);
     }
     info.rc = rc;
+    // Tell `App` (also when it was busy): start our animation once Windows has
+    // hidden / shown the window. Windows asks AFTER switching the state: a window
+    // that is minimizing is already iconic.
+    unsafe {
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_APP_MINIMIZED,
+            WPARAM(target.0 as usize),
+            LPARAM(isize::from(IsIconic(target).as_bool())),
+        );
+    }
     LRESULT(1)
 }
 
@@ -594,10 +624,44 @@ impl App {
                 self.start_frames();
             }
             morph::WM_APP_FRAME => self.on_frame(),
+            preview::WM_APP_PREVIEW => match wparam.0 {
+                preview::ENTER => {
+                    self.preview_hover = true;
+                    self.kill_timer(TIMER_COLLAPSE);
+                }
+                preview::LEAVE => {
+                    self.preview_hover = false;
+                    if !self.cursor_inside() {
+                        self.island_pointer(false);
+                    }
+                }
+                preview::PICK => self.pick_window(HWND(lparam.0 as *mut _)),
+                _ => {}
+            },
             WM_APP_MINIMIZED => {
                 let target = HWND(wparam.0 as *mut _);
-                if let Some(rc) = self.min_rect(target) {
-                    self.start_minimize(target, rc);
+                debug_log!(
+                    "nitrobar: min / restore event {target:?} minimized={}",
+                    lparam.0
+                );
+                if lparam.0 != 0 {
+                    // Minimizing: pour the window into the island / its icon.
+                    let started = self
+                        .min_rect(target)
+                        .is_some_and(|rc| self.start_minimize(target, rc));
+                    if !started && self.min_collapse {
+                        // No animation to wait for: fold the strip right away.
+                        self.min_collapse = false;
+                        self.collapse_after_click();
+                    }
+                } else {
+                    // Restoring. Ours already animated; others just make the island bounce.
+                    let own = self
+                        .own_restore
+                        .is_some_and(|(h, at)| h == target && at.elapsed() < OWN_RESTORE_GRACE);
+                    if !own {
+                        self.start_pulse(target);
+                    }
                 }
             }
             island::WM_APP_EDGE => {
@@ -928,6 +992,7 @@ impl App {
     fn activate(&mut self, hit: Option<Hit>) {
         match hit {
             Some(Hit::Start) => shell::open_start(),
+            Some(Hit::Task(index)) if self.island.is_some() => self.click_island(index),
             Some(Hit::Task(index)) => match self.items().get(index).copied() {
                 Some(BarItem {
                     group: Some(group), ..
@@ -1193,6 +1258,11 @@ impl App {
                 let center = (rect.left + rect.right) / 2.0;
                 let reach = (self.pointer_x - center) / (button_width * 1.1);
                 let scale = 1.0 + ZOOM_MAX * self.zoom * (-reach * reach).exp();
+                let hop = self
+                    .bounce
+                    .as_ref()
+                    .filter(|(key, _)| group.is_some_and(|g| &g.key == key))
+                    .map_or(0.0, |(_, at)| island::bounce_height(at.elapsed()));
                 ButtonView {
                     rect: *rect,
                     icon: group
@@ -1209,7 +1279,7 @@ impl App {
                     },
                     pointer: self.pointer(Hit::Task(i)),
                     scale,
-                    lift: (scale - 1.0) * 8.0,
+                    lift: (scale - 1.0) * 8.0 + hop,
                 }
             })
             .collect();
@@ -1386,6 +1456,13 @@ impl App {
             return;
         };
         let (expanded, animating) = (state.anim.expanded(), state.anim.animating());
+        if inside && self.suppress_expand {
+            // Just clicked: stay closed until the pointer has left once.
+            return;
+        }
+        if !inside {
+            self.suppress_expand = false;
+        }
         if inside {
             self.kill_timer(TIMER_COLLAPSE);
             if expanded {
@@ -1408,7 +1485,11 @@ impl App {
     fn collapse_blocked(&self) -> bool {
         // Left button held anywhere: a drag (file, window, scrollbar) is going on.
         let dragging = unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) } as u16 & 0x8000 != 0;
-        self.menu_open || self.flyout_open || self.pressed.is_some() || dragging
+        self.menu_open
+            || self.flyout_open
+            || self.pressed.is_some()
+            || self.preview_hover
+            || dragging
     }
 
     fn on_collapse_timer(&mut self) {
@@ -1461,8 +1542,132 @@ impl App {
             return;
         };
         if state.anim.set_target(false, Instant::now()) {
+            self.restore_collapse = false;
+            self.min_collapse = false;
+            self.close_preview();
             self.set_hover(None);
             self.start_frames();
+        }
+    }
+
+    /// Whether our minimize / restore animation may run.
+    fn window_anim_on(&self) -> bool {
+        self.config.bar.window_animation && !self.fullscreen() && morph::system_allows()
+    }
+
+    fn start_bounce(&mut self, key: String) {
+        debug_log!("nitrobar: bounce {key}");
+        self.bounce = Some((key, Instant::now()));
+        self.start_frames();
+    }
+
+    /// Folds the strip back after a click and keeps it closed until the pointer
+    /// has left once (it is still over the spot where the icon was).
+    fn collapse_after_click(&mut self) {
+        self.suppress_expand = true;
+        self.kill_timer(TIMER_EXPAND);
+        self.kill_timer(TIMER_COLLAPSE);
+        self.begin_collapse();
+    }
+
+    /// A click on an app's icon in the island strip.
+    fn click_island(&mut self, index: usize) {
+        debug_log!("nitrobar: click strip button {index}");
+        let Some(item) = self.items().get(index).copied() else {
+            return;
+        };
+        self.restore_collapse = false;
+        self.min_collapse = false;
+        let Some(group) = item.group else {
+            // Pinned, not running: start it.
+            self.launch(item);
+            let key = self.item_app(item).0;
+            self.start_bounce(key);
+            return;
+        };
+        let key = self.tasks.groups[group].key.clone();
+        let windows = self.tasks.groups[group].windows.clone();
+        if windows.len() > 1 {
+            self.toggle_preview(group, index);
+            return;
+        }
+        self.close_preview();
+        let Some(&window) = windows.first() else {
+            return;
+        };
+        if unsafe { IsIconic(window) }.as_bool() {
+            // Minimized: it pours out of its icon, then the strip folds back.
+            if self.window_anim_on() && self.start_restore(window) {
+                self.restore_collapse = true;
+            } else {
+                self.tasks.click(group);
+                self.collapse_after_click();
+            }
+        } else if window == unsafe { GetForegroundWindow() } {
+            // Active: minimize it into its icon.
+            self.tasks.click(group);
+            if self.window_anim_on() {
+                self.min_collapse = true;
+            } else {
+                self.collapse_after_click();
+            }
+        } else {
+            // Open behind others: bring it to the front, the icon hops.
+            self.tasks.click(group);
+            self.start_bounce(key);
+        }
+    }
+
+    fn close_preview(&mut self) {
+        self.preview = None;
+        self.preview_hover = false;
+    }
+
+    /// Shows (or hides) the window previews of the app at strip button `index`.
+    fn toggle_preview(&mut self, group: usize, index: usize) {
+        let key = self.tasks.groups[group].key.clone();
+        let same = self.preview.as_ref().is_some_and(|p| p.key == key);
+        self.close_preview();
+        if same {
+            return;
+        }
+        let targets = self.tasks.groups[group].windows.clone();
+        let strip = self.strip();
+        let Some(button) = strip.buttons.get(index) else {
+            return;
+        };
+        let at_top = self.metrics.at_top;
+        let bar = self.bar_rect;
+        let gap = scale(10.0, self.dpi);
+        let anchor_x = bar.left + scale((button.left + button.right) / 2.0, self.dpi);
+        let edge_y = if at_top {
+            bar.top + scale(strip.panel.bottom, self.dpi) + gap
+        } else {
+            bar.top + scale(strip.panel.top, self.dpi) - gap
+        };
+        self.preview = Preview::show(
+            self.hwnd,
+            key,
+            &targets,
+            anchor_x,
+            edge_y,
+            at_top,
+            &self.monitor_rect,
+            self.dpi,
+        );
+    }
+
+    /// A window was chosen in the previews.
+    fn pick_window(&mut self, window: HWND) {
+        self.close_preview();
+        if unsafe { IsIconic(window) }.as_bool()
+            && self.window_anim_on()
+            && self.start_restore(window)
+        {
+            self.restore_collapse = true;
+        } else {
+            tasks::activate(window);
+            self.collapse_after_click();
         }
     }
 
@@ -1536,6 +1741,22 @@ impl App {
             }
         }
 
+        if let Some((_, at)) = &self.bounce {
+            repaint = true;
+            if now.saturating_duration_since(*at) < island::BOUNCE_DURATION {
+                running = true;
+            } else {
+                self.bounce = None;
+            }
+        }
+
+        if self.suppress_expand
+            && self.island.as_ref().is_some_and(|s| s.small_window)
+            && !self.cursor_inside()
+        {
+            self.suppress_expand = false;
+        }
+
         if self.island.is_some()
             && let Some(at) = self.rest_icon.changed
         {
@@ -1554,11 +1775,21 @@ impl App {
             if tick.swallowed
                 && let Some((target, _)) = morph.target()
             {
+                if self.min_collapse {
+                    // Our click minimized it into the icon: the strip folds back.
+                    self.min_collapse = false;
+                    self.collapse_after_click();
+                }
                 self.start_pulse(target);
                 running = true;
             }
             if let Some(hwnd) = tick.show {
                 tasks::activate(hwnd);
+                if self.restore_collapse {
+                    self.restore_collapse = false;
+                    self.collapse_after_click();
+                    running = true;
+                }
             }
         }
 
@@ -1569,34 +1800,6 @@ impl App {
         if !running {
             morph::stop_clock();
         }
-    }
-
-    /// `HSHELL_GETMINRECT` for `target`: answer with the island / button rect and
-    /// start our animation. Windows asks *after* switching the state: a window
-    /// that is minimizing is already iconic, a restoring one no longer is.
-    fn on_min_rect(&mut self, target: HWND) -> Option<RECT> {
-        let rc = self.min_rect(target)?;
-        if unsafe { IsIconic(target) }.as_bool() {
-            // Start after answering, once Windows has hidden the window (showing
-            // the overlay while it minimizes makes Windows' own minimize visible).
-            unsafe {
-                let _ = PostMessageW(
-                    Some(self.hwnd),
-                    WM_APP_MINIMIZED,
-                    WPARAM(target.0 as usize),
-                    LPARAM(0),
-                );
-            }
-        } else {
-            // Restoring. Ours already animated; others just make the island bounce.
-            let own = self
-                .own_restore
-                .is_some_and(|(h, at)| h == target && at.elapsed() < OWN_RESTORE_GRACE);
-            if !own {
-                self.start_pulse(target);
-            }
-        }
-        Some(rc)
     }
 
     /// Work area and DPI of the monitor `hwnd` is (or restores) on.
@@ -1617,21 +1820,23 @@ impl App {
     }
 
     /// `target` was just minimized: pour its picture into the island / its button.
-    fn start_minimize(&mut self, target: HWND, to: RECT) {
+    fn start_minimize(&mut self, target: HWND, to: RECT) -> bool {
         if self.fullscreen() || !morph::system_allows() {
-            return;
+            debug_log!("nitrobar: minimize morph skipped (fullscreen / animations off)");
+            return false;
         }
         let Some((work, dpi)) = Self::window_monitor(target) else {
-            return;
+            return false;
         };
         let Some((frame, source)) = morph::restored_frame(target, &work, dpi) else {
-            return;
+            debug_log!("nitrobar: minimize morph: no placement");
+            return false;
         };
         if frame.right <= frame.left || frame.bottom <= frame.top {
-            return;
+            return false;
         }
         let Some(morph) = &mut self.morph else {
-            return;
+            return false;
         };
         if morph.start(
             morph::Kind::Minimize,
@@ -1642,7 +1847,12 @@ impl App {
             self.hwnd,
             self.dpi,
         ) {
+            debug_log!("nitrobar: minimize morph started {frame:?} -> {to:?}");
             self.start_frames();
+            true
+        } else {
+            debug_log!("nitrobar: minimize morph: thumbnail registration failed");
+            false
         }
     }
 
@@ -1789,7 +1999,22 @@ impl App {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
         }
+        #[cfg(debug_assertions)]
+        if !small {
+            self.debug_strip();
+        }
         self.paint();
+    }
+
+    /// Debug builds: logs where each strip button is (screen pixels), for UI tests.
+    #[cfg(debug_assertions)]
+    fn debug_strip(&self) {
+        let strip = self.strip();
+        for (rect, item) in strip.buttons.iter().zip(self.items()) {
+            let x = self.bar_rect.left + scale((rect.left + rect.right) / 2.0, self.dpi);
+            let y = self.bar_rect.top + scale((rect.top + rect.bottom) / 2.0, self.dpi);
+            debug_log!("BTN {} {x} {y}", self.item_app(item).0);
+        }
     }
 
     fn on_fullscreen_changed(&mut self) {
@@ -1959,6 +2184,7 @@ impl App {
         }
         self.cleaned_up = true;
         tasks::remove_hooks();
+        self.close_preview();
         morph::stop_clock();
         self.morph = None;
         self.island = None;

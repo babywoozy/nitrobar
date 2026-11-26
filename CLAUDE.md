@@ -18,7 +18,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.5 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB); chống thanh đen 12.6 MB; island 8.6 MB thu gọn / ~14.5 MB sau khi bung, exe 589 KB; hiệu ứng thu nhỏ 9.0 MB (sau thu nhỏ + khôi phục), ~14.7 MB sau nhiều lần bung, exe 603 KB.
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.5 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB); chống thanh đen 12.6 MB; island 8.6 MB thu gọn / ~14.5 MB sau khi bung, exe 589 KB; hiệu ứng thu nhỏ 9.0 MB (sau thu nhỏ + khôi phục), ~14.7 MB sau nhiều lần bung, exe 603 KB; island mới (dải icon + bấm icon + xem trước) 12.5 MB sau thu nhỏ / khôi phục / xem trước, exe 627 KB.
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -61,6 +61,7 @@ src/
   island.rs   chế độ island: hiệu ứng (lò xo), hình học viên + "activity" (Pulse), cảm biến mép,
               flyout, fullscreen
   morph.rs    hiệu ứng thu nhỏ / khôi phục: overlay + DWM thumbnail, đồng hồ khung hình (DwmFlush)
+  preview.rs  xem trước các cửa sổ của một app (popup GDI + DWM thumbnail)
 ```
 
 ### Cấu hình và ghim (config.rs, pins.rs)
@@ -232,6 +233,27 @@ src/
   34 DIP, giữ mép dưới) bằng lò xo (`morph::spring`, vượt ~20%), đổi màu đen (`PULSE_FILL`), hiện icon
   app (`render::Badge`, vẽ đúng cỡ pixel), giữ `PULSE_HOLD` 1.5 s (không vẽ frame nào, chỉ
   `TIMER_PULSE`), rồi lò xo về. Chỉ khi đang là viên (bung ra thì không).
+
+- Bấm icon (`App::click_island`, mode full vẫn dùng nhánh cũ trong `activate`): 1 cửa sổ + đang thu nhỏ
+  => `start_restore` (overlay bung từ rect nút), `restore_collapse` => dải thu lại khi cửa sổ hiện;
+  đang active => `tasks.click` (thu nhỏ), `GETMINRECT` trả rect NÚT (min_rect khi dải đang mở),
+  `min_collapse` => thu dải + viên nảy lúc "nuốt"; ở sau => `tasks.click` + `start_bounce` (icon nhảy
+  2 lần, `island::bounce_height`, vẽ qua `ButtonView::lift`); nhiều cửa sổ => `preview.rs`.
+  Sau khi bấm dải thu lại và `suppress_expand` chặn bung lại tới khi con trỏ rời vùng một lần (con trỏ
+  vẫn đứng ở chỗ icon cũ). Nếu overlay không chạy được (tắt hiệu ứng / đăng ký thumbnail lỗi) thì
+  thu dải ngay (`WM_APP_MINIMIZED` xử lý cả hai trường hợp).
+- `GETMINRECT` có thể tới lúc `App` đang bị mượn (ngay trong handler của click): nhánh stateless vẫn
+  trả lời bằng `MIN_RECT` VÀ post `WM_APP_MINIMIZED` (wParam cửa sổ, lParam 1 = thu nhỏ / 0 = khôi
+  phục); `App` làm phần còn lại. Trước đây việc đó nằm trong `App` nên 1/6 lần bị mất (không overlay,
+  dải không thu).
+- Xem trước nhiều cửa sổ (`preview.rs`): popup không kích hoạt, vẽ bằng GDI (nền, ô, tiêu đề) + một DWM
+  thumbnail mỗi cửa sổ (live, kể cả cửa sổ đang thu nhỏ), region bo tròn (mép hơi răng cưa). Báo cho
+  thanh `WM_APP_PREVIEW`: ENTER / LEAVE (con trỏ vào / ra panel => `preview_hover` giữ dải mở) và PICK
+  (cửa sổ được chọn: đang thu nhỏ thì tỏa ra từ icon, không thì kích hoạt, rồi thu dải). Đóng khi dải
+  thu lại hoặc bấm lại icon. Tối đa 4 cột, quá thì xuống hàng.
+- Test UI: bản debug in `BTN <khoá app> x y` (pixel màn hình) mỗi lần dải mở để script tìm nút, vì số
+  nút phụ thuộc app người dùng đang mở. Tự bấm chuột thật chỉ khi con trỏ đang ở trên popup của mình
+  (`mouse_event`), còn lại gửi `PostMessage` vào cửa sổ thanh.
 
 ### Hiệu ứng thu nhỏ / khôi phục cửa sổ
 

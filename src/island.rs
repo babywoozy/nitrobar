@@ -56,6 +56,18 @@ const PULSE_BACK: (f32, f32) = (18.0, 0.75);
 /// Time the return spring needs to settle.
 const PULSE_SETTLE: f32 = 0.55;
 
+/// How long an icon bounces after its app is raised / launched.
+pub const BOUNCE_DURATION: Duration = Duration::from_millis(700);
+
+/// Height (DIPs) an icon is lifted `since` the bounce started: two decaying hops.
+pub fn bounce_height(since: Duration) -> f32 {
+    let t = since.as_secs_f32();
+    if t >= BOUNCE_DURATION.as_secs_f32() {
+        return 0.0;
+    }
+    12.0 * (-3.2 * t).exp() * (std::f32::consts::PI * t / 0.3).sin().abs()
+}
+
 pub fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
@@ -597,6 +609,16 @@ mod tests {
         assert!(island.set_target(false, t1));
         assert!(!island.tick(t1 + COLLAPSE_DURATION));
         assert!(island.is_collapsed());
+    }
+
+    #[test]
+    fn bounce_hops_twice_and_stops() {
+        let at = |ms: u64| bounce_height(Duration::from_millis(ms));
+        assert_eq!(at(0), 0.0);
+        assert!(at(150) > 6.0, "first hop");
+        assert!(at(300) < 0.5, "lands");
+        assert!(at(450) > 2.0 && at(450) < at(150), "smaller second hop");
+        assert_eq!(at(700), 0.0);
     }
 
     #[test]

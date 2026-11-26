@@ -690,7 +690,7 @@ impl Renderer {
             let icon_px = button
                 .icon
                 .map_or(wanted_px, |icon| wanted_px.min(icon.px as f32));
-            layout::pixel_square(&rect, icon_px, nudge, dpi)
+            layout::pixel_square(&rect, icon_px, nudge - button.lift, dpi)
         };
         let bitmap = button.icon.and_then(|icon| {
             used.push(icon.id);

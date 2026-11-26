@@ -27,6 +27,7 @@ mod layout;
 mod menu;
 mod morph;
 mod pins;
+mod preview;
 mod render;
 mod safety;
 mod shell;
