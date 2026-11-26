@@ -17,7 +17,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 10 MB, working set < 20 MB. Hiện tại (giai đoạn 1): ~4.6 MB / ~17 MB.
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon).
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -42,11 +42,29 @@ src/
   safety.rs   panic hook, console ctrl handler, SEH filter -> emergency_cleanup()
   render.rs   tài nguyên Direct2D / DirectWrite, vẽ toàn bộ thanh
   clock.rs    chuỗi giờ / ngày theo locale người dùng
+  layout.rs   hình học (DIP) dùng chung cho vẽ và hit-test
+  tasks.rs    danh sách cửa sổ, gom nhóm theo AppId, WinEvent hook, click/minimize
+  icons.rs    icon thật -> IWICBitmap (AUMID/AppsFolder, WM_GETICON, icon file exe)
+  menu.rs     menu chuột phải (TrackPopupMenu, chạy NGOÀI borrow của App)
 ```
 
-Dự kiến thêm: `windows_list.rs` + `shell_hook.rs` (GĐ2), `icons.rs` (GĐ2), `start.rs` /
-`backdrop.rs` (GĐ3), `status/{network,volume,battery}.rs` (GĐ4), `config.rs` + `menu.rs` +
-`pins.rs` (GĐ5).
+Dự kiến thêm: `start.rs` / `backdrop.rs` (GĐ3), `status/{network,volume,battery}.rs` (GĐ4),
+`config.rs` + `pins.rs` (GĐ5).
+
+### Danh sách app (tasks.rs)
+
+- Lọc cửa sổ theo luật của Explorer: visible, không WS_EX_TOOLWINDOW/NOACTIVATE và không có
+  owner (trừ khi WS_EX_APPWINDOW), không bị cloak (desktop ảo khác), có tiêu đề.
+- Gom nhóm theo AppUserModelID nếu có, nếu không thì theo đường dẫn exe (giống Windows 11:
+  Chrome nhiều profile = nhiều nhóm). Thứ tự nhóm ổn định: nhóm mới thêm vào cuối.
+- Hook chỉ đăng ký các khoảng event hẹp (FOREGROUND, DESTROY..HIDE, NAMECHANGE, CLOAKED..UNCLOAKED).
+  KHÔNG hook LOCATIONCHANGE / khoảng rộng: chúng bắn liên tục và đốt CPU.
+- Callback hook không đụng `App`; chỉ gọi `request_refresh()` (gộp nhiều event thành một
+  `WM_APP_REFRESH`). Refresh = EnumWindows + diff, chỉ vẽ lại khi chữ ký thay đổi.
+- Bấm: app đang focus + 1 cửa sổ -> thu nhỏ; nhiều cửa sổ -> xoay vòng; khác -> kích hoạt
+  cửa sổ dùng gần nhất. Dùng `ShowWindowAsync` cho cửa sổ của process khác (không treo nếu app treo).
+- `WM_GETICON` gửi bằng `SendMessageTimeoutW(SMTO_ABORTIFHUNG | SMTO_BLOCK)`: không treo vì app
+  treo, và không nhận message re-entrant trong lúc chờ.
 
 ### Quy tắc trong window procedure
 
@@ -75,6 +93,15 @@ Dự kiến thêm: `windows_list.rs` + `shell_hook.rs` (GĐ2), `icons.rs` (GĐ2)
 - Lỗi không nghiêm trọng (vẽ hỏng, API phụ trả lỗi) thì `debug_log!` rồi bỏ qua; không `unwrap()`
   trên kết quả Win32.
 - Kết quả Win32 cố tình bỏ qua viết `let _ = ...;`.
+- Truyền con trỏ cho Win32 bằng `&raw const x` / `&raw mut x` (biến), `&CONST` cho hằng.
+- Không dùng `Set-Content`/`Out-File` của PowerShell 5.1 để ghi file nguồn: chúng chèn BOM.
+
+## Kiểm thử thủ công
+
+- Mỗi lần chạy thử phải kết thúc bằng `nitrobar.exe --quit` (hoặc kiểm tra taskbar gốc hiện lại).
+- Thử tương tác bằng một cửa sổ riêng (ví dụ WinForms tiêu đề `nitrobar-test`), KHÔNG bấm vào
+  cửa sổ thật của người dùng. Notepad Win11 là app đóng gói và tự mở lại tab cũ: không dùng để test.
+- Gửi click giả bằng `PostMessage(WM_LBUTTONDOWN/UP)` vào cửa sổ thanh; `WM_CONTEXTMENU` cho menu.
 
 ## Rủi ro / phần khó đã biết
 

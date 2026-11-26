@@ -1,4 +1,4 @@
-﻿//! nitrobar: a lightweight Windows 11 taskbar replacement.
+//! nitrobar: a lightweight Windows 11 taskbar replacement.
 //!
 //! Command line:
 //!   nitrobar                     start the bar
@@ -20,9 +20,13 @@ macro_rules! debug_log {
 mod app;
 mod appbar;
 mod clock;
+mod icons;
+mod layout;
+mod menu;
 mod render;
 mod safety;
 mod taskbar;
+mod tasks;
 
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,

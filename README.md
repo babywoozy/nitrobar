@@ -1,12 +1,12 @@
 # nitrobar
 
 Taskbar thay thế cho Windows 11, viết bằng Rust + Win32 thuần (Direct2D/DirectWrite).
-Nhẹ (~5 MB private memory), chạy theo sự kiện (0% CPU khi rảnh).
+Nhẹ (~9 MB private memory), chạy theo sự kiện (0% CPU khi rảnh).
 
 ## Trạng thái
 
 - [x] Giai đoạn 1: thanh ở đáy màn hình, đăng ký AppBar, đồng hồ, ẩn/khôi phục taskbar gốc
-- [ ] Giai đoạn 2: danh sách app đang chạy, icon, bấm để chuyển / thu nhỏ
+- [x] Giai đoạn 2: danh sách app đang chạy (gom nhóm theo app), icon thật, bấm để chuyển / thu nhỏ, menu chuột phải (Đóng cửa sổ / Thoát)
 - [ ] Giai đoạn 3: nút Start, hover, bo góc, Mica/Acrylic
 - [ ] Giai đoạn 4: wifi, âm lượng, pin, mở Quick Settings
 - [ ] Giai đoạn 5: ghim app, menu chuột phải, cấu hình TOML
