@@ -52,9 +52,9 @@ pub enum BarMode {
 pub enum IslandStyle {
     /// Frosted glass: a blur of what is behind it with a light tint and a hairline
     /// border (falls back to a translucent pill without blur if the blur is unavailable).
-    #[default]
     Glass,
-    /// Solid black, like the Dynamic Island.
+    /// Solid black.
+    #[default]
     Black,
 }
 
@@ -100,6 +100,8 @@ pub struct BarConfig {
     pub expand_delay_ms: u32,
     pub collapse_delay_ms: u32,
     pub island_show_clock: bool,
+    /// Seconds without input before the island's mascot falls asleep (0 = never).
+    pub island_sleep_seconds: u32,
     /// Minimizing a window pours it into the island; restoring grows it back out.
     pub window_animation: bool,
 }
@@ -115,15 +117,16 @@ impl Default for BarConfig {
             theme: ThemeMode::Auto,
             background: Background::Clear,
             mode: BarMode::Island,
-            island_style: IslandStyle::Glass,
+            island_style: IslandStyle::Black,
             island_color: "wallpaper".to_string(),
             island_opacity: 0.45,
             island_width: 200.0,
-            island_height: 40.0,
+            island_height: 44.0,
             island_gap: 10.0,
             expand_delay_ms: 30,
             collapse_delay_ms: 600,
             island_show_clock: true,
+            island_sleep_seconds: 60,
             window_animation: true,
         }
     }
@@ -180,7 +183,8 @@ impl Config {
         config.bar.height = clamp_or(config.bar.height, 32.0, 96.0, 48.0);
         config.bar.icon_size = clamp_or(config.bar.icon_size, 16.0, 48.0, 24.0);
         config.bar.island_width = clamp_or(config.bar.island_width, 40.0, 600.0, 200.0);
-        config.bar.island_height = clamp_or(config.bar.island_height, 4.0, 80.0, 40.0);
+        config.bar.island_height = clamp_or(config.bar.island_height, 4.0, 80.0, 44.0);
+        config.bar.island_sleep_seconds = config.bar.island_sleep_seconds.min(3600);
         config.bar.island_gap = clamp_or(config.bar.island_gap, 0.0, 60.0, 10.0);
         config.bar.island_opacity = clamp_or(config.bar.island_opacity, 0.0, 1.0, 0.45);
         config.bar.expand_delay_ms = config.bar.expand_delay_ms.min(2000);
@@ -216,15 +220,16 @@ background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acr
 #             nhấn phím Win) thì bung ra; không chiếm chỗ, taskbar gốc được ẩn.
 #   "full":   thanh luôn hiện và giữ chỗ như taskbar thường.
 mode = "island"
-island_style = "glass"       # "glass" (kính mờ, blur phần phía sau) hoặc "black" (đen đặc)
+island_style = "black"       # "black" (đen đặc) hoặc "glass" (kính mờ, blur phần phía sau)
 island_color = "wallpaper"   # màu lớp tint của kính: "wallpaper" (màu chủ đạo của hình nền), "accent" (màu nhấn Windows) hoặc "#RRGGBB"
 island_opacity = 0.45        # độ đậm của lớp tint (0.0 .. 1.0)
 island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
-island_height = 40           # (DIP, 4..80)
+island_height = 44           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
 expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay lập tức)
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
-island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)
+island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là linh vật Nitro)
+island_sleep_seconds = 60    # máy rảnh bao lâu thì linh vật ngủ (giây, 0 = không ngủ)
 
 # Thu nhỏ cửa sổ: cửa sổ co lại, tối dần rồi "chui" vào island (viên nảy lên, hiện icon app);
 # bấm nút trên thanh để khôi phục thì cửa sổ bung ra từ đó. false = hiệu ứng của Windows.
@@ -253,7 +258,7 @@ pub fn path() -> Option<PathBuf> {
 }
 
 /// The island lines the first island version wrote (a 120x8 pill, 100 ms delay...).
-const LEGACY_ISLAND: [(&str, &str); 4] = [
+const LEGACY_ISLAND: [(&str, &str); 6] = [
     (
         "island_width = 120           # cỡ viên khi thu gọn (DIP, 40..600)",
         "island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)",
@@ -270,6 +275,15 @@ island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
     (
         "island_show_clock = false    # hiện giờ nhỏ trong viên",
         "island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)",
+    ),
+    // Applied after the lines above, so the first version's file ends up current too.
+    (
+        "island_height = 40           # (DIP, 4..80)",
+        "island_height = 44           # (DIP, 4..80)",
+    ),
+    (
+        "island_style = \"glass\"       # \"glass\" (kính mờ, blur phần phía sau) hoặc \"black\" (đen đặc)",
+        "island_style = \"black\"       # \"black\" (đen đặc) hoặc \"glass\" (kính mờ, blur phần phía sau)",
     ),
 ];
 
@@ -420,20 +434,20 @@ island_show_clock = false    # hiện giờ nhỏ trong viên
         let edited = legacy.replace("island_width = 120 ", "island_width = 150 ");
         let config = Config::parse(&migrate_legacy(&edited).unwrap()).unwrap();
         assert_eq!(config.bar.island_width, 150.0);
-        assert_eq!(config.bar.island_height, 40.0);
+        assert_eq!(config.bar.island_height, 44.0);
         assert!(migrate_legacy(DEFAULT_CONFIG).is_none());
     }
 
     #[test]
-    fn island_style_defaults_to_glass() {
-        assert_eq!(Config::default().bar.island_style, IslandStyle::Glass);
-        let black = Config::parse(
+    fn island_style_defaults_to_black() {
+        assert_eq!(Config::default().bar.island_style, IslandStyle::Black);
+        let glass = Config::parse(
             "[bar]
-island_style = \"black\"
+island_style = \"glass\"
 ",
         )
         .unwrap();
-        assert_eq!(black.bar.island_style, IslandStyle::Black);
+        assert_eq!(glass.bar.island_style, IslandStyle::Glass);
         assert!(
             Config::parse(
                 "[bar]

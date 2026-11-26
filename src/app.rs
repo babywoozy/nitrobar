@@ -6,6 +6,7 @@
 //! handling / `DefWindowProc` instead of aliasing `&mut App`.
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 use std::time::Instant;
 
 use windows::Win32::Foundation::{
@@ -61,10 +62,12 @@ use crate::glass::Glass;
 use crate::icons::{Icon, IconLoader};
 use crate::island::{self, EdgeSensor, Island, Pulse};
 use crate::layout::{BarLayout, Hit, Metrics};
+use crate::mascot::{self, Mascot};
+use crate::media::{self, Bars, Media, Meter, Track};
 use crate::morph::{self, Morph};
 use crate::pins::{self, Pins};
 use crate::preview::{self, Preview};
-use crate::render::{Badge, IslandView, RestView};
+use crate::render::{Badge, IslandView, MascotView, MusicView, RestView};
 use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
 use crate::status::{self, Status};
 use crate::tasks::AppId;
@@ -95,10 +98,10 @@ const ZOOM_MAX: f32 = 0.20;
 const ZOOM_EASE: f32 = 0.05;
 /// The resting pill: black like the Dynamic Island, with a faint hairline.
 const REST_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
-    r: 0.035,
-    g: 0.035,
-    b: 0.04,
-    a: 0.97,
+    r: 0.027,
+    g: 0.027,
+    b: 0.031,
+    a: 1.0,
 };
 const REST_BORDER: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
@@ -119,11 +122,17 @@ const REST_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 0.95,
 };
-/// Space between the pill's edge and its icon / clock, and the clock's width, DIPs.
-const REST_PADDING: f32 = 14.0;
-const REST_CLOCK_WIDTH: f32 = 76.0;
-/// Crossfade when the active app (and so the pill's icon) changes.
-const REST_FADE: std::time::Duration = std::time::Duration::from_millis(240);
+/// Mascot: one-shot "has the machine been idle long enough?", the floating "z".
+const TIMER_SLEEP: usize = 5;
+const TIMER_ZZZ: usize = 6;
+/// Equalizer frames, only while music plays and the pill is on screen.
+const TIMER_BARS: usize = 7;
+const BARS_FRAME_MS: u32 = 33;
+/// Hover delay when the mascot is asleep, so that its wake-up hop is seen first.
+const WAKE_EXPAND_DELAY_MS: u32 = 320;
+/// Pill width while music shows, DIPs, and how long it takes to grow / shrink.
+const MUSIC_WIDTH: f32 = 288.0;
+const MUSIC_BLEND: std::time::Duration = std::time::Duration::from_millis(420);
 /// Sent once after creation to run setup inside the window procedure.
 const WM_APP_INIT: u32 = WM_APP + 2;
 /// `HSHELL_REDRAW | HSHELL_HIGHBIT`: a window is flashing for attention.
@@ -198,8 +207,17 @@ struct App {
     origin: (f32, f32),
     /// Island: the part of the window that takes the pointer (screen pixels).
     hit_rect: RECT,
-    /// Island: icon of the active app shown at rest, and the one it replaces.
-    rest_icon: RestIcon,
+    /// Island: the mascot, and the foreground window that last woke it.
+    mascot: Mascot,
+    mascot_fg: HWND,
+    /// Island: the media watcher, what it reported last, its cover as an icon, and
+    /// the equalizer (meter and timer only while bars are on screen).
+    media: Option<Media>,
+    track: Option<Arc<Track>>,
+    art: Option<Icon>,
+    music: Blend,
+    meter: Option<Meter>,
+    bars: Bars,
     /// Island glass style: the blur window below the bar (`None`: black style, or
     /// Windows.UI.Composition unavailable), and whether the backdrop behind the
     /// pill is light (text / icons turn dark).
@@ -227,12 +245,42 @@ struct App {
     own_restore: Option<(HWND, Instant)>,
 }
 
-/// The pill's icon: the active app's, crossfading from the previous one.
-#[derive(Default)]
-struct RestIcon {
-    now: Option<Icon>,
-    prev: Option<Icon>,
-    changed: Option<Instant>,
+/// How much of the pill shows music (0 = mascot and clock, 1 = music), easing
+/// with a light spring toward `target`.
+#[derive(Clone, Copy, Default)]
+struct Blend {
+    from: f32,
+    target: f32,
+    start: Option<Instant>,
+}
+
+impl Blend {
+    fn value(&self, now: Instant) -> f32 {
+        match self.start {
+            Some(at) if now.saturating_duration_since(at) < MUSIC_BLEND => {
+                let t = now.saturating_duration_since(at).as_secs_f32();
+                island::lerp(self.from, self.target, morph::spring(t, 20.0, 0.78))
+            }
+            _ => self.target,
+        }
+    }
+
+    fn moving(&self, now: Instant) -> bool {
+        self.start
+            .is_some_and(|at| now.saturating_duration_since(at) < MUSIC_BLEND)
+    }
+
+    fn go(&mut self, target: f32, now: Instant) -> bool {
+        if self.target == target {
+            return false;
+        }
+        *self = Self {
+            from: self.value(now),
+            target,
+            start: Some(now),
+        };
+        true
+    }
 }
 
 struct IslandState {
@@ -358,7 +406,14 @@ fn run_window(options: Options) -> Result<()> {
             bar_rect: RECT::default(),
             origin: (0.0, 0.0),
             hit_rect: RECT::default(),
-            rest_icon: RestIcon::default(),
+            mascot: Mascot::default(),
+            mascot_fg: HWND::default(),
+            media: None,
+            track: None,
+            art: None,
+            music: Blend::default(),
+            meter: None,
+            bars: Bars::default(),
             glass: None,
             wallpaper_color: None,
             zoom: Vec::new(),
@@ -486,6 +541,7 @@ fn on_busy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         return;
     }
     let keep = msg == WM_APP_MINIMIZED
+        || msg == media::WM_APP_MEDIA
         || msg == wallpaper::WM_APP_WALLPAPER
         || msg == WM_APP_CONFIG
         || msg == WM_APP_PINS
@@ -705,6 +761,15 @@ impl App {
                 self.start_frames();
             }
             morph::WM_APP_FRAME => self.on_frame(),
+            media::WM_APP_MEDIA => self.on_media(),
+            WM_TIMER if wparam.0 == TIMER_SLEEP => self.on_sleep_timer(),
+            WM_TIMER if wparam.0 == TIMER_ZZZ => {
+                if !self.mascot.step_z() {
+                    self.kill_timer(TIMER_ZZZ);
+                }
+                self.invalidate();
+            }
+            WM_TIMER if wparam.0 == TIMER_BARS => self.on_bars_timer(),
             wallpaper::WM_APP_WALLPAPER => {
                 let c = lparam.0 as u32;
                 self.wallpaper_color = Some(D2D1_COLOR_F {
@@ -910,6 +975,164 @@ impl App {
             self.glass = None;
         }
         self.request_wallpaper(false);
+        if self.island.is_some() {
+            if self.media.is_none() {
+                self.media = Media::start(self.hwnd);
+            }
+            self.arm_sleep();
+        } else {
+            self.kill_timer(TIMER_SLEEP);
+            self.kill_timer(TIMER_ZZZ);
+            self.kill_timer(TIMER_BARS);
+            self.meter = None;
+        }
+    }
+
+    // ----- mascot and music -----
+
+    /// Starts over the countdown to the mascot's nap.
+    fn arm_sleep(&mut self) {
+        let seconds = self.config.bar.island_sleep_seconds;
+        if seconds == 0 {
+            self.kill_timer(TIMER_SLEEP);
+            if self.mascot.wake(Instant::now()) {
+                self.invalidate();
+            }
+        } else if !self.mascot.asleep() {
+            self.set_timer(TIMER_SLEEP, seconds * 1000);
+        }
+    }
+
+    /// One-shot: asleep if there was no input for long enough, else check again
+    /// when that could be the case.
+    fn on_sleep_timer(&mut self) {
+        self.kill_timer(TIMER_SLEEP);
+        let needed = self.config.bar.island_sleep_seconds.saturating_mul(1000);
+        if needed == 0 {
+            return;
+        }
+        let idle = mascot::idle_millis();
+        if idle >= needed {
+            self.mascot.sleep();
+            self.set_timer(TIMER_ZZZ, mascot::Z_STEP_MS);
+            self.invalidate();
+        } else {
+            self.set_timer(TIMER_SLEEP, needed - idle);
+        }
+    }
+
+    /// Returns true if it was asleep.
+    fn wake_mascot(&mut self) -> bool {
+        if !self.mascot.wake(Instant::now()) {
+            return false;
+        }
+        self.kill_timer(TIMER_ZZZ);
+        self.arm_sleep();
+        self.start_frames();
+        true
+    }
+
+    fn waking(&self) -> bool {
+        self.mascot.waking(Instant::now())
+    }
+
+    fn music_showing(&self) -> bool {
+        self.track.as_ref().is_some_and(|t| t.playing)
+    }
+
+    /// The media watcher has a new snapshot.
+    fn on_media(&mut self) {
+        let now = Instant::now();
+        let track = media::current();
+        let playing = track.as_ref().is_some_and(|t| t.playing);
+        // A session that went away keeps its last picture while the pill shrinks.
+        if let Some(track) = track {
+            let art = track
+                .art
+                .as_ref()
+                .and_then(|px| self.icons.icon_from_pixels(px, track.art_px));
+            self.art = art;
+            self.track = Some(track);
+        } else if let Some(old) = &self.track {
+            self.track = Some(Arc::new(Track {
+                title: old.title.clone(),
+                artist: old.artist.clone(),
+                playing: false,
+                art: None,
+                art_px: old.art_px,
+                accent: old.accent,
+            }));
+        }
+        if self.music.go(if playing { 1.0 } else { 0.0 }, now) {
+            self.start_frames();
+        }
+        self.update_bars_timer();
+        self.invalidate();
+    }
+
+    /// The bars move only while music plays and the pill is on screen.
+    fn bars_wanted(&self) -> bool {
+        self.music_showing()
+            && self.island.as_ref().is_some_and(|s| s.small_window)
+            && !(self.fullscreen_app || self.foreground_fullscreen)
+    }
+
+    fn update_bars_timer(&mut self) {
+        if !self.bars_wanted() {
+            self.kill_timer(TIMER_BARS);
+            self.meter = None;
+        } else if self.meter.is_none() {
+            // Fetched on every start: follows the default output device.
+            self.meter = Meter::new();
+            if self.meter.is_some() {
+                self.set_timer(TIMER_BARS, BARS_FRAME_MS);
+            }
+        }
+    }
+
+    fn on_bars_timer(&mut self) {
+        if !self.bars_wanted() {
+            self.update_bars_timer();
+            return;
+        }
+        let peak = self.meter.as_ref().map_or(0.0, Meter::peak);
+        let before = self.bars.levels;
+        self.bars.step(peak, BARS_FRAME_MS as f32 / 1000.0);
+        // Silence (levels settled): nothing to redraw.
+        if before
+            .iter()
+            .zip(self.bars.levels)
+            .any(|(a, b)| (a - b).abs() > 0.01)
+        {
+            self.paint();
+        }
+    }
+
+    /// The one accent color of the island: from the playing song's cover, else from
+    /// `island_color`; bright enough to read on black.
+    fn island_accent(&self) -> D2D1_COLOR_F {
+        let cover = self
+            .track
+            .as_ref()
+            .filter(|t| t.playing)
+            .and_then(|t| t.accent);
+        let base = match cover {
+            Some((r, g, b)) => D2D1_COLOR_F {
+                r: f32::from(r) / 255.0,
+                g: f32::from(g) / 255.0,
+                b: f32::from(b) / 255.0,
+                a: 1.0,
+            },
+            None => self.island_base(),
+        };
+        let (h, sat, _) = wallpaper::to_hsv(base.r, base.g, base.b);
+        let sat = if sat > 0.08 {
+            sat.clamp(0.42, 0.72)
+        } else {
+            sat
+        };
+        let (r, g, b) = wallpaper::from_hsv(h, sat, 0.95);
+        D2D1_COLOR_F { r, g, b, a: 1.0 }
     }
 
     /// Looks the wallpaper color up when the island needs it (see `wallpaper::request`).
@@ -1246,6 +1469,10 @@ impl App {
         self.place_island();
         MIN_RECT.set(self.default_min_rect().unwrap_or_default());
         WINDOW_ANIMATION.set(self.config.bar.window_animation);
+        if let Some(media) = &self.media {
+            let (content, _) = island::pill_padding(self.config.bar.island_height);
+            media.set_art_size(scale(content, self.dpi) as u32);
+        }
         let icon_px = scale(self.metrics.icon_size, self.dpi) as u32;
         if icon_px != self.icon_px {
             self.icon_px = icon_px;
@@ -1267,7 +1494,12 @@ impl App {
             taskbar::foreground_changed(island::is_shell_flyout(self.tasks.foreground));
         }
         if self.island.is_some() {
-            self.update_rest_icon();
+            if self.tasks.foreground != self.mascot_fg {
+                self.mascot_fg = self.tasks.foreground;
+                if !self.wake_mascot() {
+                    self.arm_sleep();
+                }
+            }
             self.on_foreground_changed();
         }
     }
@@ -1441,14 +1673,17 @@ impl App {
         }
         .palette();
         p.text = self.rest_text();
+        // One accent color; everything else is black, white or grey.
+        p.accent = self.island_accent();
+        p.attention = p.accent;
         p.hover = white(0.10);
         p.pressed = white(0.16);
         p.active = white(0.12);
         p.active_hover = white(0.16);
-        p.indicator = white(0.6);
+        p.indicator = white(0.45);
         p.placeholder = white(0.18);
         p.attention_bg = D2D1_COLOR_F {
-            a: 0.3,
+            a: 0.22,
             ..p.attention
         };
         p
@@ -1571,7 +1806,7 @@ impl App {
         island::strip_layout(
             self.bar_width_dip(),
             self.island_strip_height(),
-            &self.config.bar,
+            &self.island_config(self.music.target),
             self.metrics.icon_size,
             self.items().len(),
             layout::status_width(view.icons.len(), view.percent.is_some()),
@@ -1580,12 +1815,24 @@ impl App {
     }
 
     fn island_geometry(&self) -> island::Geometry {
+        self.geometry_with(self.island_config(self.music.value(Instant::now())))
+    }
+
+    fn geometry_with(&self, config: config::BarConfig) -> island::Geometry {
         island::geometry(
             self.bar_width_dip(),
             self.island_strip_height(),
-            &self.config.bar,
+            &config,
             self.metrics.at_top,
         )
+    }
+
+    /// `[bar]` with the pill as wide as the share of music it shows asks for.
+    fn island_config(&self, music: f32) -> config::BarConfig {
+        let mut config = self.config.bar.clone();
+        let wide = config.island_width.max(MUSIC_WIDTH);
+        config.island_width = island::lerp(config.island_width, wide, music);
+        config
     }
 
     /// The pointer entered (pill, bar or screen edge) or left. Entering arms the
@@ -1607,10 +1854,20 @@ impl App {
             if expanded {
                 return;
             }
-            if animating || self.config.bar.expand_delay_ms == 0 {
+            // The pointer wakes the mascot; it gets a moment to hop before the
+            // strip opens over it.
+            let woke = self.wake_mascot();
+            let mut delay = self.config.bar.expand_delay_ms;
+            if woke && !self.music_showing() {
+                delay = delay.max(WAKE_EXPAND_DELAY_MS);
+            }
+            if animating || delay == 0 {
                 self.begin_expand();
             } else {
-                self.set_timer(TIMER_EXPAND, self.config.bar.expand_delay_ms);
+                // Not re-armed by every mouse move while waking.
+                if woke || !self.waking() {
+                    self.set_timer(TIMER_EXPAND, delay);
+                }
             }
         } else {
             self.kill_timer(TIMER_EXPAND);
@@ -1908,15 +2165,23 @@ impl App {
             self.suppress_expand = false;
         }
 
-        if self.island.is_some()
-            && let Some(at) = self.rest_icon.changed
-        {
-            repaint = true;
-            if now.saturating_duration_since(at) < REST_FADE {
+        if self.island.is_some() {
+            if self.mascot.waking(now) {
                 running = true;
-            } else {
-                self.rest_icon.changed = None;
-                self.rest_icon.prev = None;
+                repaint = true;
+            }
+            if self.music.start.is_some() {
+                if self.music.moving(now) {
+                    running = true;
+                } else {
+                    self.music.start = None;
+                }
+                // The pill changed width: its window region and hover zone follow.
+                if self.island.as_ref().is_some_and(|s| s.small_window) {
+                    self.place_island();
+                } else {
+                    repaint = true;
+                }
             }
         }
 
@@ -2093,12 +2358,15 @@ impl App {
         // limits it to the pill's hover area otherwise. Changing the region keeps
         // the drawn surface in place (resizing / moving the window shows the old
         // frame at the new position for a frame).
+        // Sized for the widest pill (music), so that growing the pill only changes
+        // the region.
+        let widest = self.geometry_with(self.island_config(1.0));
         let rc = if small {
-            to_screen(&geometry.activity_hit)
+            to_screen(&widest.activity_hit)
         } else {
             // Expanded: the strip panel's window (with room for its spring overshoot).
             let strip = self.strip().window;
-            let a = geometry.activity_hit;
+            let a = widest.activity_hit;
             to_screen(&D2D_RECT_F {
                 left: strip.left.min(a.left),
                 top: strip.top.min(a.top),
@@ -2174,6 +2442,7 @@ impl App {
         if !small {
             self.debug_strip();
         }
+        self.update_bars_timer();
         self.paint();
     }
 
@@ -2228,30 +2497,6 @@ impl App {
         }
     }
 
-    /// Remembers the icon of the active app for the pill (crossfading from the old one).
-    fn update_rest_icon(&mut self) {
-        let icon = self
-            .tasks
-            .groups
-            .iter()
-            .find(|g| g.contains(self.tasks.foreground))
-            .and_then(|g| g.icon.clone());
-        // Windows without a button (desktop, flyouts) keep the last app's icon.
-        let Some(icon) = icon else {
-            return;
-        };
-        if self.rest_icon.now.as_ref().is_some_and(|i| i.id == icon.id) {
-            return;
-        }
-        self.rest_icon.prev = self.rest_icon.now.take();
-        self.rest_icon.now = Some(icon);
-        self.rest_icon.changed = Some(Instant::now());
-        if self.island.is_some() {
-            self.start_frames();
-            self.invalidate();
-        }
-    }
-
     /// The island's tint color (glass style): the wallpaper's dominant color,
     /// Windows' accent color, or the color the user picked.
     fn island_base(&self) -> D2D1_COLOR_F {
@@ -2300,33 +2545,16 @@ impl App {
         }
     }
 
-    /// Opacity of the new icon while crossfading (1 when settled).
-    fn rest_fade(&self, now: Instant) -> f32 {
-        self.rest_icon.changed.map_or(1.0, |at| {
-            let t = now.saturating_duration_since(at).as_secs_f32() / REST_FADE.as_secs_f32();
-            morph::ease_in_out_cubic(t.min(1.0))
-        })
-    }
-
     /// How the island looks right now (`None` in full mode).
     fn island_view(&self, clock: &clock::ClockText) -> Option<IslandView> {
         let state = self.island.as_ref()?;
         let g = self.island_geometry();
         let t = state.anim.eased();
         let t_clamped = t.clamp(0.0, 1.0);
-        let palette = self.palette();
         let attention = self.tasks.groups.iter().any(|g| g.attention);
         let glass = self.glass_style();
-        let mut pill = if attention {
-            palette.attention
-        } else if glass {
-            self.glass_tint()
-        } else {
-            REST_FILL
-        };
-        if attention {
-            pill.a = 0.95;
-        }
+        let accent = self.island_accent();
+        let pill = if glass { self.glass_tint() } else { REST_FILL };
         let strip = self.strip().panel;
         // An app going in / out: the pill grows (with spring overshoot) and shows the
         // app's icon instead of its usual content.
@@ -2336,42 +2564,44 @@ impl App {
         let pill_rect = island::pulsed_pill(&g, pulse);
         let panel = island::lerp_rect(&pill_rect, &strip, t);
         let mut border = if glass { GLASS_BORDER } else { REST_BORDER };
+        // An app asking for attention: the hairline takes the accent color.
         if attention {
-            border.a = 0.0;
+            border = D2D1_COLOR_F { a: 0.95, ..accent };
         }
 
-        // Rest content: active app icon on the left, time on the right.
+        // Collapsed content: the mascot and the time, or the music.
         let pill_h = g.pill.bottom - g.pill.top;
         let pill_w = g.pill.right - g.pill.left;
+        let places = island::rest_layout(&g.pill);
         let rest_opacity = (1.0 - t_clamped / 0.45).max(0.0) * (1.0 - deep);
-        let icon_box = (pill_h - 14.0).clamp(0.0, self.metrics.icon_size);
-        let mut icons = Vec::new();
-        if icon_box >= 8.0 {
-            let rect = D2D_RECT_F {
-                left: g.pill.left + REST_PADDING,
-                top: g.pill.top,
-                right: g.pill.left + REST_PADDING + icon_box,
-                bottom: g.pill.bottom,
-            };
-            let fade = self.rest_fade(now);
-            if let Some(prev) = self.rest_icon.prev.as_ref().filter(|_| fade < 1.0) {
-                icons.push((prev.clone(), 1.0 - fade, rect));
-            }
-            if let Some(icon) = &self.rest_icon.now {
-                icons.push((icon.clone(), fade, rect));
-            }
-        }
-        let clock_text = (self.config.bar.island_show_clock && pill_w >= 100.0).then(|| {
-            (
-                clock.time.clone(),
-                D2D_RECT_F {
-                    left: g.pill.right - REST_PADDING - REST_CLOCK_WIDTH,
-                    top: g.pill.top,
-                    right: g.pill.right - REST_PADDING,
-                    bottom: g.pill.bottom,
-                },
-            )
+        let music_mix = self.music.value(now).clamp(0.0, 1.0);
+        let text = self.rest_text();
+        let secondary = D2D1_COLOR_F {
+            a: text.a * 0.6,
+            ..text
+        };
+        let mascot = (pill_h >= 20.0).then(|| MascotView {
+            rect: places.mascot,
+            asleep: self.mascot.asleep(),
+            scale: self.mascot.scale(now),
+            z: self.mascot.z_phase(),
         });
+        let clock_text = (self.config.bar.island_show_clock && pill_w >= 100.0)
+            .then(|| (clock.time.clone(), places.clock));
+        let music = self
+            .track
+            .as_ref()
+            .filter(|_| music_mix > 0.01)
+            .map(|track| MusicView {
+                art: self.art.clone(),
+                art_rect: places.art,
+                title: track.title.clone(),
+                title_rect: places.title,
+                artist: track.artist.clone(),
+                artist_rect: places.artist,
+                bars: self.bars.levels,
+                bars_rect: places.bars,
+            });
         Some(IslandView {
             panel,
             // Fully rounded at every size, like the Dynamic Island.
@@ -2384,9 +2614,13 @@ impl App {
             content_opacity: ((t_clamped - 0.35) / 0.65).clamp(0.0, 1.0),
             rest: Some(RestView {
                 opacity: rest_opacity,
-                icons,
+                music_mix,
+                mascot,
                 clock: clock_text,
-                text: self.rest_text(),
+                music,
+                text,
+                secondary,
+                accent,
             }),
             badge: state
                 .pulse

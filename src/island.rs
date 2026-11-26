@@ -31,6 +31,7 @@ use windows::core::{PCWSTR, w};
 use crate::config::BarConfig;
 use crate::icons::Icon;
 use crate::layout::{CLOCK_WIDTH, STATUS_GAP};
+use crate::media::BARS;
 use crate::morph::spring;
 use crate::tasks;
 
@@ -323,8 +324,86 @@ pub fn geometry(width: f32, strip_height: f32, config: &BarConfig, at_top: bool)
     }
 }
 
-/// Space around the icons inside the expanded pill, between buttons, and around the divider.
-const STRIP_PAD: f32 = 12.0;
+/// Equalizer bar width and the space between bars, DIPs.
+pub const BAR_WIDTH: f32 = 4.0;
+pub const BAR_GAP: f32 = 3.0;
+/// Clock's distance from the pill's end, as a share of the pill's height: matches
+/// the visible gap around the mascot on the other side.
+const CLOCK_INSET: f32 = 0.31;
+const CLOCK_TEXT_WIDTH: f32 = 90.0;
+
+/// (content size, padding) of a pill `height` tall: the content is centered with the
+/// same padding above, below and at the pill's end.
+pub fn pill_padding(height: f32) -> (f32, f32) {
+    let content = (height * 0.68).round();
+    (content, (height - content) / 2.0)
+}
+
+/// Where the collapsed pill's content goes (bar space).
+#[derive(Clone, Copy, Debug)]
+pub struct RestLayout {
+    /// The mascot's box (its drawing leaves a margin inside it).
+    pub mascot: D2D_RECT_F,
+    pub clock: D2D_RECT_F,
+    /// Round cover art: concentric with the pill's round end.
+    pub art: D2D_RECT_F,
+    pub title: D2D_RECT_F,
+    pub artist: D2D_RECT_F,
+    pub bars: D2D_RECT_F,
+}
+
+pub fn rest_layout(pill: &D2D_RECT_F) -> RestLayout {
+    let h = pill.bottom - pill.top;
+    let (content, pad) = pill_padding(h);
+    let mid = (pill.top + pill.bottom) / 2.0;
+    let rect = |left: f32, top: f32, right: f32, bottom: f32| D2D_RECT_F {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    let square = |left: f32| {
+        rect(
+            left,
+            mid - content / 2.0,
+            left + content,
+            mid + content / 2.0,
+        )
+    };
+    // The flame has some room around it inside its box (3/24 at the sides), which
+    // makes up for the pill's end curving in toward its widest part.
+    let mascot = square(pill.left + pad);
+    let inset = (h * CLOCK_INSET).round();
+    let clock_right = pill.right - inset;
+    let clock = rect(
+        clock_right - CLOCK_TEXT_WIDTH,
+        pill.top,
+        clock_right,
+        pill.bottom - 1.0,
+    );
+    let art = square(pill.left + pad);
+    let bars_w = BARS as f32 * (BAR_WIDTH + BAR_GAP) - BAR_GAP;
+    let bars_h = (h * 0.42).round();
+    let bars_right = pill.right - (h - bars_h) / 2.0;
+    let bars = rect(
+        bars_right - bars_w,
+        mid - bars_h / 2.0,
+        bars_right,
+        mid + bars_h / 2.0,
+    );
+    let left = art.right + pad + 3.0;
+    let right = (bars.left - pad - 2.0).max(left);
+    RestLayout {
+        mascot,
+        clock,
+        art,
+        title: rect(left, mid - 16.0, right, mid + 1.0),
+        artist: rect(left, mid, right, mid + 15.0),
+        bars,
+    }
+}
+
+/// Space between buttons and around the divider.
 const STRIP_GAP: f32 = 2.0;
 const DIVIDER_SPACE: f32 = 8.0;
 /// Height of the divider line between the apps and the status area.
@@ -357,12 +436,15 @@ pub fn strip_layout(
 ) -> StripLayout {
     let button = icon_size + 16.0;
     let panel_h = (button + 12.0).max(config.island_height);
+    // The same space at the ends as above and below: the first button's round
+    // plate sits concentric in the panel's round end.
+    let pad = (panel_h - button) / 2.0;
     let status_gap = if status_width > 0.0 { STATUS_GAP } else { 0.0 };
     let tail = status_width + status_gap + CLOCK_WIDTH;
     let divider_w = |apps: bool| {
         if apps { DIVIDER_SPACE * 2.0 + 1.0 } else { 0.0 }
     };
-    let fixed = STRIP_PAD * 2.0 + tail + divider_w(items > 0);
+    let fixed = pad * 2.0 + tail + divider_w(items > 0);
     let room = (width - 32.0 - fixed + STRIP_GAP) / (button + STRIP_GAP);
     let n = items.min(room.floor().max(0.0) as usize);
     let apps_w = if n > 0 {
@@ -370,9 +452,9 @@ pub fn strip_layout(
     } else {
         0.0
     };
-    let panel_w = (STRIP_PAD * 2.0 + apps_w + divider_w(n > 0) + tail)
-        .max(config.island_width)
-        .min(width);
+    let natural = pad * 2.0 + apps_w + divider_w(n > 0) + tail;
+    // Never narrower than the pill; any extra is split between the two ends.
+    let panel_w = natural.max(config.island_width).min(width);
     let left = ((width - panel_w) / 2.0).round();
     let (top, bottom) = band_y(at_top, strip_height, config.island_gap, panel_h);
     let panel = D2D_RECT_F {
@@ -389,7 +471,7 @@ pub fn strip_layout(
         right: l + w,
         bottom: row_top + button,
     };
-    let first = left + STRIP_PAD;
+    let first = left + pad + ((panel_w - natural) / 2.0).max(0.0);
     let buttons: Vec<D2D_RECT_F> = (0..n)
         .map(|i| row(first + i as f32 * (button + STRIP_GAP), button))
         .collect();
@@ -642,7 +724,7 @@ mod tests {
         let g = geometry(1920.0, strip, &config, false);
         assert_eq!(
             (g.pill.right - g.pill.left, g.pill.bottom - g.pill.top),
-            (200.0, 40.0)
+            (200.0, 44.0)
         );
         assert_eq!((g.pill.left + g.pill.right) / 2.0, 960.0);
         assert_eq!(g.pill.bottom, strip - config.island_gap, "gap to the edge");
@@ -651,6 +733,29 @@ mod tests {
         assert_eq!(top.pill.top, config.island_gap);
         assert_eq!(top.hit.top, 0.0);
         assert!(g.activity_hit.top >= 0.0);
+    }
+
+    #[test]
+    fn collapsed_content_has_equal_margins() {
+        let pill = D2D_RECT_F {
+            left: 100.0,
+            top: 20.0,
+            right: 388.0,
+            bottom: 64.0,
+        };
+        let l = rest_layout(&pill);
+        let (content, pad) = pill_padding(44.0);
+        // Cover: same gap at the end, above and below; concentric with the round end.
+        assert_eq!(l.art.left - pill.left, pad);
+        assert_eq!(l.art.top - pill.top, pad);
+        assert_eq!(pill.bottom - l.art.bottom, pad);
+        assert_eq!(content / 2.0, 44.0 / 2.0 - pad, "nested radius");
+        // Bars: centered, as far from the end as from the top.
+        assert_eq!(pill.right - l.bars.right, l.bars.top - pill.top);
+        assert_eq!(l.bars.top - pill.top, pill.bottom - l.bars.bottom);
+        // Two text lines centered between the cover and the bars.
+        assert!(l.title.left > l.art.right && l.title.right < l.bars.left);
+        assert!(((l.title.top + l.artist.bottom) / 2.0 - 42.0).abs() <= 1.0);
     }
 
     #[test]

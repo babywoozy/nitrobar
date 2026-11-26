@@ -98,6 +98,24 @@ impl IconLoader {
         })
     }
 
+    /// An icon from `size` square premultiplied BGRA pixels (cover art).
+    pub fn icon_from_pixels(&self, pixels: &[u8], size: u32) -> Option<Icon> {
+        if pixels.len() != (size * size * 4) as usize {
+            return None;
+        }
+        let bitmap = unsafe {
+            self.wic.CreateBitmapFromMemory(
+                size,
+                size,
+                &GUID_WICPixelFormat32bppPBGRA,
+                size * 4,
+                pixels,
+            )
+        }
+        .ok()?;
+        self.finish(bitmap)
+    }
+
     /// Icon for a running window of `app`.
     pub fn load(&self, hwnd: HWND, app: &AppId, px: u32) -> Option<Icon> {
         let exe = app.exe.as_deref().filter(|exe| !is_host_exe(exe));

@@ -5,12 +5,14 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
 
 ## Tính năng
 
-- **Chế độ island (mặc định)**: một viên kính mờ bo tròn nổi ở giữa mép dưới màn hình (200×40 DIP,
-  cách mép 10 DIP). `island_style = "glass"` (mặc định): blur thật phần phía sau (kể cả cửa sổ app),
-  lớp màu nhẹ, viền sáng 1 px, góc bo khử răng cưa; chữ và icon tự chuyển tối / sáng theo nền phía sau.
-  `island_style = "black"`: viên đen đặc có bóng đổ mềm. Bên trái là icon của app đang active (đổi app thì icon mờ chuyển sang
-  icon mới), bên phải là giờ. Thanh không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc
-  được ẩn).
+- **Chế độ island (mặc định)**: một viên đen bo tròn nổi ở giữa mép dưới màn hình (200×44 DIP, cách
+  mép 10 DIP). `island_style = "black"` (mặc định) hoặc `"glass"` (kính mờ blur phần phía sau). Chỉ có
+  đen / trắng / xám và một màu nhấn (lấy từ ảnh bìa bài đang phát, nếu không thì theo `island_color`).
+  - Lúc nghỉ: bên trái là linh vật **Nitro** (tia lửa có mắt), bên phải là giờ. Máy rảnh quá
+    `island_sleep_seconds` thì Nitro ngủ (chữ "z" bay lên); rê chuột tới thì nó bật dậy.
+  - Đang phát nhạc / video (theo bảng media của Windows): viên nới rộng, ảnh bìa tròn + tên bài và
+    nghệ sĩ bên trái, bốn cột sóng nhảy theo độ to của âm thanh bên phải.
+  - Thanh không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc được ẩn).
   - Rê chuột vào viên hoặc chạm mép dưới ở đoạn giữa (rộng bằng viên + 40 DIP mỗi bên; phần còn lại
     của mép, ví dụ ô chat của app khác, không làm gì) thì sau ~30 ms viên giãn ngang (~200 ms, lò xo nhẹ) thành dải
     icon các app (app ghim + đang chạy, gom theo app), vẫn là một khối bo tròn nổi, rộng vừa đủ. Vạch
@@ -86,15 +88,16 @@ theme = "auto"               # "auto" (theo Windows), "dark" hoặc "light"
 background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acrylic" hoặc "solid" (đặc)
 
 mode = "island"              # "island" (thu gọn, rê chuột thì bung ra) hoặc "full" (luôn hiện)
-island_style = "glass"       # "glass" (kính mờ, blur phần phía sau) hoặc "black" (đen đặc)
+island_style = "black"       # "black" (đen đặc) hoặc "glass" (kính mờ, blur phần phía sau)
 island_color = "wallpaper"   # màu tint của kính: "wallpaper" (màu chủ đạo hình nền), "accent" (màu Windows) hoặc "#RRGGBB"
 island_opacity = 0.45        # độ đậm lớp tint (0.0 .. 1.0)
 island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
-island_height = 40           # (DIP, 4..80)
+island_height = 44           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
 expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay lập tức)
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
-island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)
+island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là linh vật Nitro)
+island_sleep_seconds = 60    # máy rảnh bao lâu thì linh vật ngủ (giây, 0 = không ngủ)
 window_animation = true      # thu nhỏ cửa sổ "chui" vào island; false = hiệu ứng của Windows
 
 [colors]                     # để trống = theo theme Windows; "#RRGGBB" hoặc "#RRGGBBAA"

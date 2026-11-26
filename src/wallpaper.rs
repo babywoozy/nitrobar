@@ -145,7 +145,7 @@ fn analyze(path: &std::path::Path) -> Option<(u8, u8, u8)> {
 }
 
 /// RGB -> (hue 0..360, saturation 0..1, value 0..1).
-fn to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+pub fn to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let d = max - min;
@@ -161,7 +161,7 @@ fn to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (h, if max == 0.0 { 0.0 } else { d / max }, max)
 }
 
-fn from_hsv(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+pub fn from_hsv(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     let c = v * s;
     let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
     let m = v - c;

@@ -25,6 +25,8 @@ mod glass;
 mod icons;
 mod island;
 mod layout;
+mod mascot;
+mod media;
 mod menu;
 mod morph;
 mod pins;

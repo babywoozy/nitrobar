@@ -10,33 +10,40 @@ use std::collections::HashMap;
 
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F,
+    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_PARAMETERS, D2D1_PRESENT_OPTIONS_NONE,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_ROUNDED_RECT,
     D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
-    ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1Layer, ID2D1SolidColorBrush,
+    ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1Layer, ID2D1PathGeometry,
+    ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
-    IDWriteFactory, IDWriteTextFormat,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_WEIGHT_SEMI_LIGHT,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    IDWriteTypography,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{BOOL, PCWSTR, Result, w};
-use windows_numerics::Matrix3x2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::clock::ClockText;
 use crate::config::Background;
 use crate::icons::Icon;
+use crate::island::{BAR_GAP, BAR_WIDTH};
 use crate::layout::{self, Metrics};
+use crate::media::BARS;
 use crate::status::StatusView;
 use crate::theme::Palette;
 
@@ -52,7 +59,7 @@ const CLOCK_FONT_SIZE: f32 = 12.0;
 const SHADOW_LAYERS: u32 = 8;
 const SHADOW_STEP: f32 = 1.5;
 const SHADOW_DROP: f32 = 3.0;
-const SHADOW_ALPHA: f32 = 0.045;
+const SHADOW_ALPHA: f32 = 0.03;
 /// Offsets (DIPs) of the faint copies that form the text halo.
 const SHADOW_RING: [(f32, f32); 8] = [
     (-1.0, 0.0),
@@ -131,14 +138,41 @@ pub struct IslandView {
     pub badge: Option<Badge>,
 }
 
-/// What the pill shows at rest: the active app's icon (crossfading to a new one)
-/// on the left, the time on the right.
+/// What the pill shows while it is not expanded: the mascot and the time, or the
+/// music that is playing (crossfaded by `music_mix`).
 pub struct RestView {
     pub opacity: f32,
-    /// Icons with their opacity and box (bar space); two while crossfading.
-    pub icons: Vec<(Icon, f32, D2D_RECT_F)>,
+    /// 0 = mascot and clock, 1 = music.
+    pub music_mix: f32,
+    pub mascot: Option<MascotView>,
     pub clock: Option<(Vec<u16>, D2D_RECT_F)>,
+    pub music: Option<MusicView>,
     pub text: D2D1_COLOR_F,
+    pub secondary: D2D1_COLOR_F,
+    pub accent: D2D1_COLOR_F,
+}
+
+pub struct MascotView {
+    /// Square box (bar space) the flame fills.
+    pub rect: D2D_RECT_F,
+    pub asleep: bool,
+    /// Size factor (the wake-up hop).
+    pub scale: f32,
+    /// Phase of the floating "z" while asleep.
+    pub z: Option<f32>,
+}
+
+pub struct MusicView {
+    /// Round cover art; without one a plain accent disc.
+    pub art: Option<Icon>,
+    pub art_rect: D2D_RECT_F,
+    pub title: Vec<u16>,
+    pub title_rect: D2D_RECT_F,
+    pub artist: Vec<u16>,
+    pub artist_rect: D2D_RECT_F,
+    /// Equalizer bar heights 0..1 and their box.
+    pub bars: [f32; BARS],
+    pub bars_rect: D2D_RECT_F,
 }
 
 pub struct Badge {
@@ -151,6 +185,15 @@ pub struct Badge {
 impl Scene<'_> {
     fn translucent(&self) -> bool {
         self.backdrop != Background::Solid || self.island.is_some()
+    }
+
+    /// Corner radius of a hover plate: nested inside the round island, else small.
+    fn plate_radius(&self, rect: D2D_RECT_F) -> f32 {
+        if self.island.is_some() {
+            (rect.bottom - rect.top) / 2.0
+        } else {
+            layout::CORNER_RADIUS
+        }
     }
 
     /// Shadow color for text and glyphs when the bar shows the wallpaper (clear or
@@ -174,7 +217,9 @@ impl Scene<'_> {
 
 /// Device-dependent resources, recreated when the device is lost.
 struct Target {
-    rt: ID2D1HwndRenderTarget,
+    rt: ID2D1RenderTarget,
+    /// The window to resize (`None` for an offscreen target).
+    window: Option<ID2D1HwndRenderTarget>,
     size: D2D_SIZE_U,
     brush: ID2D1SolidColorBrush,
     /// Icon bitmaps by `Icon::id`; pruned to the icons drawn in the last frame.
@@ -188,6 +233,19 @@ pub struct Renderer {
     clock_format: IDWriteTextFormat,
     icon_format: IDWriteTextFormat,
     percent_format: IDWriteTextFormat,
+    /// Pill: song title (semibold) and artist (smaller), the time (semilight).
+    title_format: IDWriteTextFormat,
+    sub_format: IDWriteTextFormat,
+    time_format: IDWriteTextFormat,
+    /// Island strip: time over date.
+    strip_time_format: IDWriteTextFormat,
+    strip_date_format: IDWriteTextFormat,
+    dwrite: IDWriteFactory,
+    /// Figures of equal width, so the time does not jiggle.
+    tabular: IDWriteTypography,
+    /// The mascot: outer flame and inner core, in a 24 x 24 box.
+    flame: ID2D1PathGeometry,
+    core: ID2D1PathGeometry,
     target: Option<Target>,
 }
 
@@ -214,6 +272,54 @@ fn icon_font_family(dwrite: &IDWriteFactory) -> PCWSTR {
         fluent
     } else {
         w!("Segoe MDL2 Assets")
+    }
+}
+
+/// A closed filled shape from a start point and cubic Bezier segments.
+fn path(
+    d2d: &ID2D1Factory,
+    start: (f32, f32),
+    curves: &[[(f32, f32); 3]],
+) -> Result<ID2D1PathGeometry> {
+    let v = |(x, y): (f32, f32)| Vector2 { X: x, Y: y };
+    unsafe {
+        let geometry = d2d.CreatePathGeometry()?;
+        let sink = geometry.Open()?;
+        sink.BeginFigure(v(start), D2D1_FIGURE_BEGIN_FILLED);
+        for [a, b, c] in curves {
+            sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                point1: v(*a),
+                point2: v(*b),
+                point3: v(*c),
+            });
+        }
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink.Close()?;
+        Ok(geometry)
+    }
+}
+
+fn weighted_format(
+    dwrite: &IDWriteFactory,
+    family: PCWSTR,
+    size: f32,
+    weight: DWRITE_FONT_WEIGHT,
+    align: DWRITE_TEXT_ALIGNMENT,
+) -> Result<IDWriteTextFormat> {
+    unsafe {
+        let format = dwrite.CreateTextFormat(
+            family,
+            None,
+            weight,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            size,
+            w!(""),
+        )?;
+        format.SetTextAlignment(align)?;
+        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        Ok(format)
     }
 }
 
@@ -246,8 +352,78 @@ impl Renderer {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let ui_font = w!("Segoe UI Variable Text");
+            // Two-line texts are cut with an ellipsis.
+            let trimmed = |size: f32, weight: DWRITE_FONT_WEIGHT| -> Result<IDWriteTextFormat> {
+                let format = weighted_format(
+                    &dwrite,
+                    ui_font,
+                    size,
+                    weight,
+                    DWRITE_TEXT_ALIGNMENT_LEADING,
+                )?;
+                let sign = dwrite.CreateEllipsisTrimmingSign(&format)?;
+                let trimming = DWRITE_TRIMMING {
+                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                    delimiter: 0,
+                    delimiterCount: 0,
+                };
+                format.SetTrimming(&raw const trimming, &sign)?;
+                Ok(format)
+            };
+            let title_format = trimmed(13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            let sub_format = trimmed(11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let time_format = weighted_format(
+                &dwrite,
+                ui_font,
+                14.0,
+                DWRITE_FONT_WEIGHT_SEMI_LIGHT,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+            )?;
+            let strip_time_format = weighted_format(
+                &dwrite,
+                ui_font,
+                13.0,
+                DWRITE_FONT_WEIGHT_SEMI_LIGHT,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+            )?;
+            let strip_date_format =
+                text_format(&dwrite, ui_font, 11.0, DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+            let tabular = dwrite.CreateTypography()?;
+            tabular.AddFontFeature(DWRITE_FONT_FEATURE {
+                nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
+                parameter: 1,
+            })?;
+            let flame = path(
+                &d2d,
+                (12.0, 1.0),
+                &[
+                    [(13.0, 6.0), (21.0, 9.0), (21.0, 15.5)],
+                    [(21.0, 20.5), (17.0, 23.0), (12.0, 23.0)],
+                    [(7.0, 23.0), (3.0, 20.5), (3.0, 15.5)],
+                    [(3.0, 11.5), (6.0, 9.5), (7.2, 6.6)],
+                    [(8.0, 8.8), (8.8, 9.8), (10.0, 10.2)],
+                    [(9.4, 6.6), (10.4, 3.2), (12.0, 1.0)],
+                ],
+            )?;
+            let core = path(
+                &d2d,
+                (12.6, 9.8),
+                &[
+                    [(14.6, 12.6), (18.0, 14.2), (18.0, 17.4)],
+                    [(18.0, 20.4), (15.4, 21.8), (12.0, 21.8)],
+                    [(8.6, 21.8), (6.0, 20.4), (6.0, 17.4)],
+                    [(6.0, 14.4), (11.0, 13.4), (12.6, 9.8)],
+                ],
+            )?;
             Ok(Self {
-                d2d,
+                title_format,
+                sub_format,
+                time_format,
+                strip_time_format,
+                strip_date_format,
+                tabular,
+                flame,
+                core,
                 clock_format: text_format(
                     &dwrite,
                     ui_font,
@@ -266,6 +442,8 @@ impl Renderer {
                     CLOCK_FONT_SIZE,
                     DWRITE_TEXT_ALIGNMENT_LEADING,
                 )?,
+                d2d,
+                dwrite,
                 target: None,
             })
         }
@@ -306,7 +484,8 @@ impl Renderer {
             let brush = rt.CreateSolidColorBrush(&TRANSPARENT, None)?;
             Ok(Target {
                 layer: rt.CreateLayer(None).ok(),
-                rt,
+                window: Some(rt.clone()),
+                rt: rt.into(),
                 size,
                 brush,
                 bitmaps: HashMap::new(),
@@ -330,7 +509,9 @@ impl Renderer {
         let mut target = match self.target.take() {
             Some(mut t) => {
                 if t.size != size {
-                    unsafe { t.rt.Resize(&raw const size)? };
+                    if let Some(window) = &t.window {
+                        unsafe { window.Resize(&raw const size)? };
+                    }
                     t.size = size;
                 }
                 t
@@ -338,6 +519,27 @@ impl Renderer {
             None => self.create_target(hwnd, size, dpi)?,
         };
 
+        self.render(&mut target, scene, dpi);
+
+        match unsafe { target.rt.EndDraw(None, None) } {
+            // Device lost: drop the target and paint again right away with a new one
+            // (otherwise the window keeps whatever it showed, e.g. black).
+            Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+            Ok(()) => {
+                self.target = Some(target);
+                Ok(())
+            }
+        }
+    }
+
+    /// `BeginDraw` and everything in the scene; the caller ends the draw.
+    fn render(&self, target: &mut Target, scene: &Scene, dpi: f32) {
         let palette = &scene.palette;
         unsafe {
             target.rt.SetDpi(dpi, dpi);
@@ -373,7 +575,7 @@ impl Renderer {
 
         let mut used = Vec::new();
         let opacity = match &scene.island {
-            Some(island) => self.draw_island(&mut target, island, dpi, &mut used),
+            Some(island) => self.draw_island(target, island, dpi, scene.origin, &mut used),
             None => 1.0,
         };
         if opacity > 0.0 {
@@ -392,28 +594,12 @@ impl Renderer {
             if let Some(params) = &layer {
                 unsafe { target.rt.PushLayer(params, target.layer.as_ref()) };
             }
-            self.draw_content(&mut target, scene, dpi, &mut used);
+            self.draw_content(target, scene, dpi, &mut used);
             if layer.is_some() {
                 unsafe { target.rt.PopLayer() };
             }
         }
         target.bitmaps.retain(|id, _| used.contains(id));
-
-        match unsafe { target.rt.EndDraw(None, None) } {
-            // Device lost: drop the target and paint again right away with a new one
-            // (otherwise the window keeps whatever it showed, e.g. black).
-            Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                Ok(())
-            }
-            Err(e) => Err(e),
-            Ok(()) => {
-                self.target = Some(target);
-                Ok(())
-            }
-        }
     }
 
     /// The island panel (pill, or the bar while morphing). Returns the opacity
@@ -423,6 +609,7 @@ impl Renderer {
         target: &mut Target,
         island: &IslandView,
         dpi: f32,
+        origin: (f32, f32),
         used: &mut Vec<u64>,
     ) -> f32 {
         let rounded = D2D1_ROUNDED_RECT {
@@ -485,28 +672,22 @@ impl Renderer {
         if let Some(rest) = &island.rest
             && rest.opacity > 0.0
         {
-            for (icon, alpha, rect) in &rest.icons {
-                used.push(icon.id);
-                if let Some(bitmap) = Self::icon_bitmap(target, icon) {
-                    // Drawn at the icon's own pixel size, on whole pixels.
-                    let box_px = ((rect.right - rect.left) * dpi / 96.0).round();
-                    let px = box_px.min(icon.px as f32);
-                    let at = layout::pixel_square(rect, px, 0.0, dpi);
-                    unsafe {
-                        target.rt.DrawBitmap(
-                            &bitmap,
-                            Some(&raw const at),
-                            alpha * rest.opacity,
-                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                            None,
-                        );
-                    }
+            let idle = rest.opacity * (1.0 - rest.music_mix);
+            let music = rest.opacity * rest.music_mix;
+            if idle > 0.01 {
+                if let Some(mascot) = &rest.mascot {
+                    self.draw_mascot(target, rest, mascot, origin, idle);
+                }
+                if let Some((text, rect)) = &rest.clock {
+                    let mut color = rest.text;
+                    color.a *= idle;
+                    self.draw_time(target, text, &self.time_format, *rect, &color);
                 }
             }
-            if let Some((text, rect)) = &rest.clock {
-                let mut color = rest.text;
-                color.a *= rest.opacity;
-                self.draw_text(target, text, &self.clock_format, *rect, &color, None);
+            if music > 0.01
+                && let Some(view) = &rest.music
+            {
+                self.draw_music(target, rest, view, music, dpi, used);
             }
         }
         if let Some(badge) = &island.badge
@@ -528,6 +709,236 @@ impl Renderer {
             }
         }
         island.content_opacity
+    }
+
+    /// Text laid out with tabular figures.
+    fn draw_time(
+        &self,
+        target: &Target,
+        text: &[u16],
+        format: &IDWriteTextFormat,
+        rect: D2D_RECT_F,
+        color: &D2D1_COLOR_F,
+    ) {
+        unsafe {
+            let Ok(layout) = self.dwrite.CreateTextLayout(
+                text,
+                format,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            ) else {
+                return;
+            };
+            let all = DWRITE_TEXT_RANGE {
+                startPosition: 0,
+                length: text.len() as u32,
+            };
+            let _ = layout.SetTypography(&self.tabular, all);
+            target.brush.SetColor(color);
+            target.rt.DrawTextLayout(
+                Vector2 {
+                    X: rect.left,
+                    Y: rect.top,
+                },
+                &layout,
+                &target.brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+    }
+
+    fn fill_ellipse(target: &Target, x: f32, y: f32, rx: f32, ry: f32, color: &D2D1_COLOR_F) {
+        let ellipse = D2D1_ELLIPSE {
+            point: Vector2 { X: x, Y: y },
+            radiusX: rx,
+            radiusY: ry,
+        };
+        unsafe {
+            target.brush.SetColor(color);
+            target.rt.FillEllipse(&raw const ellipse, &target.brush);
+        }
+    }
+
+    /// "Nitro", the flame with eyes; squashed with closed eyes and a "z" while asleep.
+    fn draw_mascot(
+        &self,
+        target: &Target,
+        rest: &RestView,
+        mascot: &MascotView,
+        origin: (f32, f32),
+        opacity: f32,
+    ) {
+        let rect = mascot.rect;
+        let unit = (rect.right - rect.left) / 24.0 * mascot.scale;
+        let squash = if mascot.asleep { 0.84 } else { 1.0 };
+        let dim = if mascot.asleep { 0.78 } else { 1.0 };
+        let center = (rect.left + rect.right) / 2.0;
+        // Anchored at the bottom: it hops and slumps from where it sits.
+        let bottom = (rect.top + rect.bottom) / 2.0 + 11.0 * (rect.right - rect.left) / 24.0;
+        let transform = Matrix3x2::translation(-12.0, -23.0)
+            * Matrix3x2 {
+                M11: unit,
+                M12: 0.0,
+                M21: 0.0,
+                M22: unit * squash,
+                M31: 0.0,
+                M32: 0.0,
+            }
+            * Matrix3x2::translation(center - origin.0, bottom - origin.1);
+        let mut body = rest.accent;
+        body.a = opacity * dim;
+        let mix = |c: f32| c + (1.0 - c) * 0.62;
+        let inner = D2D1_COLOR_F {
+            r: mix(rest.accent.r),
+            g: mix(rest.accent.g),
+            b: mix(rest.accent.b),
+            a: opacity * dim,
+        };
+        let eye = D2D1_COLOR_F {
+            r: 0.07,
+            g: 0.07,
+            b: 0.09,
+            a: opacity,
+        };
+        unsafe {
+            target.rt.SetTransform(&raw const transform);
+            target.brush.SetColor(&raw const body);
+            target.rt.FillGeometry(&self.flame, &target.brush, None);
+            target.brush.SetColor(&raw const inner);
+            target.rt.FillGeometry(&self.core, &target.brush, None);
+        }
+        for x in [9.4, 14.6] {
+            if mascot.asleep {
+                // Closed lids: a little smile-shaped line.
+                unsafe {
+                    target.brush.SetColor(&raw const eye);
+                    for (from, to) in [(-1.5, 0.0), (0.0, 1.5)] {
+                        let y = |dx: f32| if dx == 0.0 { 17.7 } else { 16.9 };
+                        target.rt.DrawLine(
+                            Vector2 {
+                                X: x + from,
+                                Y: y(from),
+                            },
+                            Vector2 {
+                                X: x + to,
+                                Y: y(to),
+                            },
+                            &target.brush,
+                            1.15,
+                            None,
+                        );
+                    }
+                }
+            } else {
+                Self::fill_ellipse(target, x, 16.8, 1.45, 1.95, &eye);
+                let glint = D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: opacity,
+                };
+                Self::fill_ellipse(target, x + 0.45, 16.1, 0.6, 0.6, &glint);
+            }
+        }
+        let reset = Matrix3x2::translation(-origin.0, -origin.1);
+        unsafe { target.rt.SetTransform(&raw const reset) };
+        if let Some(phase) = mascot.z {
+            // A "z" drifting up and to the right, fading.
+            let mut color = rest.secondary;
+            color.a *= opacity * (1.0 - 0.6 * phase);
+            let left = rect.right + 1.0 + 4.0 * phase;
+            let top = rect.top + 2.0 - 6.0 * phase;
+            let z = D2D_RECT_F {
+                left,
+                top,
+                right: left + 12.0,
+                bottom: top + 14.0,
+            };
+            self.draw_text(
+                target,
+                &[u16::from(b'z')],
+                &self.sub_format,
+                z,
+                &color,
+                None,
+            );
+        }
+    }
+
+    fn draw_music(
+        &self,
+        target: &mut Target,
+        rest: &RestView,
+        music: &MusicView,
+        opacity: f32,
+        dpi: f32,
+        used: &mut Vec<u64>,
+    ) {
+        let faded = |mut c: D2D1_COLOR_F| {
+            c.a *= opacity;
+            c
+        };
+        let bitmap = music.art.as_ref().and_then(|art| {
+            used.push(art.id);
+            Self::icon_bitmap(target, art).map(|b| (b, art.px))
+        });
+        match bitmap {
+            Some((bitmap, px)) => {
+                let at = layout::pixel_square(&music.art_rect, px as f32, 0.0, dpi);
+                unsafe {
+                    target.rt.DrawBitmap(
+                        &bitmap,
+                        Some(&raw const at),
+                        opacity,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
+            }
+            None => {
+                let r = music.art_rect;
+                let radius = (r.right - r.left) / 2.0;
+                let color = faded(rest.accent);
+                Self::fill_ellipse(
+                    target,
+                    r.left + radius,
+                    r.top + radius,
+                    radius,
+                    radius,
+                    &color,
+                );
+            }
+        }
+        self.draw_text(
+            target,
+            &music.title,
+            &self.title_format,
+            music.title_rect,
+            &faded(rest.text),
+            None,
+        );
+        self.draw_text(
+            target,
+            &music.artist,
+            &self.sub_format,
+            music.artist_rect,
+            &faded(rest.secondary),
+            None,
+        );
+        let r = music.bars_rect;
+        let mid = (r.top + r.bottom) / 2.0;
+        let accent = faded(rest.accent);
+        for (i, level) in music.bars.iter().enumerate() {
+            let left = r.left + i as f32 * (BAR_WIDTH + BAR_GAP);
+            let h = BAR_WIDTH + level * (r.bottom - r.top - BAR_WIDTH);
+            let bar = D2D_RECT_F {
+                left,
+                top: mid - h / 2.0,
+                right: left + BAR_WIDTH,
+                bottom: mid + h / 2.0,
+            };
+            Self::fill_rounded(target, bar, BAR_WIDTH / 2.0, &accent);
+        }
     }
 
     /// Start, app buttons, status and clock.
@@ -574,6 +985,7 @@ impl Renderer {
         target: &Target,
         palette: &Palette,
         rect: D2D_RECT_F,
+        radius: f32,
         active: bool,
         pointer: Pointer,
     ) {
@@ -585,7 +997,7 @@ impl Renderer {
             (false, false, false) => None,
         };
         if let Some(color) = color {
-            Self::fill_rounded(target, rect, layout::CORNER_RADIUS, color);
+            Self::fill_rounded(target, rect, radius, color);
         }
     }
 
@@ -597,7 +1009,7 @@ impl Renderer {
         rect: D2D_RECT_F,
         pointer: Pointer,
     ) {
-        Self::draw_button_background(target, palette, rect, false, pointer);
+        Self::draw_button_background(target, palette, rect, layout::CORNER_RADIUS, false, pointer);
         let size = if pointer.pressed {
             metrics.start_logo_size() * 0.85
         } else {
@@ -655,18 +1067,26 @@ impl Renderer {
         let shadow = scene.text_shadow();
         let flat = scene.island.is_some();
         let rect = button.rect;
+        // Inside the island's round panel the plates are round too (panel radius
+        // minus the padding = half the button).
+        let radius = if flat {
+            (rect.bottom - rect.top) / 2.0
+        } else {
+            layout::CORNER_RADIUS
+        };
         if button.state == ButtonState::Attention && !button.pointer.pressed {
-            Self::fill_rounded(target, rect, layout::CORNER_RADIUS, &palette.attention_bg);
+            Self::fill_rounded(target, rect, radius, &palette.attention_bg);
         } else if flat {
             // Dock style: the zoom is the hover feedback; only a press shows a plate.
             if button.pointer.pressed {
-                Self::fill_rounded(target, rect, layout::CORNER_RADIUS, &palette.pressed);
+                Self::fill_rounded(target, rect, radius, &palette.pressed);
             }
         } else {
             Self::draw_button_background(
                 target,
                 palette,
                 rect,
+                radius,
                 button.state == ButtonState::Active,
                 button.pointer,
             );
@@ -783,7 +1203,14 @@ impl Renderer {
         if rect.right <= rect.left {
             return;
         }
-        Self::draw_button_background(target, &scene.palette, rect, false, scene.status_pointer);
+        Self::draw_button_background(
+            target,
+            &scene.palette,
+            rect,
+            scene.plate_radius(rect),
+            false,
+            scene.status_pointer,
+        );
         let shadow = scene.text_shadow();
         let text = scene.palette.text;
         let mut track_color = text;
@@ -823,13 +1250,55 @@ impl Renderer {
                 right: rect.right,
                 bottom: rect.bottom,
             };
-            self.draw_text(target, percent, &self.percent_format, cell, &text, shadow);
+            // In the island everything but the main line is grey.
+            let mut color = text;
+            if scene.island.is_some() {
+                color.a *= 0.6;
+            }
+            self.draw_text(target, percent, &self.percent_format, cell, &color, shadow);
+        }
+    }
+
+    /// The strip's clock: the time (tabular, main) over the date (grey, smaller),
+    /// as far from the panel's end as from its top and bottom.
+    fn draw_island_clock(&self, target: &Target, scene: &Scene) {
+        let rect = scene.clock_rect;
+        let right = rect.right - layout::ISLAND_CLOCK_PADDING;
+        let mid = (rect.top + rect.bottom) / 2.0;
+        let line = |top: f32, bottom: f32| D2D_RECT_F {
+            left: rect.left,
+            top,
+            right,
+            bottom,
+        };
+        let main = scene.palette.text;
+        let mut grey = main;
+        grey.a *= 0.6;
+        if scene.clock.date.is_empty() {
+            let r = line(mid - 9.0, mid + 9.0);
+            self.draw_time(target, &scene.clock.time, &self.strip_time_format, r, &main);
+        } else {
+            let r = line(mid - 16.0, mid + 1.0);
+            self.draw_time(target, &scene.clock.time, &self.strip_time_format, r, &main);
+            let r = line(mid + 1.0, mid + 15.0);
+            self.draw_time(target, &scene.clock.date, &self.strip_date_format, r, &grey);
         }
     }
 
     fn draw_clock(&self, target: &Target, scene: &Scene) {
         let rect = scene.clock_rect;
-        Self::draw_button_background(target, &scene.palette, rect, false, scene.clock_pointer);
+        Self::draw_button_background(
+            target,
+            &scene.palette,
+            rect,
+            scene.plate_radius(rect),
+            false,
+            scene.clock_pointer,
+        );
+        if scene.island.is_some() {
+            self.draw_island_clock(target, scene);
+            return;
+        }
         let right = rect.right - layout::CLOCK_TEXT_PADDING;
         let left = rect.left;
         let mid = (rect.top + rect.bottom) / 2.0;
@@ -863,3 +1332,6 @@ impl Renderer {
         }
     }
 }
+
+#[cfg(test)]
+mod offscreen;

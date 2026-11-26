@@ -62,6 +62,11 @@ src/
               flyout, fullscreen
   morph.rs    hiệu ứng thu nhỏ / khôi phục: overlay + DWM thumbnail, đồng hồ khung hình (DwmFlush)
   preview.rs  xem trước các cửa sổ của một app (popup GDI + DWM thumbnail)
+  glass.rs    blur phía sau viên (Windows.UI.Composition)
+  wallpaper.rs  màu chủ đạo của hình nền (luồng nền)
+  media.rs    bài đang phát (SMTC, luồng riêng), ảnh bìa tròn, độ to âm thanh, cột sóng
+  mascot.rs   linh vật Nitro: trạng thái ngủ / thức
+  render/offscreen.rs  chụp thiết kế ra file, không đụng màn hình
 ```
 
 ### Cấu hình và ghim (config.rs, pins.rs)
@@ -293,6 +298,29 @@ src/
 - Test UI: bản debug in `BTN <khoá app> x y` (pixel màn hình) mỗi lần dải mở để script tìm nút, vì số
   nút phụ thuộc app người dùng đang mở. Tự bấm chuột thật chỉ khi con trỏ đang ở trên popup của mình
   (`mouse_event`), còn lại gửi `PostMessage` vào cửa sổ thanh.
+
+### Thiết kế viên (quy tắc người dùng đặt, giữ nguyên khi sửa)
+
+- Lề đều, mọi thứ căn giữa dọc; bo góc lồng nhau = bo góc viên − lề (viên tròn hết => phần tử tròn có
+  tâm trùng đầu viên); chữ Segoe UI Variable: dòng chính trắng semibold, dòng phụ xám 60% nhỏ hơn;
+  giờ semilight + số đều (`DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES`); MỘT màu nhấn
+  (`App::island_accent`: ảnh bìa nếu đang phát, không thì `island_color`, đã kéo sáng), còn lại đen /
+  trắng / xám (cả "cần chú ý" cũng dùng màu nhấn).
+- Vị trí nội dung lúc thu gọn nằm hết ở `island::rest_layout` (dùng chung cho app và ảnh chụp, có
+  test lề). `pill_padding`: nội dung = 0.68 * cao. Giờ cách đầu viên 0.31 * cao (nhìn cân với lề quanh
+  linh vật; căn theo toán học 17 px thì trông lệch).
+- Chụp thiết kế KHÔNG cần chạy app (không làm phiền người dùng):
+  `NB_SHOTS=<thư mục> cargo test --release render_island_states -- --ignored` => BMP phóng 5x của
+  nghỉ / ngủ / nhạc / dải. Đổi giao diện thì chụp và so trước khi chạy thật.
+- Nitro: hai `ID2D1PathGeometry` trong hộp 24x24, vẽ bằng `SetTransform`. Ngủ: timer one-shot
+  `TIMER_SLEEP` rồi hỏi `GetLastInputInfo` (không polling); "z" chạy `Z_STEPS` bước rồi đứng yên (CPU 0).
+  Đang ngủ mà rê chuột tới thì trì hoãn bung 320 ms để thấy cú bật dậy.
+- Nhạc: mọi lời gọi WinRT ở thread `nitrobar-media`, chờ sự kiện phiên; UI đọc `media::current()`.
+  Cột sóng dùng `IAudioMeterInformation` (chỉ độ to, không phân tích tần số), `TIMER_BARS` 33 ms CHỈ khi
+  đang phát + viên thu gọn + không toàn màn hình. Viên nới 200 -> 288 DIP bằng lò xo; cửa sổ luôn đủ
+  rộng cho mức tối đa nên chỉ đổi region.
+- KHI THỬ: kiểm tra người dùng có đang xem video / toàn màn hình không (không chỉ idle: xem video thì
+  không có input). Đã một lần phát âm thanh thử đè lên video của người dùng.
 
 ### Hiệu ứng thu nhỏ / khôi phục cửa sổ
 
