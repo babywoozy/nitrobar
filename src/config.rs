@@ -35,6 +35,21 @@ pub enum ThemeMode {
     Light,
 }
 
+/// What is behind the bar's own drawing.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Background {
+    /// Fully transparent: the wallpaper / windows behind show through, unblurred.
+    #[default]
+    Clear,
+    /// Blurred, lightly tinted.
+    Blur,
+    /// Blur + noise + tint, like Windows 11 flyouts.
+    Acrylic,
+    /// Opaque theme color.
+    Solid,
+}
+
 #[derive(Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct BarConfig {
@@ -46,7 +61,7 @@ pub struct BarConfig {
     pub alignment: Alignment,
     pub hide_native_taskbar: bool,
     pub theme: ThemeMode,
-    pub acrylic: bool,
+    pub background: Background,
 }
 
 impl Default for BarConfig {
@@ -58,7 +73,7 @@ impl Default for BarConfig {
             alignment: Alignment::Center,
             hide_native_taskbar: false,
             theme: ThemeMode::Auto,
-            acrylic: true,
+            background: Background::Clear,
         }
     }
 }
@@ -137,7 +152,7 @@ icon_size = 24               # cỡ icon app (DIP, 16..48)
 alignment = "center"         # "center" (giống Windows 11) hoặc "left"
 hide_native_taskbar = false  # ẩn taskbar gốc của Windows khi nitrobar chạy
 theme = "auto"               # "auto" (theo Windows), "dark" hoặc "light"
-acrylic = true               # nền trong mờ (Windows 11 22H2 trở lên)
+background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acrylic" hoặc "solid" (đặc)
 
 [colors]
 # Để trống = theo theme Windows. Định dạng "#RRGGBB" hoặc "#RRGGBBAA".
@@ -209,7 +224,10 @@ mod tests {
         let config = Config::parse("[bar]\nposition = \"top\"\n").unwrap();
         assert_eq!(config.bar.position, Position::Top);
         assert_eq!(config.bar.height, 48.0);
+        assert_eq!(config.bar.background, Background::Clear);
         assert!(config.clock.show_date);
+        let blur = Config::parse("[bar]\nbackground = \"blur\"\n").unwrap();
+        assert_eq!(blur.bar.background, Background::Blur);
     }
 
     #[test]
@@ -223,6 +241,7 @@ mod tests {
     fn invalid_file_is_an_error() {
         assert!(Config::parse("[bar]\nposition = \"middle\"\n").is_err());
         assert!(Config::parse("not toml").is_err());
+        assert!(Config::parse("[bar]\nbackground = \"glass\"\n").is_err());
     }
 
     #[test]

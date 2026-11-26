@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE, PBT_POWERSETTINGCHANGE,
     PM_REMOVE, PeekMessageW, QS_ALLINPUT, WM_DWMCOLORIZATIONCOLORCHANGED, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_NCACTIVATE, WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED,
+    WM_MOUSEMOVE, WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED,
 };
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
@@ -288,11 +288,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         // These only need the HWND, so they also work while App is borrowed.
         WM_ACTIVATE => appbar::activate(hwnd),
         WM_WINDOWPOSCHANGED => appbar::window_pos_changed(hwnd),
-        // The acrylic backdrop only renders for windows DWM considers active, and the
-        // bar never activates (WS_EX_NOACTIVATE): always report an active frame.
-        WM_NCACTIVATE => unsafe {
-            return DefWindowProcW(hwnd, msg, WPARAM(1), lparam);
-        },
         WM_CONTEXTMENU => {
             show_context_menu(hwnd, lparam);
             return LRESULT(0);
@@ -603,12 +598,16 @@ impl App {
         self.invalidate();
     }
 
+    /// (Re-)applies the backdrop and menu theme. Cheap and idempotent: also used to
+    /// recover after DWM / session / power events that can drop window attributes.
     fn apply_theme(&mut self) {
-        self.theme.acrylic = theme::apply_backdrop(self.hwnd, &self.theme, self.config.bar.acrylic);
+        let wanted = self.config.bar.background;
+        // The acrylic tint is the palette background of the requested backdrop.
+        self.theme.backdrop = wanted;
+        let tint = self.palette().background;
+        self.theme.backdrop = theme::apply_backdrop(self.hwnd, self.theme.light, wanted, &tint);
         theme::apply_menu_theme(self.theme.light);
-        unsafe {
-            SendMessageW(self.hwnd, WM_NCACTIVATE, Some(WPARAM(1)), None);
-        }
+        self.invalidate();
     }
 
     fn reload_theme(&mut self) {
@@ -842,7 +841,7 @@ impl App {
         Scene {
             metrics: self.metrics,
             palette: self.palette(),
-            translucent: self.theme.acrylic,
+            backdrop: self.theme.backdrop,
             start: (layout.start, self.pointer(Hit::Start)),
             buttons,
             status_rect: layout.status,

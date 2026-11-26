@@ -18,7 +18,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB.
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.3 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB).
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -49,7 +49,7 @@ src/
   tasks.rs    danh sách cửa sổ, gom nhóm theo AppId, WinEvent hook, click/minimize
   icons.rs    icon thật -> IWICBitmap PBGRA đúng cỡ pixel (AUMID, relaunch icon, exe, WM_GETICON)
   menu.rs     menu chuột phải (TrackPopupMenu, chạy NGOÀI borrow của App)
-  theme.rs    sáng/tối + màu accent từ registry, Palette, nền acrylic (DWM), menu tối
+  theme.rs    sáng/tối + màu accent từ registry, Palette, nền clear/blur/acrylic/solid, menu tối
   shell.rs    mở UI của Windows bằng phím tắt giả lập (Start = Win, Quick Settings = Win+A,
               thông báo = Win+N)
   status/     wifi / âm lượng / pin: mod.rs (gộp thông báo, StatusView), network.rs,
@@ -105,11 +105,18 @@ src/
   `SystemUsesLightTheme` và `Explorer\Accent\AccentPalette` (tối dùng Light2, sáng dùng Dark1,
   giống chỉ báo của taskbar Win11). Nạp lại khi có WM_SETTINGCHANGE / WM_THEMECHANGED /
   WM_DWMCOLORIZATIONCOLORCHANGED.
-- Acrylic = `DwmExtendFrameIntoClientArea(-1)` + `DWMWA_SYSTEMBACKDROP_TYPE = TRANSIENTWINDOW`,
-  vẽ nền trong suốt + lớp tint `palette.background` có alpha. DWM chỉ vẽ backdrop cho cửa sổ
-  "active", nên wndproc luôn trả `WM_NCACTIVATE(TRUE)` (thanh là WS_EX_NOACTIVATE). Bỏ trick này
-  là nền thành màu xám đặc.
-- Khi trong suốt: text antialias GRAYSCALE (ClearType cần nền đặc).
+- Nền (`[bar] background`): mọi chế độ trong suốt đều `DwmExtendFrameIntoClientArea(-1)` + vẽ
+  pixel trong suốt. `clear` = không accent (thấy thẳng phía sau); `blur` = accent acrylic với tint
+  gần 0 + tint nhẹ tự vẽ; `acrylic` = accent acrylic, DWM tự tint (`GradientColor` ABGR); `solid` =
+  margins 0, vẽ đặc. Accent qua `SetWindowCompositionAttribute` (user32, không công khai, như
+  TranslucentTB). Acrylic/blur của accent lấy mẫu hình nền, không lấy cửa sổ phía sau.
+- KHÔNG dùng `DWMWA_SYSTEMBACKDROP_TYPE` (Mica/Acrylic hệ thống): DWM chỉ vẽ nó cho cửa sổ
+  "active"; mẹo trả `WM_NCACTIVATE(TRUE)` hỏng khi panel của Windows (thông báo, Quick Settings)
+  lấy foreground rồi đóng => thanh đen đặc không tự hết. Luôn đặt nó về `DWMSBT_NONE`.
+- `ACCENT_ENABLE_BLURBEHIND` (3) ra màu đen với cửa sổ thường trên Win11 hiện tại: không dùng.
+- Khi trong suốt: text antialias GRAYSCALE (ClearType cần nền đặc). Với clear/blur, chữ, glyph
+  trạng thái và vạch chỉ báo có bóng (vòng 1 DIP alpha 0.4 + bóng lệch xuống alpha 0.5, màu
+  tương phản với chữ) để đọc được trên nền trắng.
 - Hover dùng `TrackMouseEvent(TME_LEAVE)`; nhấn giữ thu nhỏ icon (24 -> 20 DIP) như Win11.
 - Menu tối dùng uxtheme ordinal 135/136 (không công khai); nếu mất thì menu chỉ sáng lại.
 
@@ -178,7 +185,7 @@ src/
 - Thử tương tác bằng một cửa sổ riêng (ví dụ WinForms tiêu đề `nitrobar-test`), KHÔNG bấm vào
   cửa sổ thật của người dùng. Notepad Win11 là app đóng gói và tự mở lại tab cũ: không dùng để test.
 - Gửi click giả bằng `PostMessage(WM_LBUTTONDOWN/UP)` vào cửa sổ thanh; `WM_CONTEXTMENU` cho menu.
-- Dò vị trí nút theo pixel chỉ đúng khi nền đặc: khi test, tạm đặt `acrylic = false` +
+- Dò vị trí nút theo pixel chỉ đúng khi nền đặc: khi test, tạm đặt `background = "solid"` +
   `background = "#202020"` trong config.toml (áp dụng trực tiếp) rồi trả lại file cũ.
 - Trước khi chọn mục menu bằng phím, chụp ảnh menu để chắc đúng menu: một lần chọn nhầm
   "Mở file cấu hình" đã mở tab config.toml trong VS Code của người dùng.
@@ -192,7 +199,7 @@ src/
   ẩn lại; cần theo dõi khi Windows cập nhật.
 - **Mở Start / Quick Settings**: không có API chính thức; dùng giả lập phím Win / Win+A / Win+N
   (`SendInput`, chỉ khi người dùng vừa bấm vào thanh).
-- **Acrylic**: `DWMWA_SYSTEMBACKDROP_TYPE` cần Windows 11 22H2+; máy cũ hơn tự về nền đặc.
+- **Nền trong suốt**: accent policy không công khai; nếu mất, blur/acrylic tự về clear.
 - **Icon app UWP/packaged**: đã giải quyết bằng AUMID -> `shell:AppsFolder` image factory.
 - **Đa màn hình**: thanh chỉ ở màn hình chính.
 - **Xem trước cửa sổ khi hover** (thumbnail): chưa làm; `DwmRegisterThumbnail` là hướng đi.

@@ -1,9 +1,10 @@
 //! Direct2D / DirectWrite drawing. All coordinates here are DIPs; the render
 //! target's DPI is set to the monitor DPI so Direct2D does the scaling.
 //!
-//! With the acrylic backdrop, pixels are cleared to transparent and DWM composes
-//! the blurred backdrop underneath; text then uses grayscale antialiasing
-//! (ClearType needs an opaque background).
+//! With a translucent background (clear / blur / acrylic) pixels are cleared to
+//! transparent and DWM composes what is behind the bar underneath; text then uses
+//! grayscale antialiasing (ClearType needs an opaque background) and, over an
+//! unknown wallpaper, a soft shadow.
 
 use std::collections::HashMap;
 
@@ -30,6 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::clock::ClockText;
+use crate::config::Background;
 use crate::icons::Icon;
 use crate::layout::{self, Metrics};
 use crate::status::StatusView;
@@ -42,6 +44,17 @@ const TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
     a: 0.0,
 };
 const CLOCK_FONT_SIZE: f32 = 12.0;
+/// Offsets (DIPs) of the faint copies that form the text halo.
+const SHADOW_RING: [(f32, f32); 8] = [
+    (-1.0, 0.0),
+    (1.0, 0.0),
+    (0.0, -1.0),
+    (0.0, 1.0),
+    (-0.7, -0.7),
+    (0.7, -0.7),
+    (-0.7, 0.7),
+    (0.7, 0.7),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ButtonState {
@@ -69,8 +82,8 @@ pub struct ButtonView<'a> {
 pub struct Scene<'a> {
     pub metrics: Metrics,
     pub palette: Palette,
-    /// True when DWM draws an acrylic backdrop under transparent pixels.
-    pub translucent: bool,
+    /// What DWM shows under transparent pixels.
+    pub backdrop: Background,
     pub start: (D2D_RECT_F, Pointer),
     pub buttons: Vec<ButtonView<'a>>,
     pub status_rect: D2D_RECT_F,
@@ -79,6 +92,29 @@ pub struct Scene<'a> {
     pub clock_rect: D2D_RECT_F,
     pub clock_pointer: Pointer,
     pub clock: ClockText,
+}
+
+impl Scene<'_> {
+    fn translucent(&self) -> bool {
+        self.backdrop != Background::Solid
+    }
+
+    /// Shadow color for text and glyphs when the bar shows the wallpaper (clear or
+    /// light blur): dark under light text, light under dark text.
+    fn text_shadow(&self) -> Option<D2D1_COLOR_F> {
+        if !matches!(self.backdrop, Background::Clear | Background::Blur) {
+            return None;
+        }
+        let t = self.palette.text;
+        let light_text = 0.299 * t.r + 0.587 * t.g + 0.114 * t.b > 0.5;
+        let v = if light_text { 0.0 } else { 1.0 };
+        Some(D2D1_COLOR_F {
+            r: v,
+            g: v,
+            b: v,
+            a: 1.0,
+        })
+    }
 }
 
 /// Device-dependent resources, recreated when the device is lost.
@@ -242,18 +278,21 @@ impl Renderer {
         let palette = &scene.palette;
         unsafe {
             target.rt.SetDpi(dpi, dpi);
-            target.rt.SetTextAntialiasMode(if scene.translucent {
+            target.rt.SetTextAntialiasMode(if scene.translucent() {
                 D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
             } else {
                 D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE
             });
             target.rt.BeginDraw();
-            target.rt.Clear(Some(if scene.translucent {
+            target.rt.Clear(Some(if scene.translucent() {
                 &TRANSPARENT
             } else {
                 &palette.background
             }));
-            if scene.translucent {
+            // Acrylic is tinted by DWM itself (accent gradient color).
+            if matches!(scene.backdrop, Background::Clear | Background::Blur)
+                && palette.background.a > 0.0
+            {
                 let full = D2D_RECT_F {
                     left: 0.0,
                     top: 0.0,
@@ -274,7 +313,15 @@ impl Renderer {
         );
         let mut used = Vec::with_capacity(scene.buttons.len());
         for button in &scene.buttons {
-            Self::draw_button(&mut target, palette, &scene.metrics, dpi, button, &mut used);
+            Self::draw_button(
+                &mut target,
+                palette,
+                &scene.metrics,
+                dpi,
+                scene.text_shadow(),
+                button,
+                &mut used,
+            );
         }
         target.bitmaps.retain(|id, _| used.contains(id));
         self.draw_status(&target, scene);
@@ -384,6 +431,7 @@ impl Renderer {
         palette: &Palette,
         metrics: &Metrics,
         dpi: f32,
+        shadow: Option<D2D1_COLOR_F>,
         button: &ButtonView,
         used: &mut Vec<u64>,
     ) {
@@ -438,26 +486,61 @@ impl Renderer {
             ButtonState::Attention => (layout::INDICATOR_ACTIVE_WIDTH, &palette.attention),
         };
         let pill = layout::indicator(&rect, width, metrics.at_top);
+        if let Some(mut halo) = shadow {
+            // Keeps the pill visible on a wallpaper of the same brightness.
+            halo.a = 0.35;
+            let outer = D2D_RECT_F {
+                left: pill.left - 1.0,
+                top: pill.top - 1.0,
+                right: pill.right + 1.0,
+                bottom: pill.bottom + 1.0,
+            };
+            Self::fill_rounded(target, outer, layout::INDICATOR_HEIGHT / 2.0 + 1.0, &halo);
+        }
         Self::fill_rounded(target, pill, layout::INDICATOR_HEIGHT / 2.0, color);
     }
 
+    /// Draws `text` in `color`; with `shadow`, first a soft halo + drop shadow so it
+    /// stays readable over any wallpaper (clear / blur backgrounds).
     fn draw_text(
         &self,
         target: &Target,
         text: &[u16],
         format: &IDWriteTextFormat,
         rect: D2D_RECT_F,
+        color: &D2D1_COLOR_F,
+        shadow: Option<D2D1_COLOR_F>,
     ) {
-        unsafe {
+        let draw = |dx: f32, dy: f32| unsafe {
+            let moved = D2D_RECT_F {
+                left: rect.left + dx,
+                top: rect.top + dy,
+                right: rect.right + dx,
+                bottom: rect.bottom + dy,
+            };
             target.rt.DrawText(
                 text,
                 format,
-                &raw const rect,
+                &raw const moved,
                 &target.brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
+        };
+        if let Some(mut shade) = shadow {
+            // A 1 DIP ring of faint copies reads as a soft outline, plus a slightly
+            // stronger copy below as the drop shadow.
+            shade.a = 0.4 * color.a;
+            unsafe { target.brush.SetColor(&raw const shade) };
+            for (dx, dy) in SHADOW_RING {
+                draw(dx, dy);
+            }
+            shade.a = 0.5 * color.a;
+            unsafe { target.brush.SetColor(&raw const shade) };
+            draw(0.0, 1.0);
         }
+        unsafe { target.brush.SetColor(color) };
+        draw(0.0, 0.0);
     }
 
     fn draw_status(&self, target: &Target, scene: &Scene) {
@@ -466,7 +549,9 @@ impl Renderer {
             return;
         }
         Self::draw_button_background(target, &scene.palette, rect, false, scene.status_pointer);
-        let mut track_color = scene.palette.text;
+        let shadow = scene.text_shadow();
+        let text = scene.palette.text;
+        let mut track_color = text;
         track_color.a *= 0.35;
         let mut left = rect.left + layout::STATUS_PADDING;
         for icon in &scene.status.icons {
@@ -477,11 +562,23 @@ impl Renderer {
                 bottom: rect.bottom,
             };
             if let Some(track) = icon.track {
-                unsafe { target.brush.SetColor(&raw const track_color) };
-                self.draw_text(target, &[track], &self.icon_format, cell);
+                self.draw_text(
+                    target,
+                    &[track],
+                    &self.icon_format,
+                    cell,
+                    &track_color,
+                    None,
+                );
             }
-            unsafe { target.brush.SetColor(&raw const scene.palette.text) };
-            self.draw_text(target, &[icon.glyph], &self.icon_format, cell);
+            self.draw_text(
+                target,
+                &[icon.glyph],
+                &self.icon_format,
+                cell,
+                &text,
+                shadow,
+            );
             left += layout::STATUS_CELL;
         }
         if let Some(percent) = &scene.status.percent {
@@ -491,7 +588,7 @@ impl Renderer {
                 right: rect.right,
                 bottom: rect.bottom,
             };
-            self.draw_text(target, percent, &self.percent_format, cell);
+            self.draw_text(target, percent, &self.percent_format, cell, &text, shadow);
         }
     }
 
@@ -512,24 +609,22 @@ impl Renderer {
         } else {
             &two_lines
         };
-        unsafe {
-            target.brush.SetColor(&raw const scene.palette.text);
-            for &(text, top, bottom) in lines {
-                let line = D2D_RECT_F {
-                    left,
-                    top,
-                    right,
-                    bottom,
-                };
-                target.rt.DrawText(
-                    text,
-                    &self.clock_format,
-                    &raw const line,
-                    &target.brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-            }
+        let shadow = scene.text_shadow();
+        for &(text, top, bottom) in lines {
+            let line = D2D_RECT_F {
+                left,
+                top,
+                right,
+                bottom,
+            };
+            self.draw_text(
+                target,
+                text,
+                &self.clock_format,
+                line,
+                &scene.palette.text,
+                shadow,
+            );
         }
     }
 }

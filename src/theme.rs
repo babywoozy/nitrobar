@@ -1,22 +1,24 @@
-//! System theme (light/dark + accent color), the acrylic backdrop and dark menus.
+//! System theme (light/dark + accent color), the window backdrop and dark menus.
 
 use std::ffi::c_void;
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Dwm::{
-    DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW,
-    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_DONOTROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RegGetValueW,
 };
 use windows::Win32::UI::Controls::MARGINS;
-use windows::core::{BOOL, PCSTR, PCWSTR, w};
+use windows::core::{BOOL, PCSTR, PCWSTR, s, w};
+
+use crate::config::Background;
 
 const fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
@@ -47,8 +49,8 @@ pub struct Palette {
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub light: bool,
-    /// Whether DWM accepted the acrylic backdrop for our window.
-    pub acrylic: bool,
+    /// Backdrop in effect (`Solid` until applied, or if it could not be).
+    pub backdrop: Background,
     pub accent: D2D1_COLOR_F,
 }
 
@@ -108,7 +110,7 @@ impl Theme {
         );
         Self {
             light,
-            acrylic: false,
+            backdrop: Background::Solid,
             accent,
         }
     }
@@ -116,10 +118,11 @@ impl Theme {
     pub fn palette(&self) -> Palette {
         if self.light {
             Palette {
-                background: if self.acrylic {
-                    rgba(0xf3, 0xf3, 0xf3, 0.55)
-                } else {
-                    rgba(0xee, 0xee, 0xee, 1.0)
+                background: match self.backdrop {
+                    Background::Clear => rgba(0xf3, 0xf3, 0xf3, 0.0),
+                    Background::Blur => rgba(0xf3, 0xf3, 0xf3, 0.25),
+                    Background::Acrylic => rgba(0xf3, 0xf3, 0xf3, 0.6),
+                    Background::Solid => rgba(0xee, 0xee, 0xee, 1.0),
                 },
                 text: rgba(0x00, 0x00, 0x00, 0.9),
                 hover: rgba(0xff, 0xff, 0xff, 0.6),
@@ -134,10 +137,11 @@ impl Theme {
             }
         } else {
             Palette {
-                background: if self.acrylic {
-                    rgba(0x1c, 0x1c, 0x1c, 0.55)
-                } else {
-                    rgba(0x1c, 0x1c, 0x1c, 1.0)
+                background: match self.backdrop {
+                    Background::Clear => rgba(0x1c, 0x1c, 0x1c, 0.0),
+                    Background::Blur => rgba(0x1c, 0x1c, 0x1c, 0.25),
+                    Background::Acrylic => rgba(0x1c, 0x1c, 0x1c, 0.6),
+                    Background::Solid => rgba(0x1c, 0x1c, 0x1c, 1.0),
                 },
                 text: rgba(0xff, 0xff, 0xff, 1.0),
                 hover: rgba(0xff, 0xff, 0xff, 0.08),
@@ -154,12 +158,77 @@ impl Theme {
     }
 }
 
-/// Dark title-bar mode, square corners and (if `acrylic`) the acrylic system backdrop.
-/// Returns whether acrylic is active; false where unsupported (Windows 10, Windows 11
-/// before 22H2) or disabled in the config: the bar is drawn opaque then.
-pub fn apply_backdrop(hwnd: HWND, theme: &Theme, acrylic: bool) -> bool {
+/// Undocumented user32 `SetWindowCompositionAttribute` accent policy (used by
+/// TranslucentTB, Windows Terminal and others since Windows 10).
+#[repr(C)]
+struct AccentPolicy {
+    state: u32,
+    flags: u32,
+    /// 0xAABBGGRR
+    gradient_color: u32,
+    animation_id: u32,
+}
+
+#[repr(C)]
+struct CompositionData {
+    attribute: u32,
+    data: *mut c_void,
+    size: usize,
+}
+
+const WCA_ACCENT_POLICY: u32 = 19;
+const ACCENT_DISABLED: u32 = 0;
+const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
+/// Use `gradient_color` as the tint.
+const ACCENT_FLAG_GRADIENT_COLOR: u32 = 2;
+
+fn abgr(c: &D2D1_COLOR_F) -> u32 {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (byte(c.a) << 24) | (byte(c.b) << 16) | (byte(c.g) << 8) | byte(c.r)
+}
+
+fn set_accent(hwnd: HWND, state: u32, tint: &D2D1_COLOR_F) -> bool {
+    type SetWindowCompositionAttribute =
+        unsafe extern "system" fn(HWND, *mut CompositionData) -> BOOL;
     unsafe {
-        let dark = BOOL::from(!theme.light);
+        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else {
+            return false;
+        };
+        let Some(proc) = GetProcAddress(user32, s!("SetWindowCompositionAttribute")) else {
+            return false;
+        };
+        let set: SetWindowCompositionAttribute = std::mem::transmute(proc);
+        let mut policy = AccentPolicy {
+            state,
+            flags: ACCENT_FLAG_GRADIENT_COLOR,
+            gradient_color: abgr(tint),
+            animation_id: 0,
+        };
+        let mut data = CompositionData {
+            attribute: WCA_ACCENT_POLICY,
+            data: (&raw mut policy).cast::<c_void>(),
+            size: size_of::<AccentPolicy>(),
+        };
+        set(hwnd, &raw mut data).as_bool()
+    }
+}
+
+/// Dark mode, square corners and the backdrop. Returns the backdrop in effect.
+///
+/// Every translucent mode extends the DWM frame over the whole window, so pixels
+/// we leave transparent are composed by DWM: with no accent they show what is
+/// behind (`Clear`); the blur / acrylic accents blur it first. Unlike the
+/// `DWMWA_SYSTEMBACKDROP_TYPE` backdrops, accents do not depend on the window
+/// being active, so the bar needs no "fake active" trick and never falls back to
+/// an opaque fill when a shell flyout takes the foreground.
+pub fn apply_backdrop(
+    hwnd: HWND,
+    light: bool,
+    wanted: Background,
+    tint: &D2D1_COLOR_F,
+) -> Background {
+    unsafe {
+        let dark = BOOL::from(!light);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -173,9 +242,15 @@ pub fn apply_backdrop(hwnd: HWND, theme: &Theme, acrylic: bool) -> bool {
             (&raw const corners).cast::<c_void>(),
             size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
         );
-        // With acrylic the whole client area becomes "frame", so DWM composes the
-        // backdrop under every pixel we leave transparent.
-        let extend = if acrylic { -1 } else { 0 };
+        // Never the activation-dependent system backdrop.
+        let none: DWM_SYSTEMBACKDROP_TYPE = DWMSBT_NONE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&raw const none).cast::<c_void>(),
+            size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
+        );
+        let extend = if wanted == Background::Solid { 0 } else { -1 };
         let margins = MARGINS {
             cxLeftWidth: extend,
             cxRightWidth: extend,
@@ -183,21 +258,26 @@ pub fn apply_backdrop(hwnd: HWND, theme: &Theme, acrylic: bool) -> bool {
             cyBottomHeight: extend,
         };
         if DwmExtendFrameIntoClientArea(hwnd, &raw const margins).is_err() {
-            return false;
+            return Background::Solid;
         }
-        let backdrop: DWM_SYSTEMBACKDROP_TYPE = if acrylic {
-            DWMSBT_TRANSIENTWINDOW
-        } else {
-            DWMSBT_NONE
-        };
-        let applied = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            (&raw const backdrop).cast::<c_void>(),
-            size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
-        )
-        .is_ok();
-        acrylic && applied
+    }
+    // ACCENT_ENABLE_BLURBEHIND (3) renders black for ordinary windows on current
+    // Windows 11 builds, so "blur" is the acrylic accent with an (almost) clear
+    // tint; the light tint is drawn by us. Acrylic is tinted by DWM itself.
+    let accent = match wanted {
+        Background::Blur | Background::Acrylic => ACCENT_ENABLE_ACRYLICBLURBEHIND,
+        Background::Clear | Background::Solid => ACCENT_DISABLED,
+    };
+    let mut accent_tint = *tint;
+    if wanted != Background::Acrylic {
+        // Alpha 0 is treated as "no tint given" by some builds: keep 1/255.
+        accent_tint.a = 1.0 / 255.0;
+    }
+    let applied = set_accent(hwnd, accent, &accent_tint);
+    match wanted {
+        // Without the accent, blur / acrylic would be fully clear: report that.
+        Background::Blur | Background::Acrylic if !applied => Background::Clear,
+        other => other,
     }
 }
 

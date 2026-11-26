@@ -15,12 +15,14 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
   bạn ghim / bỏ ghim trên taskbar gốc. App ghim chưa chạy hiện icon không vạch, bấm để mở;
   app ghim đang chạy dùng chung một nút. Ghim / bỏ ghim thêm bằng chuột phải.
 - Wifi, âm lượng, pin (%): bấm để mở Quick Settings. Bấm đồng hồ mở trung tâm thông báo.
-- Nền trong mờ acrylic, theme sáng/tối và màu nhấn theo Windows, menu tối, hỗ trợ DPI cao.
+- Nền trong suốt hoàn toàn (mặc định, như TranslucentTB "clear": thấy rõ hình nền), hoặc mờ (blur),
+  acrylic, đặc. Chữ và icon có bóng đổ nhẹ nên đọc được trên mọi hình nền. Theme sáng/tối và màu
+  nhấn theo Windows, menu tối, hỗ trợ DPI cao.
 - Tuỳ chọn ẩn taskbar gốc; taskbar gốc luôn được trả lại khi thoát, crash hoặc tắt máy.
 
 ## Cài đặt
 
-Cần Windows 11 (22H2+ để có nền acrylic; Windows 10 vẫn chạy với nền đặc) và Rust 1.88+.
+Cần Windows 10/11 và Rust 1.88+.
 
 ```powershell
 git clone https://github.com/babywoozy/nitrobar
@@ -61,7 +63,7 @@ icon_size = 24               # cỡ icon app (DIP, 16..48)
 alignment = "center"         # "center" (giống Windows 11) hoặc "left"
 hide_native_taskbar = false  # ẩn taskbar gốc của Windows khi nitrobar chạy
 theme = "auto"               # "auto" (theo Windows), "dark" hoặc "light"
-acrylic = true               # nền trong mờ (Windows 11 22H2 trở lên)
+background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acrylic" hoặc "solid" (đặc)
 
 [colors]                     # để trống = theo theme Windows; "#RRGGBB" hoặc "#RRGGBBAA"
 background = ""
