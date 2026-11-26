@@ -214,7 +214,8 @@ src/
   + chữ; bóng đổ TẮT (nó sẽ làm tối lớp blur nằm dưới). Cần `DispatcherQueue` trên thread UI
   (`CreateDispatcherQueueController`, `DQTAT_COM_NONE`). Không có Composition => `glass` là `None`,
   viên vẫn vẽ tint đậm hơn (không blur). RAM không đổi đáng kể (~11.5 MB), exe +19 KB.
-  Màu chữ / icon: `App::refresh_backdrop` lấy mẫu ~9 pixel màn hình sát ngoài viên (GetPixel; KHÔNG
+  (BỎ lấy mẫu nền: giờ màu cố định, xem `island_base` / `dark_ink`; mô tả cũ bên dưới chỉ để tham khảo.)
+  Màu chữ / icon (cũ): `App::refresh_backdrop` lấy mẫu ~9 pixel màn hình sát ngoài viên (GetPixel; KHÔNG
   polling: gọi khi bung ra / đổi foreground / đổi style), độ sáng > 0.62 => nền sáng (tint trắng, chữ
   tối `island_palette`), < 0.48 => tối (có độ trễ chống chớp).
 - Zoom: CHỈ icon đang hover (`App::hover == Task(i)`) phóng 1.2x (`ZOOM_MAX`), `App::zoom[i]` (0..1)
@@ -380,3 +381,5 @@ src/
 - **Icon app UWP/packaged**: đã giải quyết bằng AUMID -> `shell:AppsFolder` image factory.
 - **Đa màn hình**: thanh chỉ ở màn hình chính.
 - **Xem trước cửa sổ khi hover** (thumbnail): chưa làm; `DwmRegisterThumbnail` là hướng đi.
+
+- Màu island: `island_color` = wallpaper (`wallpaper.rs`: WIC thu nhỏ 48 px trên luồng nền, màu chủ đạo theo bin hue, tính lại khi `WM_SETTINGCHANGE` wParam `SPI_SETDESKWALLPAPER`) | accent | #RRGGBB, `island_opacity` = độ đậm tint; chữ tối/sáng tính MỘT lần từ màu. Menu "Màu island" ghi config qua `config::set_bar_value` (sửa tại chỗ, giữ chú thích) rồi file watcher áp dụng; "Tự chọn" dùng `ChooseColorW` ngoài borrow của App.

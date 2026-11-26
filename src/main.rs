@@ -36,6 +36,7 @@ mod status;
 mod taskbar;
 mod tasks;
 mod theme;
+mod wallpaper;
 mod winpins;
 
 use windows::Win32::UI::HiDpi::{

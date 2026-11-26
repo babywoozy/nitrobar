@@ -6,9 +6,10 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenu, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_CHECKED, MF_GRAYED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenu,
+    WM_NULL,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -19,14 +20,21 @@ pub enum Command {
     CloseWindows,
     OpenConfig,
     Exit,
+    /// "Màu island" submenu.
+    ColorWallpaper,
+    ColorAccent,
+    ColorCustom,
 }
 
-const ALL: [Command; 5] = [
+const ALL: [Command; 8] = [
     Command::Pin,
     Command::Unpin,
     Command::CloseWindows,
     Command::OpenConfig,
     Command::Exit,
+    Command::ColorWallpaper,
+    Command::ColorAccent,
+    Command::ColorCustom,
 ];
 
 impl Command {
@@ -37,6 +45,9 @@ impl Command {
             Command::CloseWindows => 3,
             Command::OpenConfig => 4,
             Command::Exit => 5,
+            Command::ColorWallpaper => 6,
+            Command::ColorAccent => 7,
+            Command::ColorCustom => 8,
         }
     }
 }
@@ -52,6 +63,16 @@ pub struct MenuContext {
     pub config_error: Option<String>,
     /// Bar docked at the top: open the menu downwards.
     pub at_top: bool,
+    /// Island with the glass style: offers the "Màu island" submenu, with the
+    /// current source ticked.
+    pub island_colors: Option<IslandColorChoice>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IslandColorChoice {
+    Wallpaper,
+    Accent,
+    Custom,
 }
 
 /// Screen position for a WM_CONTEXTMENU lParam (-1,-1 means "from keyboard").
@@ -106,6 +127,31 @@ pub fn show(owner: HWND, at: POINT, ctx: &MenuContext) -> Option<Command> {
         if let Some(label) = &error_label {
             let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, label);
         }
+        if let Some(choice) = ctx.island_colors {
+            let sub = CreatePopupMenu().ok()?;
+            let checked = |c: IslandColorChoice| if choice == c { MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(
+                sub,
+                MF_STRING | checked(IslandColorChoice::Wallpaper),
+                Command::ColorWallpaper.id(),
+                w!("Theo hình nền"),
+            );
+            let _ = AppendMenuW(
+                sub,
+                MF_STRING | checked(IslandColorChoice::Accent),
+                Command::ColorAccent.id(),
+                w!("Theo màu Windows"),
+            );
+            let _ = AppendMenuW(
+                sub,
+                MF_STRING | checked(IslandColorChoice::Custom),
+                Command::ColorCustom.id(),
+                w!("Tự chọn..."),
+            );
+            // The submenu is destroyed with its parent.
+            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Màu island"));
+            separator(menu);
+        }
         add(menu, Command::OpenConfig, w!("Mở file cấu hình"));
         add(menu, Command::Exit, w!("Thoát nitrobar"));
 
@@ -139,4 +185,32 @@ fn first_line(text: &str) -> String {
         short.push('…');
     }
     short
+}
+
+/// The standard color picker, starting at `initial`. Runs a modal loop: call it
+/// with `App` NOT borrowed. Returns `0x00BBGGRR`-free (r, g, b) bytes.
+pub fn choose_color(owner: HWND, initial: (u8, u8, u8)) -> Option<(u8, u8, u8)> {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::Controls::Dialogs::{
+        CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW,
+    };
+    let mut custom = [COLORREF(0x00FF_FFFF); 16];
+    let mut dialog = CHOOSECOLORW {
+        lStructSize: size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: owner,
+        rgbResult: COLORREF(
+            u32::from(initial.0) | u32::from(initial.1) << 8 | u32::from(initial.2) << 16,
+        ),
+        lpCustColors: custom.as_mut_ptr(),
+        Flags: CC_RGBINIT | CC_FULLOPEN,
+        ..Default::default()
+    };
+    unsafe { ChooseColorW(&raw mut dialog) }.as_bool().then(|| {
+        let c = dialog.rgbResult.0;
+        (
+            (c & 0xff) as u8,
+            ((c >> 8) & 0xff) as u8,
+            ((c >> 16) & 0xff) as u8,
+        )
+    })
 }

@@ -13,9 +13,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRectRgn, EndPaint, GetDC, GetMonitorInfoW, GetPixel, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
-    MonitorFromWindow, PAINTSTRUCT, ReleaseDC, ScreenToClient, SetWindowRgn,
+    BeginPaint, CreateRectRgn, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT,
+    ScreenToClient, SetWindowRgn,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindCloseChangeNotification,
@@ -71,6 +71,7 @@ use crate::tasks::AppId;
 use crate::tasks::{self, TaskList};
 use crate::theme::Palette;
 use crate::theme::{self, Theme};
+use crate::wallpaper;
 use crate::{appbar, clock, layout, menu, safety, shell, taskbar, winpins};
 
 /// Posted by the message loop when a file in the config directory changed.
@@ -149,33 +150,6 @@ thread_local! {
     static MIN_RECT: Cell<RECT> = const { Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }) };
 }
 
-/// Brightness of the desktop around the island, measured off the UI thread
-/// (`GetPixel` on the screen DC costs ~15 ms per pixel: sampling on the UI thread
-/// froze the start of the expansion for ~140 ms).
-static BACKDROP_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static BACKDROP_LUMA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Posted by the sampling thread when `BACKDROP_LUMA` is fresh.
-const WM_APP_BACKDROP: u32 = WM_APP + 11;
-
-/// Average luma (0..1) of the screen pixels at `points`; `None` if none is on screen.
-fn sample_luma(points: &[(i32, i32)]) -> Option<f32> {
-    let (mut total, mut count) = (0.0, 0.0);
-    unsafe {
-        let hdc = GetDC(None);
-        for &(x, y) in points {
-            let c = GetPixel(hdc, x, y).0;
-            if c == 0xFFFF_FFFF {
-                continue; // off screen
-            }
-            let (r, g, b) = (c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff);
-            total += (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
-            count += 1.0;
-        }
-        ReleaseDC(None, hdc);
-    }
-    (count > 0.0).then(|| total / count)
-}
-
 pub struct Options {
     pub hide_taskbar: bool,
 }
@@ -230,8 +204,9 @@ struct App {
     /// Windows.UI.Composition unavailable), and whether the backdrop behind the
     /// pill is light (text / icons turn dark).
     glass: Option<Glass>,
-    backdrop_light: bool,
-    backdrop_fg: HWND,
+    /// Dominant color of the current wallpaper (island_color = "wallpaper"), found
+    /// on a thread; `None` until it is ready.
+    wallpaper_color: Option<D2D1_COLOR_F>,
     /// Island strip: pointer x in bar space (DIPs), whether it is over the strip,
     /// and the eased zoom amount (0..1) of the icons under it.
     zoom: Vec<f32>,
@@ -385,8 +360,7 @@ fn run_window(options: Options) -> Result<()> {
             hit_rect: RECT::default(),
             rest_icon: RestIcon::default(),
             glass: None,
-            backdrop_light: false,
-            backdrop_fg: HWND::default(),
+            wallpaper_color: None,
             zoom: Vec::new(),
             last_frame: None,
             preview: None,
@@ -512,7 +486,7 @@ fn on_busy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         return;
     }
     let keep = msg == WM_APP_MINIMIZED
-        || msg == WM_APP_BACKDROP
+        || msg == wallpaper::WM_APP_WALLPAPER
         || msg == WM_APP_CONFIG
         || msg == WM_APP_PINS
         || msg == preview::WM_APP_PREVIEW
@@ -599,6 +573,13 @@ fn show_context_menu(hwnd: HWND, lparam: LPARAM) {
                 .map_or(0, |g| app.tasks.groups[g].windows.len()),
             config_error: app.config_error.clone(),
             at_top: app.metrics.at_top,
+            island_colors: app.glass_style().then(|| {
+                match config::island_color(&app.config.bar.island_color) {
+                    config::IslandColor::Wallpaper => menu::IslandColorChoice::Wallpaper,
+                    config::IslandColor::Accent => menu::IslandColorChoice::Accent,
+                    config::IslandColor::Custom(_) => menu::IslandColorChoice::Custom,
+                }
+            }),
         };
         (target, ctx)
     }) else {
@@ -624,6 +605,35 @@ fn show_context_menu(hwnd: HWND, lparam: LPARAM) {
         menu::Command::OpenConfig => {
             if let Some(path) = config::path() {
                 pins::open_file(&path);
+            }
+        }
+        // The config file is rewritten; the running bar reloads it and applies the color.
+        menu::Command::ColorWallpaper => {
+            config::set_bar_value("island_color", "\"wallpaper\"");
+        }
+        menu::Command::ColorAccent => {
+            config::set_bar_value("island_color", "\"accent\"");
+        }
+        menu::Command::ColorCustom => {
+            let initial = with_app(hwnd, |app| {
+                let c = app.island_base();
+                (
+                    (c.r * 255.0).round() as u8,
+                    (c.g * 255.0).round() as u8,
+                    (c.b * 255.0).round() as u8,
+                )
+            })
+            .unwrap_or((0x5a, 0x6b, 0x85));
+            // The dialog is modal: keep the island open behind it.
+            with_app(hwnd, |app| app.menu_open = true);
+            let picked = menu::choose_color(hwnd, initial);
+            with_app(hwnd, |app| {
+                app.menu_open = false;
+                let inside = app.cursor_inside();
+                app.island_pointer(inside);
+            });
+            if let Some((r, g, b)) = picked {
+                config::set_bar_value("island_color", &format!("\"#{r:02X}{g:02X}{b:02X}\""));
             }
         }
         menu::Command::Pin | menu::Command::Unpin | menu::Command::CloseWindows => {
@@ -695,7 +705,16 @@ impl App {
                 self.start_frames();
             }
             morph::WM_APP_FRAME => self.on_frame(),
-            WM_APP_BACKDROP => self.on_backdrop_luma(),
+            wallpaper::WM_APP_WALLPAPER => {
+                let c = lparam.0 as u32;
+                self.wallpaper_color = Some(D2D1_COLOR_F {
+                    r: (c & 0xff) as f32 / 255.0,
+                    g: ((c >> 8) & 0xff) as f32 / 255.0,
+                    b: ((c >> 16) & 0xff) as f32 / 255.0,
+                    a: 1.0,
+                });
+                self.invalidate();
+            }
             preview::WM_APP_PREVIEW => match wparam.0 {
                 preview::ENTER => {
                     self.preview_hover = true;
@@ -746,6 +765,10 @@ impl App {
             WM_TIMECHANGE => self.tick_clock(),
             WM_SETTINGCHANGE => {
                 // Light/dark mode, accent color, locale or time format may have changed.
+                if wparam.0 == wallpaper::SPI_SETDESKWALLPAPER {
+                    // New wallpaper (also each picture of a slideshow).
+                    self.request_wallpaper(true);
+                }
                 self.reload_theme(false);
                 return None;
             }
@@ -886,89 +909,21 @@ impl App {
         } else if !want {
             self.glass = None;
         }
-        self.backdrop_light = false;
-        self.refresh_backdrop();
+        self.request_wallpaper(false);
+    }
+
+    /// Looks the wallpaper color up when the island needs it (see `wallpaper::request`).
+    fn request_wallpaper(&self, force: bool) {
+        if self.glass_style()
+            && config::island_color(&self.config.bar.island_color) == config::IslandColor::Wallpaper
+        {
+            wallpaper::request(self.hwnd, force);
+        }
     }
 
     /// Glass look (blur, or a translucent fill when the blur is unavailable).
     fn glass_style(&self) -> bool {
         self.island.is_some() && self.config.bar.island_style == IslandStyle::Glass
-    }
-
-    /// Is the desktop around the island light? Text and icons turn dark on light glass.
-    /// Looks at a few pixels next to and above the panel (not polled: called when the
-    /// island opens / closes, the foreground app changes...).
-    fn refresh_backdrop(&mut self) {
-        if !self.glass_style() || self.bar_rect.right <= self.bar_rect.left {
-            return;
-        }
-        let g = self.island_geometry();
-        let panel = if self.island.as_ref().is_some_and(|s| s.anim.expanded()) {
-            self.strip().panel
-        } else {
-            g.pill
-        };
-        let bar = self.bar_rect;
-        let px = |dip: f32| scale(dip, self.dpi);
-        let mid = (panel.top + panel.bottom) / 2.0;
-        let above = if self.metrics.at_top {
-            panel.bottom + 8.0
-        } else {
-            panel.top - 8.0
-        };
-        let w = panel.right - panel.left;
-        let mut points = vec![
-            (panel.left - 10.0, mid),
-            (panel.right + 10.0, mid),
-            (panel.left - 10.0, panel.top),
-            (panel.right + 10.0, panel.bottom),
-        ];
-        points.extend((1..=5).map(|i| (panel.left + w * i as f32 / 6.0, above)));
-        // Screen pixels, sampled on a short-lived thread; the answer comes back as
-        // `WM_APP_BACKDROP`. At most one sample runs at a time.
-        let points: Vec<(i32, i32)> = points
-            .into_iter()
-            .map(|(x, y)| (bar.left + px(x), bar.top + px(y)))
-            .collect();
-        if BACKDROP_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            return;
-        }
-        let target = self.hwnd.0 as usize;
-        let spawned = std::thread::Builder::new()
-            .name("nitrobar-backdrop".into())
-            .stack_size(64 * 1024)
-            .spawn(move || {
-                if let Some(luma) = sample_luma(&points) {
-                    BACKDROP_LUMA.store(luma.to_bits(), std::sync::atomic::Ordering::Release);
-                    unsafe {
-                        let _ = PostMessageW(
-                            Some(HWND(target as *mut _)),
-                            WM_APP_BACKDROP,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
-                }
-                BACKDROP_BUSY.store(false, std::sync::atomic::Ordering::Release);
-            });
-        if spawned.is_err() {
-            BACKDROP_BUSY.store(false, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    /// The sampling thread measured the desktop around the island.
-    fn on_backdrop_luma(&mut self) {
-        let luma = f32::from_bits(BACKDROP_LUMA.load(std::sync::atomic::Ordering::Acquire));
-        // Hysteresis: no flicker around the threshold.
-        let light = if self.backdrop_light {
-            luma > 0.48
-        } else {
-            luma > 0.62
-        };
-        if light != self.backdrop_light {
-            self.backdrop_light = light;
-            self.invalidate();
-        }
     }
 
     fn apply_native_taskbar(&mut self) {
@@ -1078,7 +1033,11 @@ impl App {
                     self.tasks.close_group(index);
                 }
             }
-            menu::Command::OpenConfig | menu::Command::Exit => {}
+            menu::Command::OpenConfig
+            | menu::Command::Exit
+            | menu::Command::ColorWallpaper
+            | menu::Command::ColorAccent
+            | menu::Command::ColorCustom => {}
         }
         self.invalidate();
     }
@@ -1310,12 +1269,6 @@ impl App {
         if self.island.is_some() {
             self.update_rest_icon();
             self.on_foreground_changed();
-            // Title changes etc. also refresh the list: only a new foreground app
-            // can change what is behind the island.
-            if self.tasks.foreground != self.backdrop_fg {
-                self.backdrop_fg = self.tasks.foreground;
-                self.refresh_backdrop();
-            }
         }
     }
 
@@ -1474,7 +1427,7 @@ impl App {
     /// Colors for the content of the island: light on its black panel, whatever the theme.
     fn island_palette(&self) -> Palette {
         // Dark ink on light glass, white on dark glass / the black style.
-        let dark_ink = self.glass_style() && self.backdrop_light;
+        let dark_ink = self.dark_ink();
         let ink = if dark_ink { 0.06 } else { 1.0 };
         let white = |a: f32| D2D1_COLOR_F {
             r: ink,
@@ -1699,7 +1652,6 @@ impl App {
     }
 
     fn begin_expand(&mut self) {
-        self.refresh_backdrop();
         debug_log!(
             "nitrobar: expand? abn_fullscreen={} fg_fullscreen={} flyout={}",
             self.fullscreen_app,
@@ -2300,28 +2252,43 @@ impl App {
         }
     }
 
-    /// Tint laid over the blur: dark on dark surroundings, white-ish on light ones.
-    fn glass_tint(&self) -> D2D1_COLOR_F {
-        if self.backdrop_light {
-            D2D1_COLOR_F {
-                r: 0.97,
-                g: 0.97,
-                b: 0.98,
-                a: if self.glass.is_some() { 0.45 } else { 0.72 },
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 0.05,
-                g: 0.05,
-                b: 0.07,
-                a: if self.glass.is_some() { 0.42 } else { 0.70 },
-            }
+    /// The island's tint color (glass style): the wallpaper's dominant color,
+    /// Windows' accent color, or the color the user picked.
+    fn island_base(&self) -> D2D1_COLOR_F {
+        let accent = D2D1_COLOR_F {
+            a: 1.0,
+            ..self.theme.accent
+        };
+        match config::island_color(&self.config.bar.island_color) {
+            config::IslandColor::Custom(c) => c,
+            config::IslandColor::Accent => accent,
+            config::IslandColor::Wallpaper => self.wallpaper_color.unwrap_or(accent),
         }
     }
 
-    /// Text color on the island: dark on light glass, light otherwise.
+    /// Text and icons are dark on a light tint color, white on a dark one: decided
+    /// once from the color (not from what happens to be behind the island).
+    fn dark_ink(&self) -> bool {
+        let c = self.island_base();
+        self.glass_style() && 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b > 0.58
+    }
+
+    /// Tint laid over the blur.
+    fn glass_tint(&self) -> D2D1_COLOR_F {
+        let mut c = self.island_base();
+        // Without the blur window there is nothing to see through: denser tint.
+        let opacity = self.config.bar.island_opacity;
+        c.a = if self.glass.is_some() {
+            opacity
+        } else {
+            (opacity + 0.3).min(1.0)
+        };
+        c
+    }
+
+    /// Text color on the island: dark on a light tint, light otherwise.
     fn rest_text(&self) -> D2D1_COLOR_F {
-        if self.glass_style() && self.backdrop_light {
+        if self.dark_ink() {
             D2D1_COLOR_F {
                 r: 0.06,
                 g: 0.06,

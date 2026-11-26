@@ -62,7 +62,7 @@ nitrobar.exe --quit             # tắt (hoặc chuột phải trên thanh > Tho
 nitrobar.exe --restore-taskbar  # cứu taskbar gốc nếu bị kẹt ẩn (sau khi bị End task)
 ```
 
-Chuột phải trên thanh:
+Chuột phải trên thanh (kính: có mục "Màu island" > Theo hình nền / Theo màu Windows / Tự chọn, áp dụng ngay):
 
 | Vị trí | Mục trong menu |
 |---|---|
@@ -87,6 +87,8 @@ background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acr
 
 mode = "island"              # "island" (thu gọn, rê chuột thì bung ra) hoặc "full" (luôn hiện)
 island_style = "glass"       # "glass" (kính mờ, blur phần phía sau) hoặc "black" (đen đặc)
+island_color = "wallpaper"   # màu tint của kính: "wallpaper" (màu chủ đạo hình nền), "accent" (màu Windows) hoặc "#RRGGBB"
+island_opacity = 0.45        # độ đậm lớp tint (0.0 .. 1.0)
 island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
 island_height = 40           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)

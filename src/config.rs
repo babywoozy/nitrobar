@@ -87,6 +87,10 @@ pub struct BarConfig {
     pub background: Background,
     pub mode: BarMode,
     pub island_style: IslandStyle,
+    /// Glass tint color: "wallpaper", "accent" or "#RRGGBB".
+    pub island_color: String,
+    /// How strong the tint is, 0..=1.
+    pub island_opacity: f32,
     /// Pill size while at rest, DIPs (clamped to 40..=600 / 4..=80), and its gap to
     /// the screen edge (0..=60).
     pub island_width: f32,
@@ -112,6 +116,8 @@ impl Default for BarConfig {
             background: Background::Clear,
             mode: BarMode::Island,
             island_style: IslandStyle::Glass,
+            island_color: "wallpaper".to_string(),
+            island_opacity: 0.45,
             island_width: 200.0,
             island_height: 40.0,
             island_gap: 10.0,
@@ -176,6 +182,7 @@ impl Config {
         config.bar.island_width = clamp_or(config.bar.island_width, 40.0, 600.0, 200.0);
         config.bar.island_height = clamp_or(config.bar.island_height, 4.0, 80.0, 40.0);
         config.bar.island_gap = clamp_or(config.bar.island_gap, 0.0, 60.0, 10.0);
+        config.bar.island_opacity = clamp_or(config.bar.island_opacity, 0.0, 1.0, 0.45);
         config.bar.expand_delay_ms = config.bar.expand_delay_ms.min(2000);
         config.bar.collapse_delay_ms = config.bar.collapse_delay_ms.min(10_000);
         Ok(config)
@@ -210,6 +217,8 @@ background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acr
 #   "full":   thanh luôn hiện và giữ chỗ như taskbar thường.
 mode = "island"
 island_style = "glass"       # "glass" (kính mờ, blur phần phía sau) hoặc "black" (đen đặc)
+island_color = "wallpaper"   # màu lớp tint của kính: "wallpaper" (màu chủ đạo của hình nền), "accent" (màu nhấn Windows) hoặc "#RRGGBB"
+island_opacity = 0.45        # độ đậm của lớp tint (0.0 .. 1.0)
 island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
 island_height = 40           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
@@ -274,6 +283,75 @@ fn migrate_legacy(text: &str) -> Option<String> {
         out = out.replace(old, new);
     }
     (out != text).then_some(out)
+}
+
+/// Where the island's tint color comes from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum IslandColor {
+    Wallpaper,
+    Accent,
+    Custom(D2D1_COLOR_F),
+}
+
+/// Parses `island_color`: "wallpaper", "accent" or "#RRGGBB"; anything else is "wallpaper".
+pub fn island_color(text: &str) -> IslandColor {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "accent" => IslandColor::Accent,
+        t if t.starts_with('#') => parse_color(t).map_or(IslandColor::Wallpaper, |mut c| {
+            c.a = 1.0;
+            IslandColor::Custom(c)
+        }),
+        _ => IslandColor::Wallpaper,
+    }
+}
+
+/// Sets `key = value` in the `[bar]` table of the config file text, keeping the
+/// line's comment. `value` is TOML ("\"accent\"", "0.5"). A missing key is added
+/// at the end of the table.
+pub fn set_bar_value_in(text: &str, key: &str, value: &str) -> String {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut in_bar = false;
+    let mut last_bar_line = None;
+    for (i, line) in lines.iter_mut().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_bar = trimmed.starts_with("[bar]");
+            if in_bar {
+                last_bar_line = Some(i);
+            }
+            continue;
+        }
+        if !in_bar {
+            continue;
+        }
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            last_bar_line = Some(i);
+        }
+        let is_key = trimmed
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if is_key {
+            let comment = line.find('#').map(|at| line[at..].to_string());
+            *line = match comment {
+                Some(c) => format!("{key} = {value}  {c}"),
+                None => format!("{key} = {value}"),
+            };
+            return lines.join(newline) + newline;
+        }
+    }
+    let at = last_bar_line.map_or(lines.len(), |i| i + 1);
+    lines.insert(at, format!("{key} = {value}"));
+    lines.join(newline) + newline
+}
+
+/// Changes one `[bar]` value in the user's config file (the running bar reloads it).
+pub fn set_bar_value(key: &str, value: &str) -> bool {
+    let Some(path) = path() else {
+        return false;
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
+    std::fs::write(&path, set_bar_value_in(&text, key, value)).is_ok()
 }
 
 /// Reads the config file, creating it with defaults if missing.
@@ -363,6 +441,45 @@ island_style = \"neon\"
 "
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn island_color_spec() {
+        assert_eq!(island_color("wallpaper"), IslandColor::Wallpaper);
+        assert_eq!(island_color(" ACCENT "), IslandColor::Accent);
+        assert_eq!(island_color("nonsense"), IslandColor::Wallpaper);
+        match island_color("#336699") {
+            IslandColor::Custom(c) => assert!((c.r - 0.2).abs() < 0.01 && c.a == 1.0),
+            other => panic!("{other:?}"),
+        }
+        let config = Config::parse("[bar]\nisland_opacity = 7\n").unwrap();
+        assert_eq!(config.bar.island_opacity, 1.0);
+    }
+
+    #[test]
+    fn set_bar_value_edits_in_place_and_keeps_comments() {
+        let text = "[bar]\nisland_color = \"wallpaper\"   # nguồn\nmode = \"island\"\n\n[clock]\nshow_date = true\n";
+        let out = set_bar_value_in(text, "island_color", "\"#102030\"");
+        assert!(out.contains("island_color = \"#102030\"  # nguồn"));
+        assert!(out.contains("mode = \"island\"") && out.contains("[clock]"));
+        // A key that is missing is added at the end of [bar], not of the file.
+        let out = set_bar_value_in(text, "island_x", "0.5");
+        let bar = out.find("[bar]").unwrap();
+        let clock = out.find("[clock]").unwrap();
+        let added = out.find("island_x = 0.5").unwrap();
+        assert!(bar < added && added < clock);
+        // Keys of other tables with the same name are left alone.
+        let other = "[bar]\nmode = \"full\"\n[x]\nisland_color = 1\n";
+        let out = set_bar_value_in(other, "island_color", "\"accent\"");
+        assert!(out.contains("[x]\nisland_color = 1"));
+        assert!(
+            Config::parse(&set_bar_value_in(
+                DEFAULT_CONFIG,
+                "island_color",
+                "\"accent\""
+            ))
+            .is_ok()
         );
     }
 
