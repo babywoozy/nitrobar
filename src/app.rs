@@ -87,8 +87,8 @@ const TIMER_PULSE: usize = 4;
 /// A restore we started ourselves still gets its own `HSHELL_GETMINRECT`; ignore it.
 const OWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Dock-like zoom of the icon under the pointer, and how fast it follows (s).
-const ZOOM_MAX: f32 = 0.30;
-const ZOOM_EASE: f32 = 0.07;
+const ZOOM_MAX: f32 = 0.20;
+const ZOOM_EASE: f32 = 0.05;
 /// The resting pill: black like the Dynamic Island, with a faint hairline.
 const REST_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 0.035,
@@ -191,9 +191,7 @@ struct App {
     rest_icon: RestIcon,
     /// Island strip: pointer x in bar space (DIPs), whether it is over the strip,
     /// and the eased zoom amount (0..1) of the icons under it.
-    pointer_x: f32,
-    pointer_in: bool,
-    zoom: f32,
+    zoom: Vec<f32>,
     last_frame: Option<Instant>,
     /// Island: window previews of an app with several windows, whether the
     /// pointer is on them, the icon that bounces (group key) and since when.
@@ -343,9 +341,7 @@ fn run_window(options: Options) -> Result<()> {
             origin: (0.0, 0.0),
             hit_rect: RECT::default(),
             rest_icon: RestIcon::default(),
-            pointer_x: 0.0,
-            pointer_in: false,
-            zoom: 0.0,
+            zoom: Vec::new(),
             last_frame: None,
             preview: None,
             preview_hover: false,
@@ -718,10 +714,6 @@ impl App {
             }
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
-                self.pointer_in = false;
-                if self.zoom > 0.001 {
-                    self.start_frames();
-                }
                 self.island_pointer(false);
                 self.set_hover(None);
                 if self.pressed.take().is_some() {
@@ -998,15 +990,6 @@ impl App {
         }
         self.island_pointer(true);
         let hit = self.hit_at(x, y);
-        if self.island.as_ref().is_some_and(|s| !s.small_window) {
-            // Island strip: the icons zoom around the pointer.
-            self.pointer_x = x as f32 * 96.0 / self.dpi as f32 + self.origin.0;
-            self.pointer_in = true;
-            self.invalidate();
-            if self.zoom < 0.999 {
-                self.start_frames();
-            }
-        }
         self.set_hover(hit);
     }
 
@@ -1014,6 +997,10 @@ impl App {
         if hit != self.hover {
             self.hover = hit;
             self.invalidate();
+            if self.island.is_some() {
+                // The icon under the pointer zooms in, the one it left zooms out.
+                self.start_frames();
+            }
         }
     }
 
@@ -1273,7 +1260,6 @@ impl App {
             self.palette()
         };
         let foreground = self.tasks.foreground;
-        let button_width = self.metrics.icon_size + 16.0;
         let buttons = layout
             .tasks
             .iter()
@@ -1282,10 +1268,8 @@ impl App {
             .map(|(i, (rect, item))| {
                 let group = item.group.and_then(|g| self.tasks.groups.get(g));
                 let pin = item.pin.and_then(|p| self.pins.items.get(p));
-                // Dock zoom: a smooth bump around the pointer.
-                let center = (rect.left + rect.right) / 2.0;
-                let reach = (self.pointer_x - center) / (button_width * 1.1);
-                let scale = 1.0 + ZOOM_MAX * self.zoom * (-reach * reach).exp();
+                // Only the hovered icon grows.
+                let scale = 1.0 + ZOOM_MAX * self.zoom.get(i).copied().unwrap_or(0.0);
                 let hop = self
                     .bounce
                     .as_ref()
@@ -1307,7 +1291,7 @@ impl App {
                     },
                     pointer: self.pointer(Hit::Task(i)),
                     scale,
-                    lift: (scale - 1.0) * 8.0 + hop,
+                    lift: (scale - 1.0) * 10.0 + hop,
                 }
             })
             .collect();
@@ -1496,7 +1480,7 @@ impl App {
             if expanded {
                 return;
             }
-            if animating {
+            if animating || self.config.bar.expand_delay_ms == 0 {
                 self.begin_expand();
             } else {
                 self.set_timer(TIMER_EXPAND, self.config.bar.expand_delay_ms);
@@ -1713,22 +1697,32 @@ impl App {
         let mut running = false;
         let mut repaint = false;
 
-        // Icon zoom follows the pointer with a short ease.
+        // Only the icon under the pointer zooms; each one eases in and out on its own.
         if self.island.is_some() {
             let open = self.island.as_ref().is_some_and(|s| !s.small_window);
-            let target = if open && self.pointer_in { 1.0 } else { 0.0 };
-            if (self.zoom - target).abs() > 0.002 {
-                let dt = self
-                    .last_frame
-                    .map_or(0.016, |at| now.saturating_duration_since(at).as_secs_f32())
-                    .min(0.05);
-                self.zoom += (target - self.zoom) * (1.0 - (-dt / ZOOM_EASE).exp());
-                if (self.zoom - target).abs() < 0.01 {
-                    self.zoom = target;
+            let count = self.items().len();
+            self.zoom.resize(count, 0.0);
+            let dt = self
+                .last_frame
+                .map_or(0.016, |at| now.saturating_duration_since(at).as_secs_f32())
+                .min(0.05);
+            let k = 1.0 - (-dt / ZOOM_EASE).exp();
+            let hovered = self.hover;
+            for (i, z) in self.zoom.iter_mut().enumerate() {
+                let target = if open && hovered == Some(Hit::Task(i)) {
+                    1.0
                 } else {
-                    running = true;
+                    0.0
+                };
+                if (*z - target).abs() > 0.002 {
+                    *z += (target - *z) * k;
+                    if (*z - target).abs() < 0.01 {
+                        *z = target;
+                    } else {
+                        running = true;
+                    }
+                    repaint = true;
                 }
-                repaint = true;
             }
         }
 
@@ -1997,7 +1991,18 @@ impl App {
             (rc.top - bar.top) as f32 * px_to_dip,
         );
         if let Some(sensor) = &state.sensor {
-            sensor.place(&self.monitor_rect, self.metrics.at_top, small && !hidden);
+            // Only the middle of the edge expands the island: the pill plus a margin.
+            let edge_y = if self.metrics.at_top {
+                self.monitor_rect.top
+            } else {
+                self.monitor_rect.bottom - 1
+            };
+            sensor.place(
+                bar.left + to_px(geometry.pill.left - island::EDGE_ZONE_MARGIN),
+                bar.left + to_px(geometry.pill.right + island::EDGE_ZONE_MARGIN),
+                edge_y,
+                small && !hidden,
+            );
         }
         unsafe {
             if hidden {

@@ -203,9 +203,16 @@ src/
   vượt của lò xo ~3%) hợp với `activity_hit`; danh sách app đổi lúc đang mở thì `place_island` lại.
   Bung ra theo lò xo (`EXPAND_SPRING`), thu lại ease-in-out. Không có nút Start (Win mở Start).
   Màu nội dung = `App::island_palette` (trắng trên đen bất kể theme); `text_shadow` tắt trong island.
-- Zoom kiểu dock: `ButtonView::scale` = 1 + 0.30 * zoom * exp(-(dx/(1.1*nút))^2) quanh con trỏ,
-  `App::zoom` (0..1) đuổi theo đích bằng ease 70 ms trong `on_frame` (chỉ chạy frame khi còn đang
-  đổi); mỗi `WM_MOUSEMOVE` vẽ lại. Icon phóng to vẽ từ bitmap cỡ gốc nên hơi mềm; ở 1x vẫn 1:1 theo
+- Zoom: CHỈ icon đang hover (`App::hover == Task(i)`) phóng 1.2x (`ZOOM_MAX`), `App::zoom[i]` (0..1)
+  của từng nút đuổi theo đích bằng ease 50 ms trong `on_frame` (frame chỉ chạy khi còn đang đổi),
+  nút vừa rời thì thu lại riêng. (Bản đầu zoom theo khoảng cách bằng Gaussian: hai icon cùng to khi
+  chuột ở giữa, bị bỏ.)
+- Vùng kích hoạt: `EdgeSensor` chỉ rộng `viên + 2 * EDGE_ZONE_MARGIN` (40 DIP) ở giữa mép; trước đây
+  cả chiều ngang màn hình nên rê chuột xuống đáy cửa sổ app khác (ô chat) cũng bung dải.
+  `expand_delay_ms` mặc định 30 (0 = bung ngay), bung 220 ms lò xo (40 rad/s, 0.72).
+- `config::migrate_legacy`: file config tạo bởi bản island đầu ghi sẵn 120x8 / 100 ms; giá trị trong
+  file luôn thắng mặc định nên người dùng không bao giờ thấy thiết kế mới. Các dòng còn nguyên văn
+  như bản cũ ghi (chưa bị sửa) được tự nâng lên mặc định mới; dòng đã sửa thì giữ. Icon phóng to vẽ từ bitmap cỡ gốc nên hơi mềm; ở 1x vẫn 1:1 theo
   pixel. Hit-test dùng rect không phóng to. `ButtonState::Minimized` = mọi cửa sổ iconic => chấm mờ.
 - Khung hình: `morph::start_clock` = thread `nitrobar-frames` gọi `DwmFlush` (chờ lần compose kế
   tiếp = theo tần số màn hình, 60/120/144 Hz) rồi post `WM_APP_FRAME` (tối đa 1 message đang chờ).

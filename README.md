@@ -9,10 +9,11 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
   mép 10 DIP, có bóng đổ mềm). Bên trái là icon của app đang active (đổi app thì icon mờ chuyển sang
   icon mới), bên phải là giờ. Thanh không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc
   được ẩn).
-  - Rê chuột vào viên hoặc chạm mép dưới ở bất kỳ đâu (~100 ms): viên giãn ngang bằng lò xo thành dải
+  - Rê chuột vào viên hoặc chạm mép dưới ở đoạn giữa (rộng bằng viên + 40 DIP mỗi bên; phần còn lại
+    của mép, ví dụ ô chat của app khác, không làm gì) thì sau ~30 ms viên giãn ngang (~200 ms, lò xo nhẹ) thành dải
     icon các app (app ghim + đang chạy, gom theo app), vẫn là một khối bo tròn nổi, rộng vừa đủ. Vạch
     ngắn dưới app đang mở, vạch dài màu nhấn dưới app đang active, chấm mờ dưới app đã thu nhỏ hết
-    cửa sổ, nền cam khi app cần chú ý. Icon dưới con trỏ phóng to nhẹ như dock macOS. Wifi / âm lượng
+    cửa sổ, nền cam khi app cần chú ý. Chỉ icon đang có chuột phóng to nhẹ (1,2 lần), các icon khác giữ nguyên. Wifi / âm lượng
     / pin / đồng hồ nằm cuối dải, ngăn cách bằng một vạch mờ. Rời chuột ~600 ms thì thu về viên.
   - Bấm icon trên dải: app đang thu nhỏ thì cửa sổ tỏa ra từ đúng icon đó (khối tròn đen cỡ icon lớn
     dần, sáng dần thành cửa sổ thật) rồi dải thu lại; app đang active thì cửa sổ co ngược vào đúng
@@ -86,7 +87,7 @@ mode = "island"              # "island" (thu gọn, rê chuột thì bung ra) ho
 island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
 island_height = 40           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
-expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
+expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay lập tức)
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
 island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)
 window_animation = true      # thu nhỏ cửa sổ "chui" vào island; false = hiệu ứng của Windows

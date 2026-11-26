@@ -39,10 +39,13 @@ pub const WM_APP_EDGE: u32 = WM_APP + 7;
 /// Sent after `TrackMouseEvent(TME_LEAVE)` when the pointer leaves the window.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-pub const EXPAND_DURATION: Duration = Duration::from_millis(480);
-pub const COLLAPSE_DURATION: Duration = Duration::from_millis(260);
+pub const EXPAND_DURATION: Duration = Duration::from_millis(220);
+pub const COLLAPSE_DURATION: Duration = Duration::from_millis(200);
 /// Spring (rad/s, damping ratio) of the expansion: a small overshoot.
-const EXPAND_SPRING: (f32, f32) = (22.0, 0.72);
+const EXPAND_SPRING: (f32, f32) = (40.0, 0.72);
+/// The part of the screen edge that expands the island: the pill's width plus this
+/// much on each side, DIPs. The rest of the edge (a chat box of another app...) does nothing.
+pub const EDGE_ZONE_MARGIN: f32 = 40.0;
 /// Extra hover area around the pill, DIPs. Also room for its soft shadow.
 pub const HIT_MARGIN: f32 = 14.0;
 /// "Activity" pill shown while an app goes into / comes out of the island: grows
@@ -541,24 +544,20 @@ impl EdgeSensor {
         }
     }
 
-    /// Places the strip along the edge of `monitor` and shows it (or hides it).
-    pub fn place(&self, monitor: &RECT, at_top: bool, visible: bool) {
+    /// Places the 1 px strip at screen height `y`, from `left` to `right` (screen
+    /// pixels), and shows it (or hides it).
+    pub fn place(&self, left: i32, right: i32, y: i32, visible: bool) {
         unsafe {
             if !visible {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 return;
             }
-            let y = if at_top {
-                monitor.top
-            } else {
-                monitor.bottom - 1
-            };
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
-                monitor.left,
+                left,
                 y,
-                monitor.right - monitor.left,
+                (right - left).max(1),
                 1,
                 SWP_NOACTIVATE,
             );
@@ -627,7 +626,7 @@ mod tests {
         let mut island = Island::collapsed();
         island.set_target(true, t0);
         let mut peak = 0.0f32;
-        for ms in (0..480).step_by(8) {
+        for ms in (0..220).step_by(4) {
             island.tick(t0 + Duration::from_millis(ms));
             peak = peak.max(island.eased());
         }

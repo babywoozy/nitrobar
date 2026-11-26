@@ -101,7 +101,7 @@ impl Default for BarConfig {
             island_width: 200.0,
             island_height: 40.0,
             island_gap: 10.0,
-            expand_delay_ms: 100,
+            expand_delay_ms: 30,
             collapse_delay_ms: 600,
             island_show_clock: true,
             window_animation: true,
@@ -198,7 +198,7 @@ mode = "island"
 island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
 island_height = 40           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
-expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
+expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay lập tức)
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
 island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)
 
@@ -228,13 +228,52 @@ pub fn path() -> Option<PathBuf> {
     dir().map(|d| d.join("config.toml"))
 }
 
+/// The island lines the first island version wrote (a 120x8 pill, 100 ms delay...).
+const LEGACY_ISLAND: [(&str, &str); 4] = [
+    (
+        "island_width = 120           # cỡ viên khi thu gọn (DIP, 40..600)",
+        "island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)",
+    ),
+    (
+        "island_height = 8            # (DIP, 4..40)",
+        "island_height = 40           # (DIP, 4..80)
+island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)",
+    ),
+    (
+        "expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra",
+        "expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay lập tức)",
+    ),
+    (
+        "island_show_clock = false    # hiện giờ nhỏ trong viên",
+        "island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)",
+    ),
+];
+
+/// A config file written by an earlier version still pins that version's island
+/// numbers (a file value always beats the default), so the new design would never
+/// show. Lines that are still exactly what that version wrote (the user never
+/// touched them) are brought up to date; edited lines are left alone.
+fn migrate_legacy(text: &str) -> Option<String> {
+    let mut out = text.to_string();
+    for (old, new) in LEGACY_ISLAND {
+        out = out.replace(old, new);
+    }
+    (out != text).then_some(out)
+}
+
 /// Reads the config file, creating it with defaults if missing.
 pub fn load() -> Result<Config, String> {
     let Some(path) = path() else {
         return Ok(Config::default());
     };
     match std::fs::read_to_string(&path) {
-        Ok(text) => Config::parse(&text),
+        Ok(text) => match migrate_legacy(&text) {
+            Some(new) => {
+                let _ = std::fs::write(&path, &new);
+                Config::parse(&new)
+            }
+            None => Config::parse(&text),
+        },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -269,6 +308,27 @@ mod tests {
     #[test]
     fn default_file_matches_defaults() {
         assert_eq!(Config::parse(DEFAULT_CONFIG), Ok(Config::default()));
+    }
+
+    #[test]
+    fn legacy_island_lines_are_migrated_but_edits_are_kept() {
+        let legacy = "[bar]
+mode = \"island\"
+island_width = 120           # cỡ viên khi thu gọn (DIP, 40..600)
+island_height = 8            # (DIP, 4..40)
+expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
+island_show_clock = false    # hiện giờ nhỏ trong viên
+";
+        let migrated = migrate_legacy(legacy).unwrap();
+        let config = Config::parse(&migrated).unwrap();
+        assert_eq!(config.bar, Config::default().bar);
+        assert!(migrate_legacy(&migrated).is_none(), "idempotent");
+        // The user changed the width: that line stays.
+        let edited = legacy.replace("island_width = 120 ", "island_width = 150 ");
+        let config = Config::parse(&migrate_legacy(&edited).unwrap()).unwrap();
+        assert_eq!(config.bar.island_width, 150.0);
+        assert_eq!(config.bar.island_height, 40.0);
+        assert!(migrate_legacy(DEFAULT_CONFIG).is_none());
     }
 
     #[test]
