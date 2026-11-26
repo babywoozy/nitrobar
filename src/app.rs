@@ -13,9 +13,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRectRgn, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT,
-    ScreenToClient, SetWindowRgn,
+    BeginPaint, CreateRectRgn, EndPaint, GetDC, GetMonitorInfoW, GetPixel, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    MonitorFromWindow, PAINTSTRUCT, ReleaseDC, ScreenToClient, SetWindowRgn,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindCloseChangeNotification,
@@ -54,7 +54,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
-use crate::config::{self, Alignment, Background, BarMode, Config, Position, ThemeMode};
+use crate::config::{
+    self, Alignment, Background, BarMode, Config, IslandStyle, Position, ThemeMode,
+};
+use crate::glass::Glass;
 use crate::icons::{Icon, IconLoader};
 use crate::island::{self, EdgeSensor, Island, Pulse};
 use crate::layout::{BarLayout, Hit, Metrics};
@@ -101,6 +104,13 @@ const REST_BORDER: D2D1_COLOR_F = D2D1_COLOR_F {
     g: 1.0,
     b: 1.0,
     a: 0.09,
+};
+/// Hairline around the glass pill.
+const GLASS_BORDER: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.40,
 };
 const REST_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
@@ -189,6 +199,11 @@ struct App {
     hit_rect: RECT,
     /// Island: icon of the active app shown at rest, and the one it replaces.
     rest_icon: RestIcon,
+    /// Island glass style: the blur window below the bar (`None`: black style, or
+    /// Windows.UI.Composition unavailable), and whether the backdrop behind the
+    /// pill is light (text / icons turn dark).
+    glass: Option<Glass>,
+    backdrop_light: bool,
     /// Island strip: pointer x in bar space (DIPs), whether it is over the strip,
     /// and the eased zoom amount (0..1) of the icons under it.
     zoom: Vec<f32>,
@@ -341,6 +356,8 @@ fn run_window(options: Options) -> Result<()> {
             origin: (0.0, 0.0),
             hit_rect: RECT::default(),
             rest_icon: RestIcon::default(),
+            glass: None,
+            backdrop_light: false,
             zoom: Vec::new(),
             last_frame: None,
             preview: None,
@@ -773,6 +790,7 @@ impl App {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.status = Some(Status::new(self.hwnd));
+        self.apply_style();
         self.morph = Morph::new();
         self.pins.load_icons(&self.icons, self.icon_px, false);
         self.refresh_tasks();
@@ -822,6 +840,88 @@ impl App {
             self.hit_rect = RECT::default();
             unsafe { SetWindowRgn(self.hwnd, None, true) };
         }
+        self.apply_style();
+    }
+
+    /// Creates / drops the glass window for `island_style`.
+    fn apply_style(&mut self) {
+        let want = self.island.is_some() && self.config.bar.island_style == IslandStyle::Glass;
+        if want && self.glass.is_none() {
+            self.glass = Glass::new();
+            debug_log!(
+                "nitrobar: glass backdrop available: {}",
+                self.glass.is_some()
+            );
+        } else if !want {
+            self.glass = None;
+        }
+        self.backdrop_light = false;
+        self.refresh_backdrop();
+    }
+
+    /// Glass look (blur, or a translucent fill when the blur is unavailable).
+    fn glass_style(&self) -> bool {
+        self.island.is_some() && self.config.bar.island_style == IslandStyle::Glass
+    }
+
+    /// Is the desktop around the island light? Text and icons turn dark on light glass.
+    /// Looks at a few pixels next to and above the panel (not polled: called when the
+    /// island opens / closes, the foreground app changes...).
+    fn refresh_backdrop(&mut self) {
+        if !self.glass_style() || self.bar_rect.right <= self.bar_rect.left {
+            return;
+        }
+        let g = self.island_geometry();
+        let panel = if self.island.as_ref().is_some_and(|s| s.anim.expanded()) {
+            self.strip().panel
+        } else {
+            g.pill
+        };
+        let bar = self.bar_rect;
+        let px = |dip: f32| scale(dip, self.dpi);
+        let mid = (panel.top + panel.bottom) / 2.0;
+        let above = if self.metrics.at_top {
+            panel.bottom + 8.0
+        } else {
+            panel.top - 8.0
+        };
+        let w = panel.right - panel.left;
+        let mut points = vec![
+            (panel.left - 10.0, mid),
+            (panel.right + 10.0, mid),
+            (panel.left - 10.0, panel.top),
+            (panel.right + 10.0, panel.bottom),
+        ];
+        points.extend((1..=5).map(|i| (panel.left + w * i as f32 / 6.0, above)));
+        let mut total = 0.0;
+        let mut count = 0.0;
+        unsafe {
+            let hdc = GetDC(None);
+            for (x, y) in points {
+                let c = GetPixel(hdc, bar.left + px(x), bar.top + px(y)).0;
+                if c == 0xFFFF_FFFF {
+                    continue; // off screen
+                }
+                let (r, g, b) = (c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff);
+                total += (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
+                count += 1.0;
+            }
+            ReleaseDC(None, hdc);
+        }
+        if count == 0.0 {
+            return;
+        }
+        let luma = total / count;
+        // Hysteresis: no flicker around the threshold.
+        let light = if self.backdrop_light {
+            luma > 0.48
+        } else {
+            luma > 0.62
+        };
+        if light != self.backdrop_light {
+            self.backdrop_light = light;
+            self.invalidate();
+        }
     }
 
     fn apply_native_taskbar(&mut self) {
@@ -844,6 +944,7 @@ impl App {
                     self.metrics = metrics_for(&self.config);
                     self.theme = Theme::from_system(forced_light(&self.config));
                     self.apply_mode();
+                    self.apply_style();
                     self.apply_theme();
                     self.apply_native_taskbar();
                     self.reposition();
@@ -1162,6 +1263,7 @@ impl App {
         if self.island.is_some() {
             self.update_rest_icon();
             self.on_foreground_changed();
+            self.refresh_backdrop();
         }
     }
 
@@ -1319,14 +1421,21 @@ impl App {
 
     /// Colors for the content of the island: light on its black panel, whatever the theme.
     fn island_palette(&self) -> Palette {
+        // Dark ink on light glass, white on dark glass / the black style.
+        let dark_ink = self.glass_style() && self.backdrop_light;
+        let ink = if dark_ink { 0.06 } else { 1.0 };
         let white = |a: f32| D2D1_COLOR_F {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
+            r: ink,
+            g: ink,
+            b: ink,
             a,
         };
-        let mut p = self.theme.palette();
-        p.text = REST_TEXT;
+        let mut p = Theme {
+            light: dark_ink,
+            ..self.theme
+        }
+        .palette();
+        p.text = self.rest_text();
         p.hover = white(0.10);
         p.pressed = white(0.16);
         p.active = white(0.12);
@@ -1346,7 +1455,20 @@ impl App {
             BeginPaint(self.hwnd, &raw mut ps);
             // The scene borrows `self`, so the renderer is moved out while drawing.
             if let Some(mut renderer) = self.renderer.take() {
-                let result = renderer.draw(self.hwnd, self.dpi, &self.scene());
+                let scene = self.scene();
+                if let (Some(glass), Some(view)) = (&self.glass, &scene.island) {
+                    // The blur takes the panel's current shape (moving with the animation).
+                    let k = self.dpi as f32 / 96.0;
+                    let p = view.panel;
+                    glass.set_shape(
+                        (p.left - self.origin.0) * k,
+                        (p.top - self.origin.1) * k,
+                        (p.right - p.left) * k,
+                        (p.bottom - p.top) * k,
+                        view.radius * k,
+                    );
+                }
+                let result = renderer.draw(self.hwnd, self.dpi, &scene);
                 self.renderer = Some(renderer);
                 if let Err(err) = result {
                     debug_log!("nitrobar: draw failed: {err}");
@@ -1525,6 +1647,7 @@ impl App {
     }
 
     fn begin_expand(&mut self) {
+        self.refresh_backdrop();
         debug_log!(
             "nitrobar: expand? abn_fullscreen={} fg_fullscreen={} flyout={}",
             self.fullscreen_app,
@@ -2007,6 +2130,9 @@ impl App {
         unsafe {
             if hidden {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
+                if let Some(glass) = &self.glass {
+                    glass.place(&rc, self.hwnd, false);
+                }
                 return;
             }
             let mut current = RECT::default();
@@ -2022,6 +2148,9 @@ impl App {
                     rc.bottom - rc.top,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
+            }
+            if let Some(glass) = &self.glass {
+                glass.place(&rc, self.hwnd, true);
             }
             let region = (hit != rc).then(|| {
                 CreateRectRgn(
@@ -2119,6 +2248,39 @@ impl App {
         }
     }
 
+    /// Tint laid over the blur: dark on dark surroundings, white-ish on light ones.
+    fn glass_tint(&self) -> D2D1_COLOR_F {
+        if self.backdrop_light {
+            D2D1_COLOR_F {
+                r: 0.97,
+                g: 0.97,
+                b: 0.98,
+                a: if self.glass.is_some() { 0.45 } else { 0.72 },
+            }
+        } else {
+            D2D1_COLOR_F {
+                r: 0.05,
+                g: 0.05,
+                b: 0.07,
+                a: if self.glass.is_some() { 0.42 } else { 0.70 },
+            }
+        }
+    }
+
+    /// Text color on the island: dark on light glass, light otherwise.
+    fn rest_text(&self) -> D2D1_COLOR_F {
+        if self.glass_style() && self.backdrop_light {
+            D2D1_COLOR_F {
+                r: 0.06,
+                g: 0.06,
+                b: 0.07,
+                a: 0.95,
+            }
+        } else {
+            REST_TEXT
+        }
+    }
+
     /// Opacity of the new icon while crossfading (1 when settled).
     fn rest_fade(&self, now: Instant) -> f32 {
         self.rest_icon.changed.map_or(1.0, |at| {
@@ -2135,8 +2297,11 @@ impl App {
         let t_clamped = t.clamp(0.0, 1.0);
         let palette = self.palette();
         let attention = self.tasks.groups.iter().any(|g| g.attention);
+        let glass = self.glass_style();
         let mut pill = if attention {
             palette.attention
+        } else if glass {
+            self.glass_tint()
         } else {
             REST_FILL
         };
@@ -2151,7 +2316,7 @@ impl App {
         let deep = pulse.clamp(0.0, 1.0);
         let pill_rect = island::pulsed_pill(&g, pulse);
         let panel = island::lerp_rect(&pill_rect, &strip, t);
-        let mut border = REST_BORDER;
+        let mut border = if glass { GLASS_BORDER } else { REST_BORDER };
         if attention {
             border.a = 0.0;
         }
@@ -2194,14 +2359,15 @@ impl App {
             radius: (panel.bottom - panel.top) / 2.0,
             fill: pill,
             border,
-            shadow: 1.0,
+            // The glass is see-through: a shadow under it would darken the blur.
+            shadow: if glass { 0.0 } else { 1.0 },
             // Icons appear over the last two thirds of the expansion.
             content_opacity: ((t_clamped - 0.35) / 0.65).clamp(0.0, 1.0),
             rest: Some(RestView {
                 opacity: rest_opacity,
                 icons,
                 clock: clock_text,
-                text: REST_TEXT,
+                text: self.rest_text(),
             }),
             badge: state
                 .pulse
@@ -2223,6 +2389,7 @@ impl App {
         self.cleaned_up = true;
         tasks::remove_hooks();
         self.close_preview();
+        self.glass = None;
         morph::stop_clock();
         self.morph = None;
         self.island = None;

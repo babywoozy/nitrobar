@@ -46,6 +46,18 @@ pub enum BarMode {
     Island,
 }
 
+/// How the island looks.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IslandStyle {
+    /// Frosted glass: a blur of what is behind it with a light tint and a hairline
+    /// border (falls back to a translucent pill without blur if the blur is unavailable).
+    #[default]
+    Glass,
+    /// Solid black, like the Dynamic Island.
+    Black,
+}
+
 /// What is behind the bar's own drawing.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
@@ -74,6 +86,7 @@ pub struct BarConfig {
     pub theme: ThemeMode,
     pub background: Background,
     pub mode: BarMode,
+    pub island_style: IslandStyle,
     /// Pill size while at rest, DIPs (clamped to 40..=600 / 4..=80), and its gap to
     /// the screen edge (0..=60).
     pub island_width: f32,
@@ -98,6 +111,7 @@ impl Default for BarConfig {
             theme: ThemeMode::Auto,
             background: Background::Clear,
             mode: BarMode::Island,
+            island_style: IslandStyle::Glass,
             island_width: 200.0,
             island_height: 40.0,
             island_gap: 10.0,
@@ -195,6 +209,7 @@ background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acr
 #             nhấn phím Win) thì bung ra; không chiếm chỗ, taskbar gốc được ẩn.
 #   "full":   thanh luôn hiện và giữ chỗ như taskbar thường.
 mode = "island"
+island_style = "glass"       # "glass" (kính mờ, blur phần phía sau) hoặc "black" (đen đặc)
 island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
 island_height = 40           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
@@ -329,6 +344,26 @@ island_show_clock = false    # hiện giờ nhỏ trong viên
         assert_eq!(config.bar.island_width, 150.0);
         assert_eq!(config.bar.island_height, 40.0);
         assert!(migrate_legacy(DEFAULT_CONFIG).is_none());
+    }
+
+    #[test]
+    fn island_style_defaults_to_glass() {
+        assert_eq!(Config::default().bar.island_style, IslandStyle::Glass);
+        let black = Config::parse(
+            "[bar]
+island_style = \"black\"
+",
+        )
+        .unwrap();
+        assert_eq!(black.bar.island_style, IslandStyle::Black);
+        assert!(
+            Config::parse(
+                "[bar]
+island_style = \"neon\"
+"
+            )
+            .is_err()
+        );
     }
 
     #[test]

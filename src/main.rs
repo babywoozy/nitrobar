@@ -21,6 +21,7 @@ mod app;
 mod appbar;
 mod clock;
 mod config;
+mod glass;
 mod icons;
 mod island;
 mod layout;

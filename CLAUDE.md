@@ -203,6 +203,20 @@ src/
   vượt của lò xo ~3%) hợp với `activity_hit`; danh sách app đổi lúc đang mở thì `place_island` lại.
   Bung ra theo lò xo (`EXPAND_SPRING`), thu lại ease-in-out. Không có nút Start (Win mở Start).
   Màu nội dung = `App::island_palette` (trắng trên đen bất kể theme); `text_shadow` tắt trong island.
+- Kính (`island_style = "glass"`, `glass.rs`): blur THẬT phía sau viên (cả cửa sổ app) bằng
+  Windows.UI.Composition `CreateHostBackdropBrush` (+ `DWMWA_USE_HOSTBACKDROPBRUSH`), cắt bằng
+  `CompositionRoundedRectangleGeometry` (khử răng cưa, góc bo theo đúng viên). Đã đo: chạy được cả với
+  cửa sổ KHÔNG BAO GIỜ active (khác DWMSBT / accent chỉ lấy hình nền). NHƯNG output của Composition vẽ
+  ĐÈ LÊN bề mặt GDI / D2D của cùng cửa sổ (icon, chữ biến mất, ngoài visual là nền đen) => kính nằm
+  trong cửa sổ RIÊNG `NitrobarGlass` ngay dưới cửa sổ thanh (`WS_EX_NOREDIRECTIONBITMAP` = trong suốt
+  ngoài visual, click xuyên qua), `Glass::place` đặt cùng rect + ngay dưới cửa sổ thanh, `set_shape`
+  mỗi lần vẽ theo panel đang chạy. Cửa sổ thanh vẽ lớp màu (tint) trong suốt + viền sáng 1 px + icon
+  + chữ; bóng đổ TẮT (nó sẽ làm tối lớp blur nằm dưới). Cần `DispatcherQueue` trên thread UI
+  (`CreateDispatcherQueueController`, `DQTAT_COM_NONE`). Không có Composition => `glass` là `None`,
+  viên vẫn vẽ tint đậm hơn (không blur). RAM không đổi đáng kể (~11.5 MB), exe +19 KB.
+  Màu chữ / icon: `App::refresh_backdrop` lấy mẫu ~9 pixel màn hình sát ngoài viên (GetPixel; KHÔNG
+  polling: gọi khi bung ra / đổi foreground / đổi style), độ sáng > 0.62 => nền sáng (tint trắng, chữ
+  tối `island_palette`), < 0.48 => tối (có độ trễ chống chớp).
 - Zoom: CHỈ icon đang hover (`App::hover == Task(i)`) phóng 1.2x (`ZOOM_MAX`), `App::zoom[i]` (0..1)
   của từng nút đuổi theo đích bằng ease 50 ms trong `on_frame` (frame chỉ chạy khi còn đang đổi),
   nút vừa rời thì thu lại riêng. (Bản đầu zoom theo khoảng cách bằng Gaussian: hai icon cùng to khi

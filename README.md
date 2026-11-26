@@ -5,8 +5,10 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
 
 ## Tính năng
 
-- **Chế độ island (mặc định)**: một viên đen bo tròn nổi ở giữa mép dưới màn hình (200×40 DIP, cách
-  mép 10 DIP, có bóng đổ mềm). Bên trái là icon của app đang active (đổi app thì icon mờ chuyển sang
+- **Chế độ island (mặc định)**: một viên kính mờ bo tròn nổi ở giữa mép dưới màn hình (200×40 DIP,
+  cách mép 10 DIP). `island_style = "glass"` (mặc định): blur thật phần phía sau (kể cả cửa sổ app),
+  lớp màu nhẹ, viền sáng 1 px, góc bo khử răng cưa; chữ và icon tự chuyển tối / sáng theo nền phía sau.
+  `island_style = "black"`: viên đen đặc có bóng đổ mềm. Bên trái là icon của app đang active (đổi app thì icon mờ chuyển sang
   icon mới), bên phải là giờ. Thanh không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc
   được ẩn).
   - Rê chuột vào viên hoặc chạm mép dưới ở đoạn giữa (rộng bằng viên + 40 DIP mỗi bên; phần còn lại
@@ -84,6 +86,7 @@ theme = "auto"               # "auto" (theo Windows), "dark" hoặc "light"
 background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acrylic" hoặc "solid" (đặc)
 
 mode = "island"              # "island" (thu gọn, rê chuột thì bung ra) hoặc "full" (luôn hiện)
+island_style = "glass"       # "glass" (kính mờ, blur phần phía sau) hoặc "black" (đen đặc)
 island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
 island_height = 40           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
@@ -128,8 +131,7 @@ ghim thêm trong nitrobar. nitrobar không sửa danh sách ghim của Windows; 
   dock), bấm icon (tỏa ra / co vào icon, nhảy icon, xem trước nhiều cửa sổ)
 
 Chưa có: khay hệ thống (icon app chạy nền), nhiều màn hình (thanh chỉ ở màn hình chính). Ở chế độ
-island, `background` và `[colors]` không áp dụng: viên luôn đen (nền trong suốt hẳn không đọc được
-khi thanh đè lên cửa sổ app); chúng chỉ dùng cho chế độ `full`. Hiệu ứng
+island, `background` và `[colors]` không áp dụng (dùng `island_style`); chúng chỉ dùng cho chế độ `full`. Hiệu ứng
 thu nhỏ: góc bo của ảnh cửa sổ hơi răng cưa (DWM không cho bo góc thumbnail, phải cắt bằng region),
 cửa sổ biến mất ~1-2 khung hình trước khi hiệu ứng bắt đầu, và khi khôi phục có thể thấy một khung
 tối lúc app vẽ lại.
