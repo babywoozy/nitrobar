@@ -19,15 +19,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE,
     DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DwmFlush, DwmRegisterThumbnail,
     DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
 };
-use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, CreateRoundRectRgn, GetStockObject, HBRUSH, SetWindowRgn,
-};
+use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, CreateSolidBrush, SetWindowRgn};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -36,8 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GetWindowLongW, GetWindowPlacement,
-    HWND_TOPMOST, IsIconic, LWA_ALPHA, PostMessageW, RegisterClassExW, SM_CXPADDEDBORDER,
-    SM_CXSIZEFRAME, SM_CYSIZEFRAME, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    HWND_TOPMOST, IsIconic, LWA_ALPHA, LWA_COLORKEY, PostMessageW, RegisterClassExW,
+    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     SetLayeredWindowAttributes, SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_APP, WNDCLASSEXW,
     WPF_RESTORETOMAXIMIZED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
@@ -191,6 +189,26 @@ fn union(a: &RECT, b: &RECT) -> RECT {
     }
 }
 
+/// A topmost window covering a whole monitor is a "fullscreen app" to Explorer
+/// (`ABN_FULLSCREENAPP`): the bar would hide itself and cancel the very animation
+/// that tripped it (a maximized app could then never be reopened from the bar).
+/// Leave a thin edge of the monitor uncovered.
+pub fn avoid_fullscreen(bounds: RECT, monitor: &RECT) -> RECT {
+    let covers = bounds.left <= monitor.left
+        && bounds.top <= monitor.top
+        && bounds.right >= monitor.right
+        && bounds.bottom >= monitor.bottom;
+    if !covers {
+        return bounds;
+    }
+    RECT {
+        left: monitor.left + 2,
+        top: monitor.top + 2,
+        right: monitor.right - 2,
+        bottom: monitor.bottom - 2,
+    }
+}
+
 fn size(r: &RECT) -> (i32, i32) {
     (r.right - r.left, r.bottom - r.top)
 }
@@ -297,6 +315,9 @@ pub struct Tick {
 }
 
 const CLASS: PCWSTR = w!("NitrobarMorph");
+/// The overlay's background: near black for the minimize blob; made see-through
+/// with a color key while a window grows back (so there is no black shape).
+const BACKDROP: COLORREF = COLORREF(0x0002_0202);
 
 extern "system" fn morph_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -316,7 +337,7 @@ impl Morph {
                 lpfnWndProc: Some(morph_proc),
                 hInstance: instance,
                 // Black: what the picture darkens to (the thumbnail fades over it).
-                hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
+                hbrBackground: CreateSolidBrush(BACKDROP),
                 lpszClassName: CLASS,
                 ..Default::default()
             };
@@ -362,6 +383,7 @@ impl Morph {
         island: RECT,
         below: HWND,
         dpi: u32,
+        monitor: &RECT,
     ) -> bool {
         self.finish();
         // Only once the window is hidden: a thumbnail of a window that is still
@@ -369,7 +391,7 @@ impl Morph {
         let Ok(thumb) = (unsafe { DwmRegisterThumbnail(self.hwnd, target) }) else {
             return false;
         };
-        let bounds = union(&frame, &island);
+        let bounds = avoid_fullscreen(union(&frame, &island), monitor);
         let (w, h) = size(&bounds);
         self.run = Some(Run {
             kind,
@@ -468,10 +490,11 @@ impl Morph {
                 1.0 - smoothstep(0.08, 0.62, p),
                 1.0 - smoothstep(0.82, 1.0, p),
             ),
+            // The window grows out of its icon and fades in; nothing black around it.
             Kind::Restore => (
                 1.0 - ease_out_cubic(p),
-                smoothstep(0.25, 0.85, p),
-                smoothstep(0.0, 0.12, p),
+                smoothstep(0.0, 0.5, p),
+                smoothstep(0.0, 0.08, p),
             ),
         };
         let rect = lerp_px(&run.frame, &run.island, along);
@@ -529,9 +552,13 @@ impl Morph {
             SetWindowRgn(self.hwnd, Some(region), true);
             let _ = SetLayeredWindowAttributes(
                 self.hwnd,
-                Default::default(),
+                BACKDROP,
                 (alpha * fade * 255.0).round().clamp(0.0, 255.0) as u8,
-                LWA_ALPHA,
+                if run.kind == Kind::Restore {
+                    LWA_ALPHA | LWA_COLORKEY
+                } else {
+                    LWA_ALPHA
+                },
             );
         }
     }
@@ -559,6 +586,35 @@ impl Drop for Morph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_never_covers_a_whole_monitor() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let maximized = avoid_fullscreen(monitor, &monitor);
+        assert!(maximized.left > 0 && maximized.top > 0);
+        assert!(maximized.right < 1920 && maximized.bottom < 1080);
+        // Bigger than the monitor (a maximized window's frame overhangs by 8 px).
+        let overhang = RECT {
+            left: -8,
+            top: -8,
+            right: 1928,
+            bottom: 1088,
+        };
+        assert_ne!(avoid_fullscreen(overhang, &monitor), overhang);
+        // A normal window is left alone.
+        let window = RECT {
+            left: 300,
+            top: 100,
+            right: 1200,
+            bottom: 1070,
+        };
+        assert_eq!(avoid_fullscreen(window, &monitor), window);
+    }
 
     #[test]
     fn spring_overshoots_then_settles() {

@@ -449,13 +449,41 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 drop(Box::from_raw(ptr));
             }
         },
-        _ => {
-            if let Some(Some(result)) = with_app(hwnd, |app| app.handle(msg, wparam, lparam)) {
-                return result;
-            }
-        }
+        _ => match with_app(hwnd, |app| app.handle(msg, wparam, lparam)) {
+            Some(Some(result)) => return result,
+            Some(None) => {}
+            None => on_busy(hwnd, msg, wparam, lparam),
+        },
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// `App` is borrowed (we are inside one of its handlers, and something pumped
+/// messages: a COM call to the shell, a nested loop). Posted messages that carry
+/// state must not be lost, or things stall for good: a lost `WM_APP_FRAME` left the
+/// frame clock waiting for a message that never came (a restore animation froze
+/// and the app was never restored). Frames can simply be skipped; the rest is
+/// posted again.
+fn on_busy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
+    if msg == morph::WM_APP_FRAME {
+        morph::frame_handled();
+        return;
+    }
+    let keep = msg == WM_APP_MINIMIZED
+        || msg == WM_APP_CONFIG
+        || msg == WM_APP_PINS
+        || msg == preview::WM_APP_PREVIEW
+        || msg == island::WM_APP_EDGE
+        || msg == tasks::WM_APP_REFRESH
+        || msg == status::WM_APP_STATUS
+        || msg == appbar::CALLBACK_MSG
+        || (msg != 0 && msg == SHELL_HOOK_MSG.get());
+    if keep {
+        debug_log!("nitrobar: App busy, re-posting message {msg:#x}");
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), msg, wparam, lparam);
+        }
+    }
 }
 
 /// `HSHELL_GETMINRECT`: the rect a window minimizes to / restores from: the
@@ -1597,7 +1625,9 @@ impl App {
         };
         if unsafe { IsIconic(window) }.as_bool() {
             // Minimized: it pours out of its icon, then the strip folds back.
-            if self.window_anim_on() && self.start_restore(window) {
+            let animated = self.window_anim_on() && self.start_restore(window);
+            debug_log!("nitrobar: restore click {window:?} animated={animated}");
+            if animated {
                 self.restore_collapse = true;
             } else {
                 self.tasks.click(group);
@@ -1784,6 +1814,7 @@ impl App {
                 running = true;
             }
             if let Some(hwnd) = tick.show {
+                debug_log!("nitrobar: restore morph done, activating {hwnd:?}");
                 tasks::activate(hwnd);
                 if self.restore_collapse {
                     self.restore_collapse = false;
@@ -1846,6 +1877,7 @@ impl App {
             to,
             self.hwnd,
             self.dpi,
+            &self.monitor_rect,
         ) {
             debug_log!("nitrobar: minimize morph started {frame:?} -> {to:?}");
             self.start_frames();
@@ -1881,6 +1913,7 @@ impl App {
             from,
             self.hwnd,
             self.dpi,
+            &self.monitor_rect,
         ) {
             return false;
         }

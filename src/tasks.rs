@@ -23,10 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
     EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
     EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetForegroundWindow, GetWindow,
-    GetWindowLongW, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    OBJID_WINDOW, PostMessageW, SW_MINIMIZE, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetWindowLongW, GetWindowTextLengthW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic,
+    IsWindowVisible, OBJID_WINDOW, PostMessageW, SHOW_WINDOW_CMD, SW_MINIMIZE, SW_RESTORE,
+    SetForegroundWindow, ShowWindow, ShowWindowAsync, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, PWSTR};
 
@@ -278,19 +278,31 @@ pub fn app_id_for(hwnd: HWND) -> AppId {
     AppId { aumid, exe }
 }
 
+/// Minimizes / restores `hwnd`. `ShowWindowAsync` (a posted message) is ignored by
+/// some apps: VS Code (Chromium) never minimized or restored from it, so a
+/// minimized VS Code could not be reopened from the bar. A plain `ShowWindow`
+/// works, but would block on an app that is not responding: those get the async one.
+fn show(hwnd: HWND, command: SHOW_WINDOW_CMD) {
+    unsafe {
+        if IsHungAppWindow(hwnd).as_bool() {
+            let _ = ShowWindowAsync(hwnd, command);
+        } else {
+            let _ = ShowWindow(hwnd, command);
+        }
+    }
+}
+
 pub fn activate(hwnd: HWND) {
     unsafe {
         if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+            show(hwnd, SW_RESTORE);
         }
         let _ = SetForegroundWindow(hwnd);
     }
 }
 
 fn minimize(hwnd: HWND) {
-    unsafe {
-        let _ = ShowWindowAsync(hwnd, SW_MINIMIZE);
-    }
+    show(hwnd, SW_MINIMIZE);
 }
 
 impl TaskList {

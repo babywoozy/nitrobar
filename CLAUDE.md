@@ -246,6 +246,23 @@ src/
   trả lời bằng `MIN_RECT` VÀ post `WM_APP_MINIMIZED` (wParam cửa sổ, lParam 1 = thu nhỏ / 0 = khôi
   phục); `App` làm phần còn lại. Trước đây việc đó nằm trong `App` nên 1/6 lần bị mất (không overlay,
   dải không thu).
+- BÀI HỌC (lỗi "thu nhỏ app xong không mở lại được", đã tái hiện với Claude, VS Code):
+  1. Overlay của hiệu ứng phủ KÍN màn hình (app đang phóng to) => Explorer coi nó là app toàn màn hình
+     => `ABN_FULLSCREENAPP` => thanh tự ẩn + `morph.finish()` huỷ chính hiệu ứng đang chạy => cửa sổ
+     không bao giờ được khôi phục (`tasks::activate` nằm cuối hiệu ứng). `morph::avoid_fullscreen` chừa
+     mép 2 px. Mọi cửa sổ topmost của mình phủ kín màn hình đều dính cái này.
+  2. `ShowWindowAsync` bị VS Code (Chromium) lờ đi hoàn toàn (cả thu nhỏ lẫn khôi phục; 8 s không đổi
+     gì), `ShowWindow` đồng bộ thì chạy. `tasks::show` dùng `ShowWindow`, trừ app treo
+     (`IsHungAppWindow`) dùng bản async. `GETMINRECT` gửi tới trong lúc ta đang gọi `ShowWindow`
+     (App bị mượn) => nhánh stateless lo (đúng chỗ đã sửa trước đó).
+  3. Tin nhắn post tới lúc `App` đang bị mượn (COM của shell bơm message) bị `DefWindowProc` nuốt:
+     `on_busy` post lại (riêng `WM_APP_FRAME` thì chỉ bỏ cờ pending, nếu không đồng hồ khung hình
+     đứng vĩnh viễn).
+- Khôi phục: overlay có `BACKDROP` (2,2,2) làm colorkey => không còn khối đen, chỉ ảnh cửa sổ phóng
+  to từ icon + mờ dần vào; thu nhỏ vẫn là khối đen (không dùng colorkey).
+- Test app thật: `real2.ps1` (bản debug) thu nhỏ rồi bấm icon trên dải, bấm icon app active, mở lại,
+  Alt+Tab, kiểm tra overlay không kẹt. Thu nhỏ bằng `ShowWindow` đồng bộ (PostMessage SC_MINIMIZE bị
+  VS Code lờ đi). Không dùng `ShowWindowAsync` cho test vì lý do ở mục 2.
 - Xem trước nhiều cửa sổ (`preview.rs`): popup không kích hoạt, vẽ bằng GDI (nền, ô, tiêu đề) + một DWM
   thumbnail mỗi cửa sổ (live, kể cả cửa sổ đang thu nhỏ), region bo tròn (mép hơi răng cưa). Báo cho
   thanh `WM_APP_PREVIEW`: ENTER / LEAVE (con trỏ vào / ra panel => `preview_hover` giữ dải mở) và PICK
