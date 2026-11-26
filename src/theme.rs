@@ -44,6 +44,9 @@ pub struct Palette {
     pub attention: D2D1_COLOR_F,
     pub attention_bg: D2D1_COLOR_F,
     pub placeholder: D2D1_COLOR_F,
+    /// Collapsed island pill: lightly tinted glass with a hairline border.
+    pub island: D2D1_COLOR_F,
+    pub island_border: D2D1_COLOR_F,
 }
 
 #[derive(Clone, Copy)]
@@ -134,6 +137,8 @@ impl Theme {
                 attention: rgba(0xc4, 0x2b, 0x1c, 1.0),
                 attention_bg: rgba(0xff, 0x8c, 0x00, 0.3),
                 placeholder: rgba(0x00, 0x00, 0x00, 0.2),
+                island: rgba(0xf3, 0xf3, 0xf3, 0.7),
+                island_border: rgba(0x00, 0x00, 0x00, 0.18),
             }
         } else {
             Palette {
@@ -153,6 +158,8 @@ impl Theme {
                 attention: rgba(0xff, 0x8c, 0x00, 1.0),
                 attention_bg: rgba(0xff, 0x8c, 0x00, 0.28),
                 placeholder: rgba(0xff, 0xff, 0xff, 0.25),
+                island: rgba(0x20, 0x20, 0x20, 0.6),
+                island_border: rgba(0xff, 0xff, 0xff, 0.22),
             }
         }
     }

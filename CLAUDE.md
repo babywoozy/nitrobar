@@ -18,7 +18,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.5 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB); chống thanh đen 12.6 MB.
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.5 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB); chống thanh đen 12.6 MB; island 8.6 MB thu gọn / ~14.5 MB sau khi bung, exe 589 KB.
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -28,9 +28,10 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Phụ thuộc
 
-- Crate đang dùng: `windows` (Win32), `windows-core` (cho `#[implement]`), `serde` (derive) +
-  `toml` (tắt default features) cho config.toml / pins.toml. Không dùng framework GUI (egui,
-  Tauri, webview, winit...).
+- Crate đang dùng: `windows` (Win32), `windows-core` (cho `#[implement]`), `windows-numerics`
+  (`Matrix3x2` cho `SetTransform` / layer của Direct2D; cả hai đã có sẵn trong cây phụ thuộc của
+  `windows`, không nặng thêm), `serde` (derive) + `toml` (tắt default features) cho config.toml /
+  pins.toml. Không dùng framework GUI (egui, Tauri, webview, winit...).
 - Thêm crate mới phải có lý do rõ ràng và ghi vào đây.
 - Feature của `windows` bật tối thiểu; thêm feature khi cần, giữ danh sách theo thứ tự ABC.
 
@@ -57,6 +58,7 @@ src/
   config.rs   %APPDATA%\nitrobar\config.toml: parse + clamp, file mặc định có chú thích, màu
   pins.rs     danh sách ghim = ghim của Windows + pins.toml ([[pin]] thêm, [[hide]] bỏ), mở app
   winpins.rs  đọc ghim của taskbar gốc (blob Taskband\Favorites -> PIDL), theo dõi registry
+  island.rs   chế độ island: hiệu ứng (ease-out), hình học viên, cửa sổ cảm biến mép, flyout, fullscreen
 ```
 
 ### Cấu hình và ghim (config.rs, pins.rs)
@@ -166,7 +168,45 @@ src/
 - Kích thước render target được đồng bộ lúc vẽ, không phụ thuộc WM_SIZE.
 - Toạ độ vẽ là DIP; render target đặt DPI = DPI màn hình. Toạ độ cửa sổ là pixel, đổi bằng `scale()`.
 
+### Chế độ island (island.rs, phần "island mode" trong app.rs)
+
+- `[bar] mode = "island"` (mặc định) | `"full"`. Island = KHÔNG đặt vị trí AppBar (chỉ `ABM_NEW`,
+  để vẫn nhận `ABN_FULLSCREENAPP`); đổi mode thì `ABM_REMOVE` + `ABM_NEW` để nhả chỗ đã giữ.
+  Island ngầm ẩn taskbar gốc (`wants_native_hidden`), nếu không cửa sổ phóng to không tràn xuống đáy.
+- Không gian vẽ = "bar space" (DIP của cả dải thanh). Khi thu gọn, cửa sổ chỉ còn vùng viên +
+  lề hover (`Geometry::hit`), nên không chặn click chỗ khác; `App::origin` là độ lệch của cửa sổ
+  trong bar space, renderer `SetTransform(-origin)`, `hit_at` cộng origin. Lúc bung / đang co cửa
+  sổ là cả dải; về hẳn trạng thái thu gọn mới thu cửa sổ lại. Đổi kích thước xong gọi `paint()`
+  ngay (không để DWM hiện khung cũ / đen). KHÔNG `UpdateWindow` trong lúc đang mượn `App`.
+- Phát hiện chạm mép: `EdgeSensor` = cửa sổ layered alpha 1/255 cao 1 px dọc mép (alpha 0 thì không
+  được hit-test), chỉ hiện khi thu gọn; post `WM_APP_EDGE`. Không quét chuột: chỉ `WM_MOUSEMOVE`,
+  `TrackMouseEvent(TME_LEAVE)` và 3 timer: `TIMER_EXPAND` (trễ bung), `TIMER_COLLAPSE` (trễ thu; nếu
+  bị chặn thì hẹn lại, chỉ khi đang mở và bị chặn), `TIMER_ANIM` 16 ms chỉ chạy khi đang chuyển động.
+- Bung ra không do chuột (phím Win) thì gọi `track_mouse()` ngay: con trỏ không ở trên thanh =>
+  `WM_MOUSELEAVE` lập tức => hẹn thu lại. Hết giờ thu mà con trỏ đã quay lại (chưa có
+  `WM_MOUSEMOVE`) thì chỉ track lại, không thu.
+- Không thu khi: menu chuột phải (`menu_open`, đặt quanh `menu::show`), flyout của Windows ở
+  foreground (`is_shell_flyout`: SearchHost = Start, ShellHost = Quick Settings,
+  ShellExperienceHost = thông báo, StartMenuExperienceHost trên bản cũ), đang nhấn chuột trái
+  (kéo thả). Phím Win = Start lên foreground => bung ra (dùng hook foreground sẵn có, không hook bàn phím).
+- Toàn màn hình: `ABN_FULLSCREENAPP` + kiểm tra foreground (phủ kín màn hình, không `IsZoomed`, không
+  caption; cửa sổ phóng to có rect lố ra -8 px nên phải loại bằng `IsZoomed`) => ẩn viên + sensor,
+  chạm mép không bung.
+- Hiệu ứng: `Island` (vị trí tuyến tính theo thời gian, vẽ bằng `ease_out_cubic`), đảo chiều giữa
+  chừng thì chỉ tốn phần còn lại. Khung morph từ viên -> cả thanh; icon hiện dần qua layer
+  (opacity, clip vào khung). Dùng lại MỘT `ID2D1Layer` cho mỗi render target: `PushLayer(.., None)`
+  cấp layer mới mỗi frame, RAM riêng lên 16-17 MB thay vì 14 MB.
+- Cửa sổ island luôn dùng accent "clear"; khung do mình vẽ. Viên: `palette.island` (kính mờ nhẹ +
+  viền mảnh), app cần chú ý => màu `attention`. Khi bung với `background = "clear"`: kính alpha 0.85
+  (thanh đè lên cửa sổ app, trong suốt hẳn thì chữ lẫn vào nội dung bên dưới).
+- Đo: thu gọn 8.6 MB, sau nhiều lần bung/thu ~14.5 MB; CPU 0 khi đứng yên; ~57 ms CPU cho mỗi lần
+  chuyển động ~180 ms (software render cả dải 60 fps).
+
 ## Bất biến an toàn: taskbar gốc PHẢI hiện lại
+
+- Khi taskbar gốc đang ẩn và Start / Quick Settings mở, Explorer hiện lại taskbar; ẩn nó ngay lúc
+  đó làm Start đóng lập tức (lỗi có từ GĐ1 với `--hide-taskbar`). Hook `on_object_show` bỏ qua khi
+  flyout đang ở foreground; `taskbar::foreground_changed` ẩn lại khi flyout đóng.
 
 - Mọi đường thoát đều gọi `safety::emergency_cleanup()` (idempotent, gọi được từ thread bất kỳ):
   thoát bình thường, WM_DESTROY, WM_ENDSESSION, panic hook, Ctrl+C / đóng console, SEH filter.

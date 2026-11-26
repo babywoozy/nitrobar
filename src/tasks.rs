@@ -234,6 +234,11 @@ fn window_aumid(hwnd: HWND) -> Option<String> {
 /// is a packaged (MSIX / Store) app. Packaged desktop apps (e.g. Electron apps from
 /// the Store) often set no AUMID on their windows; Windows then groups them by the
 /// package identity, which is also what their pins refer to.
+/// Full path of the executable that owns `hwnd`.
+pub fn process_exe(hwnd: HWND) -> Option<String> {
+    window_process(hwnd).0
+}
+
 fn window_process(hwnd: HWND) -> (Option<String>, Option<String>) {
     unsafe {
         let mut pid = 0u32;

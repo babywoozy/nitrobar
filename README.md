@@ -5,7 +5,14 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
 
 ## Tính năng
 
-- Thanh ở đáy (hoặc đỉnh) màn hình, đăng ký AppBar: cửa sổ phóng to không đè lên thanh.
+- **Chế độ island (mặc định)**: thanh thu gọn thành một viên nhỏ bo tròn ở giữa mép dưới màn
+  hình, không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc được ẩn). Rê chuột vào
+  viên hoặc chạm mép dưới ở bất kỳ đâu (~100 ms) thì thanh giãn ra mượt thành thanh đầy đủ, nằm đè
+  lên trên cửa sổ; rời chuột ~600 ms thì thu lại. Nhấn phím Win (mở Start) cũng làm thanh bung ra.
+  Không thu lại khi đang mở menu chuột phải, Start, Quick Settings, trung tâm thông báo hay đang kéo
+  thả. App cần chú ý thì viên đổi sang màu cam. Đang chơi game / xem video toàn màn hình thì viên ẩn
+  đi và chạm mép không làm thanh bung ra.
+- **Chế độ full**: thanh luôn hiện ở đáy (hoặc đỉnh), đăng ký AppBar: cửa sổ phóng to không đè lên thanh.
 - Nút Start (mở Start menu của Windows), app đang chạy gom nhóm theo ứng dụng với icon thật.
   Vạch ngắn = đang chạy, vạch dài màu nhấn = đang mở, nền cam = app cần chú ý.
 - Icon nét như taskbar gốc: lấy đúng cỡ pixel theo DPI, giữ kênh alpha (viền mượt), không phóng to
@@ -36,7 +43,7 @@ Tự chạy khi đăng nhập: nhấn Win+R, gõ `shell:startup`, tạo shortcut
 ## Dùng
 
 ```powershell
-nitrobar.exe                    # chạy (giữ taskbar gốc, nitrobar nằm ngay trên nó)
+nitrobar.exe                    # chạy (island: ẩn taskbar gốc; full: nằm ngay trên taskbar gốc)
 nitrobar.exe --hide-taskbar     # chạy và ẩn taskbar gốc (hoặc đặt hide_native_taskbar = true)
 nitrobar.exe --quit             # tắt (hoặc chuột phải trên thanh > Thoát nitrobar)
 nitrobar.exe --restore-taskbar  # cứu taskbar gốc nếu bị kẹt ẩn (sau khi bị End task)
@@ -64,6 +71,13 @@ alignment = "center"         # "center" (giống Windows 11) hoặc "left"
 hide_native_taskbar = false  # ẩn taskbar gốc của Windows khi nitrobar chạy
 theme = "auto"               # "auto" (theo Windows), "dark" hoặc "light"
 background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acrylic" hoặc "solid" (đặc)
+
+mode = "island"              # "island" (thu gọn, rê chuột thì bung ra) hoặc "full" (luôn hiện)
+island_width = 120           # cỡ viên khi thu gọn (DIP, 40..600)
+island_height = 8            # (DIP, 4..40)
+expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
+collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
+island_show_clock = false    # hiện giờ nhỏ trong viên
 
 [colors]                     # để trống = theo theme Windows; "#RRGGBB" hoặc "#RRGGBBAA"
 background = ""
@@ -94,6 +108,9 @@ ghim thêm trong nitrobar. nitrobar không sửa danh sách ghim của Windows; 
 - [x] Giai đoạn 3: nút Start, hover / nhấn, nút bo góc, nền acrylic, theme sáng/tối + màu accent, menu tối
 - [x] Giai đoạn 4: wifi, âm lượng, pin (%), bấm mở Quick Settings; đồng hồ mở trung tâm thông báo
 - [x] Giai đoạn 5: ghim app, menu chuột phải đầy đủ, file cấu hình TOML áp dụng trực tiếp
+- [x] Ghim theo taskbar gốc, icon nét, nền trong suốt, sửa lỗi thanh đen
+- [x] Chế độ island: viên thu gọn, bung ra khi rê chuột / chạm mép / nhấn Win, có hiệu ứng
 
 Chưa có: khay hệ thống (icon app chạy nền), xem trước cửa sổ khi hover, nhiều màn hình
-(thanh chỉ ở màn hình chính).
+(thanh chỉ ở màn hình chính). Ở chế độ island, `background = "blur"` / `"acrylic"` chỉ còn lớp màu
+(không làm mờ), vì hiệu ứng mờ của Windows không đi theo được khung bo tròn đang co giãn.

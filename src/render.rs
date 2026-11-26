@@ -13,11 +13,12 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_PARAMETERS, D2D1_PRESENT_OPTIONS_NONE,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
+    ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1Layer, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -30,6 +31,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{BOOL, PCWSTR, Result, w};
+use windows_numerics::Matrix3x2;
 
 use crate::clock::ClockText;
 use crate::config::Background;
@@ -45,6 +47,7 @@ const TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
     a: 0.0,
 };
 const CLOCK_FONT_SIZE: f32 = 12.0;
+const PILL_FONT_SIZE: f32 = 11.0;
 /// Offsets (DIPs) of the faint copies that form the text halo.
 const SHADOW_RING: [(f32, f32); 8] = [
     (-1.0, 0.0),
@@ -93,11 +96,29 @@ pub struct Scene<'a> {
     pub clock_rect: D2D_RECT_F,
     pub clock_pointer: Pointer,
     pub clock: ClockText,
+    /// DIP offset of the window inside bar space (island: the collapsed window is
+    /// only the pill area).
+    pub origin: (f32, f32),
+    /// Island mode: the morphing panel drawn behind (and clipping) the content.
+    pub island: Option<IslandView>,
+}
+
+/// The island panel at one point of the expand / collapse animation.
+pub struct IslandView {
+    pub panel: D2D_RECT_F,
+    pub radius: f32,
+    pub fill: D2D1_COLOR_F,
+    pub border: D2D1_COLOR_F,
+    /// Opacity of the bar content (icons fade in while expanding).
+    pub content_opacity: f32,
+    /// Small clock inside the collapsed pill.
+    pub clock: Option<Vec<u16>>,
+    pub text: D2D1_COLOR_F,
 }
 
 impl Scene<'_> {
     fn translucent(&self) -> bool {
-        self.backdrop != Background::Solid
+        self.backdrop != Background::Solid || self.island.is_some()
     }
 
     /// Shadow color for text and glyphs when the bar shows the wallpaper (clear or
@@ -125,6 +146,8 @@ struct Target {
     brush: ID2D1SolidColorBrush,
     /// Icon bitmaps by `Icon::id`; pruned to the icons drawn in the last frame.
     bitmaps: HashMap<u64, ID2D1Bitmap>,
+    /// Reused for the island fade (an anonymous layer is re-allocated every frame).
+    layer: Option<ID2D1Layer>,
 }
 
 pub struct Renderer {
@@ -132,6 +155,7 @@ pub struct Renderer {
     clock_format: IDWriteTextFormat,
     icon_format: IDWriteTextFormat,
     percent_format: IDWriteTextFormat,
+    pill_format: IDWriteTextFormat,
     target: Option<Target>,
 }
 
@@ -210,6 +234,12 @@ impl Renderer {
                     CLOCK_FONT_SIZE,
                     DWRITE_TEXT_ALIGNMENT_LEADING,
                 )?,
+                pill_format: text_format(
+                    &dwrite,
+                    ui_font,
+                    PILL_FONT_SIZE,
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                )?,
                 target: None,
             })
         }
@@ -249,6 +279,7 @@ impl Renderer {
                 .CreateHwndRenderTarget(&raw const props, &raw const hwnd_props)?;
             let brush = rt.CreateSolidColorBrush(&TRANSPARENT, None)?;
             Ok(Target {
+                layer: rt.CreateLayer(None).ok(),
                 rt,
                 size,
                 brush,
@@ -295,8 +326,12 @@ impl Renderer {
             } else {
                 &palette.background
             }));
+            // Scene coordinates are bar space; the window may be only part of it.
+            let origin = Matrix3x2::translation(-scene.origin.0, -scene.origin.1);
+            target.rt.SetTransform(&raw const origin);
             // Acrylic is tinted by DWM itself (accent gradient color).
-            if matches!(scene.backdrop, Background::Clear | Background::Blur)
+            if scene.island.is_none()
+                && matches!(scene.backdrop, Background::Clear | Background::Blur)
                 && palette.background.a > 0.0
             {
                 let full = D2D_RECT_F {
@@ -310,28 +345,31 @@ impl Renderer {
             }
         }
 
-        Self::draw_start(
-            &target,
-            palette,
-            &scene.metrics,
-            scene.start.0,
-            scene.start.1,
-        );
-        let mut used = Vec::with_capacity(scene.buttons.len());
-        for button in &scene.buttons {
-            Self::draw_button(
-                &mut target,
-                palette,
-                &scene.metrics,
-                dpi,
-                scene.text_shadow(),
-                button,
-                &mut used,
-            );
+        let opacity = match &scene.island {
+            Some(island) => self.draw_island(&target, island),
+            None => 1.0,
+        };
+        if opacity > 0.0 {
+            // While the island morphs, the bar content fades in, clipped to the panel.
+            let layer = scene
+                .island
+                .as_ref()
+                .filter(|_| opacity < 1.0)
+                .map(|island| D2D1_LAYER_PARAMETERS {
+                    contentBounds: island.panel,
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: Matrix3x2::identity(),
+                    opacity,
+                    ..Default::default()
+                });
+            if let Some(params) = &layer {
+                unsafe { target.rt.PushLayer(params, target.layer.as_ref()) };
+            }
+            self.draw_content(&mut target, scene, dpi);
+            if layer.is_some() {
+                unsafe { target.rt.PopLayer() };
+            }
         }
-        target.bitmaps.retain(|id, _| used.contains(id));
-        self.draw_status(&target, scene);
-        self.draw_clock(&target, scene);
 
         match unsafe { target.rt.EndDraw(None, None) } {
             // Device lost: drop the target and paint again right away with a new one
@@ -348,6 +386,81 @@ impl Renderer {
                 Ok(())
             }
         }
+    }
+
+    /// The island panel (pill, or the bar while morphing). Returns the opacity
+    /// of the bar content to draw on top (0 while collapsed).
+    fn draw_island(&self, target: &Target, island: &IslandView) -> f32 {
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: island.panel,
+            radiusX: island.radius,
+            radiusY: island.radius,
+        };
+        unsafe {
+            if island.fill.a > 0.0 {
+                target.brush.SetColor(&raw const island.fill);
+                target
+                    .rt
+                    .FillRoundedRectangle(&raw const rounded, &target.brush);
+            }
+            if island.border.a > 0.0 {
+                // Hairline inside the panel edge.
+                let inner = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: island.panel.left + 0.5,
+                        top: island.panel.top + 0.5,
+                        right: island.panel.right - 0.5,
+                        bottom: island.panel.bottom - 0.5,
+                    },
+                    radiusX: (island.radius - 0.5).max(0.0),
+                    radiusY: (island.radius - 0.5).max(0.0),
+                };
+                target.brush.SetColor(&raw const island.border);
+                target
+                    .rt
+                    .DrawRoundedRectangle(&raw const inner, &target.brush, 1.0, None);
+            }
+        }
+        if let Some(clock) = &island.clock
+            && island.content_opacity == 0.0
+        {
+            self.draw_text(
+                target,
+                clock,
+                &self.pill_format,
+                island.panel,
+                &island.text,
+                None,
+            );
+        }
+        island.content_opacity
+    }
+
+    /// Start, app buttons, status and clock.
+    fn draw_content(&self, target: &mut Target, scene: &Scene, dpi: f32) {
+        let palette = &scene.palette;
+        Self::draw_start(
+            target,
+            palette,
+            &scene.metrics,
+            scene.start.0,
+            scene.start.1,
+        );
+        let mut used = Vec::with_capacity(scene.buttons.len());
+        for button in &scene.buttons {
+            Self::draw_button(
+                target,
+                palette,
+                &scene.metrics,
+                dpi,
+                scene.text_shadow(),
+                button,
+                &mut used,
+            );
+        }
+        target.bitmaps.retain(|id, _| used.contains(id));
+        self.draw_status(target, scene);
+        self.draw_clock(target, scene);
     }
 
     fn fill_rounded(target: &Target, rect: D2D_RECT_F, radius: f32, color: &D2D1_COLOR_F) {

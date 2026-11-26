@@ -18,8 +18,9 @@ use windows::Win32::UI::Shell::{
     ABM_GETSTATE, ABM_SETSTATE, ABS_ALWAYSONTOP, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_OBJECT_SHOW, FindWindowExW, FindWindowW, GetClassNameW, GetWindowThreadProcessId,
-    OBJID_WINDOW, SW_HIDE, SW_SHOW, ShowWindow, WINEVENT_OUTOFCONTEXT,
+    EVENT_OBJECT_SHOW, FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow,
+    GetWindowThreadProcessId, IsWindowVisible, OBJID_WINDOW, SW_HIDE, SW_SHOW, ShowWindow,
+    WINEVENT_OUTOFCONTEXT,
 };
 use windows::core::{PCWSTR, w};
 
@@ -199,8 +200,26 @@ unsafe extern "system" fn on_object_show(
     _time: u32,
 ) {
     if id_object == OBJID_WINDOW.0 && HIDDEN.load(Ordering::SeqCst) && is_taskbar_window(hwnd) {
+        // Start / search / Quick Settings are anchored to the taskbar: hiding it
+        // while one is open closes it instantly. Wait until it closes
+        // (`foreground_changed`).
+        if crate::island::is_shell_flyout(unsafe { GetForegroundWindow() }) {
+            return;
+        }
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
+    }
+}
+
+/// Called on every foreground change: once no Windows flyout is open any more,
+/// hide the taskbar again if Explorer showed it meanwhile.
+pub fn foreground_changed(flyout_open: bool) {
+    if HIDDEN.load(Ordering::SeqCst) && !flyout_open {
+        for_each_taskbar(|hwnd| unsafe {
+            if IsWindowVisible(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        });
     }
 }

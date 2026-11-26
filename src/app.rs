@@ -6,10 +6,12 @@
 //! handling / `DefWindowProc` instead of aliasing `&mut App`.
 
 use std::cell::RefCell;
+use std::time::Instant;
 
 use windows::Win32::Foundation::{
     GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
@@ -27,7 +29,9 @@ use windows::Win32::System::RemoteDesktop::{
 };
 use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_LBUTTON,
+};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DeregisterShellHookWindow, DispatchMessageW, FindWindowW,
@@ -41,17 +45,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_DWMCOMPOSITIONCHANGED, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
+    GetCursorPos, GetWindowRect, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, PM_REMOVE, PeekMessageW,
+    QS_ALLINPUT, SW_HIDE, SWP_SHOWWINDOW, WM_DWMCOLORIZATIONCOLORCHANGED, WM_DWMCOMPOSITIONCHANGED,
+    WM_MBUTTONUP, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED, WM_WTSSESSION_CHANGE,
+    WTS_SESSION_UNLOCK,
 };
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
-use crate::config::{self, Alignment, Config, Position, ThemeMode};
+use crate::config::{self, Alignment, Background, BarMode, Config, Position, ThemeMode};
 use crate::icons::IconLoader;
+use crate::island::{self, EdgeSensor, Island};
 use crate::layout::{BarLayout, Hit, Metrics};
 use crate::pins::{self, Pins};
+use crate::render::IslandView;
 use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
 use crate::status::{self, Status};
 use crate::tasks::AppId;
@@ -67,6 +74,13 @@ const WM_APP_PINS: u32 = WM_APP + 6;
 
 const CLASS_NAME: PCWSTR = w!("NitrobarWindow");
 const TIMER_CLOCK: usize = 1;
+/// Island: hover delay before expanding, delay before collapsing, animation frames.
+const TIMER_EXPAND: usize = 2;
+const TIMER_COLLAPSE: usize = 3;
+const TIMER_ANIM: usize = 4;
+/// Glass opacity of the expanded island bar with `background = "clear"` (it lies
+/// over app windows; the collapsed pill uses the lighter `palette.island`).
+const ISLAND_EXPANDED_ALPHA: f32 = 0.85;
 /// Sent once after creation to run setup inside the window procedure.
 const WM_APP_INIT: u32 = WM_APP + 2;
 /// `HSHELL_REDRAW | HSHELL_HIGHBIT`: a window is flashing for attention.
@@ -106,6 +120,27 @@ struct App {
     tracking_mouse: bool,
     /// Element under the last left-button press, while the button is held.
     pressed: Option<Hit>,
+    /// Island mode state; `None` in full mode.
+    island: Option<IslandState>,
+    /// A context menu (nested loop) is open: the island must not collapse.
+    menu_open: bool,
+    /// A Windows flyout (Start, Quick Settings, notifications) has the foreground.
+    flyout_open: bool,
+    /// The foreground window is a fullscreen app on our monitor (backup for
+    /// ABN_FULLSCREENAPP, which island mode may not get without reserved space).
+    foreground_fullscreen: bool,
+    /// Primary monitor and the full bar strip on it, in screen pixels.
+    monitor_rect: RECT,
+    bar_rect: RECT,
+    /// Where the window sits inside bar space, DIPs (non-zero for the island pill).
+    origin: (f32, f32),
+}
+
+struct IslandState {
+    anim: Island,
+    sensor: Option<EdgeSensor>,
+    /// The window is currently shrunk to the pill.
+    small_window: bool,
 }
 
 /// One app button: a pinned app, a running app, or a pinned app that is running.
@@ -214,6 +249,13 @@ fn run_window(options: Options) -> Result<()> {
             hover: None,
             tracking_mouse: false,
             pressed: None,
+            island: None,
+            menu_open: false,
+            flyout_open: false,
+            foreground_fullscreen: false,
+            monitor_rect: RECT::default(),
+            bar_rect: RECT::default(),
+            origin: (0.0, 0.0),
         };
         let cell = Box::into_raw(Box::new(RefCell::new(app)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, cell as isize);
@@ -344,7 +386,14 @@ fn show_context_menu(hwnd: HWND, lparam: LPARAM) {
     // Open away from the screen edge, from the bar's inner edge, like the Windows 11 taskbar.
     screen.y = if ctx.at_top { bar.bottom } else { bar.top };
 
-    let Some(command) = menu::show(hwnd, screen, &ctx) else {
+    with_app(hwnd, |app| app.menu_open = true);
+    let command = menu::show(hwnd, screen, &ctx);
+    with_app(hwnd, |app| {
+        app.menu_open = false;
+        let inside = app.cursor_inside();
+        app.island_pointer(inside);
+    });
+    let Some(command) = command else {
         return;
     };
     match command {
@@ -415,6 +464,19 @@ impl App {
             }
             appbar::CALLBACK_MSG => self.on_appbar_notify(wparam.0 as u32, lparam),
             WM_TIMER if wparam.0 == TIMER_CLOCK => self.tick_clock(),
+            WM_TIMER if wparam.0 == TIMER_EXPAND => {
+                self.kill_timer(TIMER_EXPAND);
+                self.begin_expand();
+            }
+            WM_TIMER if wparam.0 == TIMER_COLLAPSE => self.on_collapse_timer(),
+            WM_TIMER if wparam.0 == TIMER_ANIM => self.animate(),
+            island::WM_APP_EDGE => {
+                // The pointer touched the screen edge (not over a fullscreen game / video).
+                let entered = wparam.0 != 0;
+                if !entered || !self.fullscreen() {
+                    self.island_pointer(entered);
+                }
+            }
             WM_TIMECHANGE => self.tick_clock(),
             WM_SETTINGCHANGE => {
                 // Light/dark mode, accent color, locale or time format may have changed.
@@ -434,6 +496,7 @@ impl App {
             }
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
+                self.island_pointer(false);
                 self.set_hover(None);
                 if self.pressed.take().is_some() {
                     self.invalidate();
@@ -479,9 +542,10 @@ impl App {
     }
 
     fn init(&mut self) {
+        appbar::register(self.hwnd);
+        self.apply_mode();
         self.apply_theme();
         self.apply_native_taskbar();
-        appbar::register(self.hwnd);
         self.reposition();
         tasks::install_hooks(self.hwnd);
         unsafe {
@@ -508,7 +572,31 @@ impl App {
     }
 
     fn wants_native_hidden(&self) -> bool {
-        self.options.hide_taskbar || self.config.bar.hide_native_taskbar
+        // Island mode means "no permanent bar": the native taskbar would be one.
+        self.options.hide_taskbar
+            || self.config.bar.hide_native_taskbar
+            || self.config.bar.mode == BarMode::Island
+    }
+
+    /// Switches between full (AppBar reserving space) and island mode.
+    fn apply_mode(&mut self) {
+        let island = self.config.bar.mode == BarMode::Island;
+        if island == self.island.is_some() {
+            return;
+        }
+        // Re-registering drops any space reserved by a previous ABM_SETPOS. Island
+        // mode stays registered without a position, only to hear ABN_FULLSCREENAPP.
+        appbar::unregister(self.hwnd);
+        appbar::register(self.hwnd);
+        for timer in [TIMER_EXPAND, TIMER_COLLAPSE, TIMER_ANIM] {
+            self.kill_timer(timer);
+        }
+        self.island = island.then(|| IslandState {
+            anim: Island::collapsed(),
+            sensor: EdgeSensor::new(self.hwnd),
+            small_window: true,
+        });
+        self.origin = (0.0, 0.0);
     }
 
     fn apply_native_taskbar(&mut self) {
@@ -530,6 +618,7 @@ impl App {
                     self.config = config;
                     self.metrics = metrics_for(&self.config);
                     self.theme = Theme::from_system(forced_light(&self.config));
+                    self.apply_mode();
                     self.apply_theme();
                     self.apply_native_taskbar();
                     self.reposition();
@@ -624,7 +713,13 @@ impl App {
     /// (Re-)applies the backdrop and menu theme. Cheap and idempotent: also used to
     /// recover after DWM / session / power events that can drop window attributes.
     fn apply_theme(&mut self) {
-        let wanted = self.config.bar.background;
+        // The island window changes shape while animating and a DWM blur can't
+        // follow a rounded, moving panel: it is clear, the panel is drawn by us.
+        let wanted = if self.island.is_some() {
+            Background::Clear
+        } else {
+            self.config.bar.background
+        };
         // The acrylic tint is the palette background of the requested backdrop.
         self.theme.backdrop = wanted;
         let tint = self.palette().background;
@@ -653,16 +748,22 @@ impl App {
         self.reposition();
     }
 
+    fn track_mouse(&mut self) {
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: self.hwnd,
+            dwHoverTime: 0,
+        };
+        // Posts WM_MOUSELEAVE right away if the pointer is not over the window.
+        self.tracking_mouse = unsafe { TrackMouseEvent(&raw mut track) }.is_ok();
+    }
+
     fn on_mouse_move(&mut self, x: i32, y: i32) {
         if !self.tracking_mouse {
-            let mut track = TRACKMOUSEEVENT {
-                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: self.hwnd,
-                dwHoverTime: 0,
-            };
-            self.tracking_mouse = unsafe { TrackMouseEvent(&raw mut track) }.is_ok();
+            self.track_mouse();
         }
+        self.island_pointer(true);
         let hit = self.hit_at(x, y);
         self.set_hover(hit);
     }
@@ -714,6 +815,11 @@ impl App {
     fn on_appbar_notify(&mut self, code: u32, lparam: LPARAM) {
         match code {
             ABN_POSCHANGED => self.reposition(),
+            ABN_FULLSCREENAPP if self.island.is_some() => {
+                self.fullscreen_app = lparam.0 != 0;
+                debug_log!("nitrobar: ABN_FULLSCREENAPP {}", self.fullscreen_app);
+                self.on_fullscreen_changed();
+            }
             ABN_FULLSCREENAPP => {
                 self.fullscreen_app = lparam.0 != 0;
                 unsafe {
@@ -758,17 +864,36 @@ impl App {
                 self.dpi = dpi_x;
             }
             let height = scale(self.metrics.bar_height, self.dpi);
-            let rc = appbar::set_pos(self.hwnd, info.rcMonitor, height, self.metrics.at_top);
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(self.z_order()),
-                rc.left,
-                rc.top,
-                rc.right - rc.left,
-                rc.bottom - rc.top,
-                SWP_NOACTIVATE,
-            );
+            self.monitor_rect = info.rcMonitor;
+            if self.island.is_some() {
+                let m = info.rcMonitor;
+                self.bar_rect = if self.metrics.at_top {
+                    RECT {
+                        bottom: m.top + height,
+                        ..m
+                    }
+                } else {
+                    RECT {
+                        top: m.bottom - height,
+                        ..m
+                    }
+                };
+            } else {
+                let rc = appbar::set_pos(self.hwnd, info.rcMonitor, height, self.metrics.at_top);
+                self.bar_rect = rc;
+                self.origin = (0.0, 0.0);
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(self.z_order()),
+                    rc.left,
+                    rc.top,
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                    SWP_NOACTIVATE,
+                );
+            }
         }
+        self.place_island();
         let icon_px = scale(self.metrics.icon_size, self.dpi) as u32;
         if icon_px != self.icon_px {
             self.icon_px = icon_px;
@@ -781,6 +906,12 @@ impl App {
     fn refresh_tasks(&mut self) {
         if self.tasks.refresh(&self.icons, self.icon_px) {
             self.invalidate();
+        }
+        if self.native_hidden {
+            taskbar::foreground_changed(island::is_shell_flyout(self.tasks.foreground));
+        }
+        if self.island.is_some() {
+            self.on_foreground_changed();
         }
     }
 
@@ -803,10 +934,13 @@ impl App {
         }
     }
 
+    /// Width of the full bar (not of the window, which may be just the pill).
     fn bar_width_dip(&self) -> f32 {
-        let mut rc = RECT::default();
-        unsafe {
-            let _ = GetClientRect(self.hwnd, &raw mut rc);
+        let mut rc = self.bar_rect;
+        if rc.right <= rc.left {
+            unsafe {
+                let _ = GetClientRect(self.hwnd, &raw mut rc);
+            }
         }
         (rc.right - rc.left) as f32 * 96.0 / self.dpi as f32
     }
@@ -831,8 +965,17 @@ impl App {
 
     /// Element at a client-area pixel position.
     fn hit_at(&self, x: i32, y: i32) -> Option<Hit> {
+        // The collapsed / collapsing island shows no buttons: nothing to hit.
+        if let Some(island) = &self.island
+            && (!island.anim.expanded() || island.small_window)
+        {
+            return None;
+        }
         let scale = 96.0 / self.dpi as f32;
-        self.layout().hit(x as f32 * scale, y as f32 * scale)
+        self.layout().hit(
+            x as f32 * scale + self.origin.0,
+            y as f32 * scale + self.origin.1,
+        )
     }
 
     fn pointer(&self, hit: Hit) -> Pointer {
@@ -883,7 +1026,9 @@ impl App {
             status: self.status_view(),
             clock_rect: layout.clock,
             clock_pointer: self.pointer(Hit::Clock),
+            island: self.island_view(&clock),
             clock,
+            origin: self.origin,
         }
     }
 
@@ -903,12 +1048,301 @@ impl App {
         }
     }
 
+    // ----- island mode -----
+
+    fn kill_timer(&self, id: usize) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), id);
+        }
+    }
+
+    fn set_timer(&self, id: usize, ms: u32) {
+        unsafe {
+            SetTimer(Some(self.hwnd), id, ms.max(1), None);
+        }
+    }
+
+    fn fullscreen(&self) -> bool {
+        self.fullscreen_app
+            || self.foreground_fullscreen
+            || island::foreground_is_fullscreen(&self.monitor_rect)
+    }
+
+    fn cursor_inside(&self) -> bool {
+        let mut pt = POINT::default();
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetCursorPos(&raw mut pt);
+            let _ = GetWindowRect(self.hwnd, &raw mut rc);
+        }
+        pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
+    }
+
+    fn island_geometry(&self) -> island::Geometry {
+        island::geometry(
+            self.bar_width_dip(),
+            self.metrics.bar_height,
+            &self.config.bar,
+            self.metrics.at_top,
+        )
+    }
+
+    /// The pointer entered (pill, bar or screen edge) or left. Entering arms the
+    /// expand delay (or reverses a collapse right away); leaving arms the collapse delay.
+    fn island_pointer(&mut self, inside: bool) {
+        let Some(state) = &self.island else {
+            return;
+        };
+        let (expanded, animating) = (state.anim.expanded(), state.anim.animating());
+        if inside {
+            self.kill_timer(TIMER_COLLAPSE);
+            if expanded {
+                return;
+            }
+            if animating {
+                self.begin_expand();
+            } else {
+                self.set_timer(TIMER_EXPAND, self.config.bar.expand_delay_ms);
+            }
+        } else {
+            self.kill_timer(TIMER_EXPAND);
+            if expanded {
+                self.set_timer(TIMER_COLLAPSE, self.config.bar.collapse_delay_ms);
+            }
+        }
+    }
+
+    /// Things that keep the bar open even without the pointer on it.
+    fn collapse_blocked(&self) -> bool {
+        // Left button held anywhere: a drag (file, window, scrollbar) is going on.
+        let dragging = unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) } as u16 & 0x8000 != 0;
+        self.menu_open || self.flyout_open || self.pressed.is_some() || dragging
+    }
+
+    fn on_collapse_timer(&mut self) {
+        self.kill_timer(TIMER_COLLAPSE);
+        debug_log!(
+            "nitrobar: collapse timer: menu={} flyout={} pressed={} inside={}",
+            self.menu_open,
+            self.flyout_open,
+            self.pressed.is_some(),
+            self.cursor_inside()
+        );
+        if self.collapse_blocked() {
+            // Check again later (only while expanded and blocked).
+            self.set_timer(TIMER_COLLAPSE, self.config.bar.collapse_delay_ms);
+        } else if self.cursor_inside() {
+            // Pointer is back (no WM_MOUSEMOVE yet): wait for it to leave again.
+            self.track_mouse();
+        } else {
+            self.begin_collapse();
+        }
+    }
+
+    fn begin_expand(&mut self) {
+        debug_log!(
+            "nitrobar: expand? abn_fullscreen={} fg_fullscreen={} flyout={}",
+            self.fullscreen_app,
+            self.foreground_fullscreen,
+            self.flyout_open
+        );
+        if self.fullscreen() && !self.flyout_open {
+            return;
+        }
+        let Some(state) = &mut self.island else {
+            return;
+        };
+        if !state.anim.set_target(true, Instant::now()) {
+            return;
+        }
+        if state.small_window {
+            state.small_window = false;
+            self.place_island();
+        }
+        self.set_timer(TIMER_ANIM, island::FRAME_MS);
+        // Leave detection for an expansion not started by the pointer (Win key).
+        self.track_mouse();
+    }
+
+    fn begin_collapse(&mut self) {
+        let Some(state) = &mut self.island else {
+            return;
+        };
+        if state.anim.set_target(false, Instant::now()) {
+            self.set_hover(None);
+            self.set_timer(TIMER_ANIM, island::FRAME_MS);
+        }
+    }
+
+    /// One animation frame (only runs while the island moves).
+    fn animate(&mut self) {
+        let Some(state) = &mut self.island else {
+            self.kill_timer(TIMER_ANIM);
+            return;
+        };
+        let moving = state.anim.tick(Instant::now());
+        let collapsed = state.anim.is_collapsed();
+        if collapsed {
+            state.small_window = true;
+        }
+        if !moving {
+            self.kill_timer(TIMER_ANIM);
+            if collapsed {
+                self.place_island();
+                return;
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Sizes / shows the island window for its state: the pill area when collapsed,
+    /// the full strip otherwise; hidden over fullscreen apps. Paints at once so a
+    /// resized window never shows a stale or black frame.
+    fn place_island(&mut self) {
+        let Some(state) = &self.island else {
+            return;
+        };
+        let small = state.small_window;
+        let hidden = self.fullscreen_app || self.foreground_fullscreen;
+        let geometry = self.island_geometry();
+        let bar = self.bar_rect;
+        let to_px = |dip: f32| scale(dip, self.dpi);
+        let rc = if small {
+            RECT {
+                left: bar.left + to_px(geometry.hit.left),
+                top: bar.top + to_px(geometry.hit.top),
+                right: bar.left + to_px(geometry.hit.right),
+                bottom: bar.top + to_px(geometry.hit.bottom),
+            }
+        } else {
+            bar
+        };
+        let px_to_dip = 96.0 / self.dpi as f32;
+        self.origin = (
+            (rc.left - bar.left) as f32 * px_to_dip,
+            (rc.top - bar.top) as f32 * px_to_dip,
+        );
+        if let Some(sensor) = &state.sensor {
+            sensor.place(&self.monitor_rect, self.metrics.at_top, small && !hidden);
+        }
+        unsafe {
+            if hidden {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                return;
+            }
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        self.paint();
+    }
+
+    fn on_fullscreen_changed(&mut self) {
+        if self.fullscreen_app || self.foreground_fullscreen {
+            for timer in [TIMER_EXPAND, TIMER_COLLAPSE, TIMER_ANIM] {
+                self.kill_timer(timer);
+            }
+            if let Some(state) = &mut self.island {
+                state.anim = Island::collapsed();
+                state.small_window = true;
+            }
+        }
+        self.place_island();
+    }
+
+    /// Foreground changed: Windows flyouts keep the bar open (Win opens Start, so
+    /// pressing Win expands it); a fullscreen game / video hides the pill.
+    fn on_foreground_changed(&mut self) {
+        let foreground = self.tasks.foreground;
+        let fullscreen = island::foreground_is_fullscreen(&self.monitor_rect);
+        if fullscreen != self.foreground_fullscreen {
+            self.foreground_fullscreen = fullscreen;
+            self.on_fullscreen_changed();
+        }
+        let flyout = island::is_shell_flyout(foreground);
+        if flyout == self.flyout_open {
+            return;
+        }
+        self.flyout_open = flyout;
+        if flyout {
+            self.kill_timer(TIMER_EXPAND);
+            self.kill_timer(TIMER_COLLAPSE);
+            self.begin_expand();
+        } else if !self.cursor_inside() {
+            self.island_pointer(false);
+        }
+    }
+
+    /// How the island looks right now (`None` in full mode).
+    fn island_view(&self, clock: &clock::ClockText) -> Option<IslandView> {
+        let state = self.island.as_ref()?;
+        let g = self.island_geometry();
+        let t = state.anim.eased();
+        let palette = self.palette();
+        let attention = self.tasks.groups.iter().any(|g| g.attention);
+        let mut pill = if attention {
+            palette.attention
+        } else {
+            palette.island
+        };
+        if attention {
+            pill.a = 0.9;
+        }
+        // The expanded fill follows `[bar] background` (clear = none, solid = opaque).
+        let mut full = Theme {
+            backdrop: self.config.bar.background,
+            ..self.theme
+        }
+        .palette()
+        .background;
+        if let Some(c) = config::parse_color(&self.config.colors.background) {
+            full = c;
+        }
+        if full.a == 0.0 {
+            // The expanded island lies over app windows (it reserves no space): a
+            // fully clear bar would mix its text with theirs. Keep the pill's glass.
+            full = palette.island;
+            full.a = ISLAND_EXPANDED_ALPHA;
+        }
+        let mix = |a: f32, b: f32| island::lerp(a, b, t);
+        let pill_radius = (g.pill.bottom - g.pill.top) / 2.0;
+        let mut border = palette.island_border;
+        // The hairline stays (fainter) on the expanded bar as its edge toward the windows.
+        border.a *= if attention { 0.0 } else { 1.0 - 0.5 * t };
+        Some(IslandView {
+            panel: island::lerp_rect(&g.pill, &g.bar, t),
+            radius: mix(pill_radius, 0.0),
+            fill: D2D1_COLOR_F {
+                r: mix(pill.r, full.r),
+                g: mix(pill.g, full.g),
+                b: mix(pill.b, full.b),
+                a: mix(pill.a, full.a),
+            },
+            border,
+            // Icons appear over the last two thirds of the expansion.
+            content_opacity: ((t - 0.35) / 0.65).clamp(0.0, 1.0),
+            clock: self
+                .config
+                .bar
+                .island_show_clock
+                .then(|| clock.time.clone()),
+            text: palette.text,
+        })
+    }
+
     fn cleanup(&mut self) {
         if self.cleaned_up {
             return;
         }
         self.cleaned_up = true;
         tasks::remove_hooks();
+        self.island = None;
         if let Some(mut status) = self.status.take() {
             status.shutdown();
         }

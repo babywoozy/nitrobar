@@ -35,6 +35,17 @@ pub enum ThemeMode {
     Light,
 }
 
+/// How the bar occupies the screen edge.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BarMode {
+    /// Always shown, reserves its strip of the screen (an AppBar).
+    Full,
+    /// A small pill that expands into the full bar on hover; reserves no space.
+    #[default]
+    Island,
+}
+
 /// What is behind the bar's own drawing.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
@@ -62,6 +73,14 @@ pub struct BarConfig {
     pub hide_native_taskbar: bool,
     pub theme: ThemeMode,
     pub background: Background,
+    pub mode: BarMode,
+    /// Pill size while collapsed, DIPs (clamped to 40..=600 / 4..=40).
+    pub island_width: f32,
+    pub island_height: f32,
+    /// Hover time before expanding / after leaving before collapsing (ms).
+    pub expand_delay_ms: u32,
+    pub collapse_delay_ms: u32,
+    pub island_show_clock: bool,
 }
 
 impl Default for BarConfig {
@@ -74,6 +93,12 @@ impl Default for BarConfig {
             hide_native_taskbar: false,
             theme: ThemeMode::Auto,
             background: Background::Clear,
+            mode: BarMode::Island,
+            island_width: 120.0,
+            island_height: 8.0,
+            expand_delay_ms: 100,
+            collapse_delay_ms: 600,
+            island_show_clock: false,
         }
     }
 }
@@ -128,6 +153,10 @@ impl Config {
         let mut config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
         config.bar.height = clamp_or(config.bar.height, 32.0, 96.0, 48.0);
         config.bar.icon_size = clamp_or(config.bar.icon_size, 16.0, 48.0, 24.0);
+        config.bar.island_width = clamp_or(config.bar.island_width, 40.0, 600.0, 120.0);
+        config.bar.island_height = clamp_or(config.bar.island_height, 4.0, 40.0, 8.0);
+        config.bar.expand_delay_ms = config.bar.expand_delay_ms.min(2000);
+        config.bar.collapse_delay_ms = config.bar.collapse_delay_ms.min(10_000);
         Ok(config)
     }
 }
@@ -153,6 +182,17 @@ alignment = "center"         # "center" (giống Windows 11) hoặc "left"
 hide_native_taskbar = false  # ẩn taskbar gốc của Windows khi nitrobar chạy
 theme = "auto"               # "auto" (theo Windows), "dark" hoặc "light"
 background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acrylic" hoặc "solid" (đặc)
+
+# Chế độ hiển thị:
+#   "island": thu gọn thành một viên nhỏ ở mép màn hình, rê chuột vào (hoặc chạm mép, hoặc
+#             nhấn phím Win) thì bung ra; không chiếm chỗ, taskbar gốc được ẩn.
+#   "full":   thanh luôn hiện và giữ chỗ như taskbar thường.
+mode = "island"
+island_width = 120           # cỡ viên khi thu gọn (DIP, 40..600)
+island_height = 8            # (DIP, 4..40)
+expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
+collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
+island_show_clock = false    # hiện giờ nhỏ trong viên
 
 [colors]
 # Để trống = theo theme Windows. Định dạng "#RRGGBB" hoặc "#RRGGBBAA".
@@ -226,6 +266,7 @@ mod tests {
         assert_eq!(config.bar.height, 48.0);
         assert_eq!(config.bar.background, Background::Clear);
         assert!(config.clock.show_date);
+        assert_eq!(config.bar.mode, BarMode::Island);
         let blur = Config::parse("[bar]\nbackground = \"blur\"\n").unwrap();
         assert_eq!(blur.bar.background, Background::Blur);
     }
@@ -235,6 +276,9 @@ mod tests {
         let config = Config::parse("[bar]\nheight = 500\nicon_size = 1\n").unwrap();
         assert_eq!(config.bar.height, 96.0);
         assert_eq!(config.bar.icon_size, 16.0);
+        let island = Config::parse("[bar]\nisland_width = 5\ncollapse_delay_ms = 99999\n").unwrap();
+        assert_eq!(island.bar.island_width, 40.0);
+        assert_eq!(island.bar.collapse_delay_ms, 10_000);
     }
 
     #[test]

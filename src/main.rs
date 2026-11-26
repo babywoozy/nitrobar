@@ -22,6 +22,7 @@ mod appbar;
 mod clock;
 mod config;
 mod icons;
+mod island;
 mod layout;
 mod menu;
 mod pins;
