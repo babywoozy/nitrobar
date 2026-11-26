@@ -22,6 +22,9 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::{
+    NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+};
 use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
@@ -38,9 +41,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE, PBT_POWERSETTINGCHANGE,
-    PM_REMOVE, PeekMessageW, QS_ALLINPUT, WM_DWMCOLORIZATIONCOLORCHANGED, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED,
+    GetWindowRect, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_DWMCOMPOSITIONCHANGED, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
 };
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
@@ -383,6 +387,18 @@ impl App {
             }
             tasks::WM_APP_REFRESH => self.refresh_tasks(),
             status::WM_APP_STATUS => self.refresh_status(),
+            WM_POWERBROADCAST
+                if matches!(
+                    wparam.0 as u32,
+                    PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND
+                ) =>
+            {
+                // Back from sleep / hibernate.
+                self.recover();
+                return Some(LRESULT(1));
+            }
+            WM_WTSSESSION_CHANGE if wparam.0 as u32 == WTS_SESSION_UNLOCK => self.recover(),
+            WM_DWMCOMPOSITIONCHANGED => self.recover(),
             WM_POWERBROADCAST => {
                 if matches!(
                     wparam.0 as u32,
@@ -400,9 +416,14 @@ impl App {
             appbar::CALLBACK_MSG => self.on_appbar_notify(wparam.0 as u32, lparam),
             WM_TIMER if wparam.0 == TIMER_CLOCK => self.tick_clock(),
             WM_TIMECHANGE => self.tick_clock(),
-            WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {
+            WM_SETTINGCHANGE => {
                 // Light/dark mode, accent color, locale or time format may have changed.
-                self.reload_theme();
+                self.reload_theme(false);
+                return None;
+            }
+            WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {
+                // DWM may reset window attributes on a theme switch: always re-apply.
+                self.reload_theme(true);
                 return None;
             }
             WM_DISPLAYCHANGE | WM_DPICHANGED => self.reposition(),
@@ -465,6 +486,8 @@ impl App {
         tasks::install_hooks(self.hwnd);
         unsafe {
             let _ = RegisterShellHookWindow(self.hwnd);
+            // WM_WTSSESSION_CHANGE (unlock) for `recover`.
+            let _ = WTSRegisterSessionNotification(self.hwnd, NOTIFY_FOR_THIS_SESSION);
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.status = Some(Status::new(self.hwnd));
@@ -610,13 +633,24 @@ impl App {
         self.invalidate();
     }
 
-    fn reload_theme(&mut self) {
+    fn reload_theme(&mut self, force: bool) {
         let fresh = Theme::from_system(forced_light(&self.config));
-        if fresh.light != self.theme.light || fresh.accent != self.theme.accent {
+        if force || fresh.light != self.theme.light || fresh.accent != self.theme.accent {
             self.theme = fresh;
             self.apply_theme();
         }
         self.invalidate();
+    }
+
+    /// After unlock, resume or a DWM restart: re-apply everything DWM or the
+    /// shell may have dropped, and redraw from a fresh render target, so the bar
+    /// can never stay black / stale.
+    fn recover(&mut self) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.reset();
+        }
+        self.apply_theme();
+        self.reposition();
     }
 
     fn on_mouse_move(&mut self, x: i32, y: i32) {
@@ -663,7 +697,7 @@ impl App {
         if self.native_hidden {
             taskbar::rehide();
         }
-        self.reposition();
+        self.recover();
         tasks::request_refresh();
     }
 
@@ -881,6 +915,7 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_CLOCK);
             let _ = DeregisterShellHookWindow(self.hwnd);
+            let _ = WTSUnRegisterSessionNotification(self.hwnd);
         }
         safety::emergency_cleanup();
     }

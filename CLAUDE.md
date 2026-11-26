@@ -18,7 +18,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.3 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB).
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB; ghim từ Windows 12.1 MB / 48 MB (property system của shell); icon nét 12.0 MB; nền clear 11.5 MB (sau khi đổi qua lại 4 chế độ: 14.5 MB); chống thanh đen 12.6 MB.
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -114,6 +114,17 @@ src/
   "active"; mẹo trả `WM_NCACTIVATE(TRUE)` hỏng khi panel của Windows (thông báo, Quick Settings)
   lấy foreground rồi đóng => thanh đen đặc không tự hết. Luôn đặt nó về `DWMSBT_NONE`.
 - `ACCENT_ENABLE_BLURBEHIND` (3) ra màu đen với cửa sổ thường trên Win11 hiện tại: không dùng.
+- `clear` dùng `ACCENT_ENABLE_TRANSPARENTGRADIENT` (2) với màu alpha 0, KHÔNG `ACCENT_DISABLED`:
+  về DISABLED sau khi đã bật accent acrylic thì pixel trong suốt thành đen (đã tái hiện:
+  acrylic -> clear). Chỉ `solid` dùng DISABLED (không có pixel trong suốt).
+- Tự phục hồi (`App::recover`: bỏ render target, áp lại backdrop, đặt lại vị trí, vẽ lại) khi:
+  mở khoá máy (`WM_WTSSESSION_CHANGE`/`WTS_SESSION_UNLOCK`, cần `WTSRegisterSessionNotification`),
+  thức dậy sau sleep (`PBT_APMRESUMEAUTOMATIC`/`RESUMESUSPEND`), `WM_DWMCOMPOSITIONCHANGED`,
+  Explorer khởi động lại. `WM_THEMECHANGED`/`WM_DWMCOLORIZATIONCOLORCHANGED` luôn áp lại backdrop.
+  `D2DERR_RECREATE_TARGET` -> vẽ lại ngay (trước đây cửa sổ giữ nguyên hình cũ / đen).
+- Kiểm thử chống "thanh đen": mở + đóng trung tâm thông báo, Quick Settings, Start, Alt+Tab ở
+  cả clear và acrylic, đổi acrylic -> clear, đổi theme sáng/tối (registry + broadcast
+  `ImmersiveColorSet`, nhớ trả lại). Khoá máy / sleep không tự test được: post message giả.
 - Khi trong suốt: text antialias GRAYSCALE (ClearType cần nền đặc). Với clear/blur, chữ, glyph
   trạng thái và vạch chỉ báo có bóng (vòng 1 DIP alpha 0.4 + bóng lệch xuống alpha 0.5, màu
   tương phản với chữ) để đọc được trên nền trắng.

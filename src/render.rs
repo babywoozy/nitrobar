@@ -27,6 +27,7 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -256,6 +257,11 @@ impl Renderer {
         }
     }
 
+    /// Drops the render target; the next paint recreates it.
+    pub fn reset(&mut self) {
+        self.target = None;
+    }
+
     /// Draws the whole bar. Call between `BeginPaint` and `EndPaint`.
     pub fn draw(&mut self, hwnd: HWND, dpi: u32, scene: &Scene) -> Result<()> {
         let size = Self::client_size(hwnd)?;
@@ -328,8 +334,14 @@ impl Renderer {
         self.draw_clock(&target, scene);
 
         match unsafe { target.rt.EndDraw(None, None) } {
-            // Device lost: drop the target, it is recreated on the next paint.
-            Err(e) if e.code() == D2DERR_RECREATE_TARGET => Ok(()),
+            // Device lost: drop the target and paint again right away with a new one
+            // (otherwise the window keeps whatever it showed, e.g. black).
+            Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                Ok(())
+            }
             Err(e) => Err(e),
             Ok(()) => {
                 self.target = Some(target);

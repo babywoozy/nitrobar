@@ -178,6 +178,7 @@ struct CompositionData {
 
 const WCA_ACCENT_POLICY: u32 = 19;
 const ACCENT_DISABLED: u32 = 0;
+const ACCENT_ENABLE_TRANSPARENTGRADIENT: u32 = 2;
 const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
 /// Use `gradient_color` as the tint.
 const ACCENT_FLAG_GRADIENT_COLOR: u32 = 2;
@@ -216,8 +217,8 @@ fn set_accent(hwnd: HWND, state: u32, tint: &D2D1_COLOR_F) -> bool {
 /// Dark mode, square corners and the backdrop. Returns the backdrop in effect.
 ///
 /// Every translucent mode extends the DWM frame over the whole window, so pixels
-/// we leave transparent are composed by DWM: with no accent they show what is
-/// behind (`Clear`); the blur / acrylic accents blur it first. Unlike the
+/// we leave transparent are composed by DWM: a transparent-gradient accent shows
+/// what is behind (`Clear`); the acrylic accent blurs it first. Unlike the
 /// `DWMWA_SYSTEMBACKDROP_TYPE` backdrops, accents do not depend on the window
 /// being active, so the bar needs no "fake active" trick and never falls back to
 /// an opaque fill when a shell flyout takes the foreground.
@@ -264,14 +265,20 @@ pub fn apply_backdrop(
     // ACCENT_ENABLE_BLURBEHIND (3) renders black for ordinary windows on current
     // Windows 11 builds, so "blur" is the acrylic accent with an (almost) clear
     // tint; the light tint is drawn by us. Acrylic is tinted by DWM itself.
+    // Clear also keeps an accent (a fully transparent gradient, like TranslucentTB's
+    // "clear"): going back to ACCENT_DISABLED after a blur accent leaves the
+    // transparent pixels black until the window is recreated.
     let accent = match wanted {
         Background::Blur | Background::Acrylic => ACCENT_ENABLE_ACRYLICBLURBEHIND,
-        Background::Clear | Background::Solid => ACCENT_DISABLED,
+        Background::Clear => ACCENT_ENABLE_TRANSPARENTGRADIENT,
+        Background::Solid => ACCENT_DISABLED,
     };
     let mut accent_tint = *tint;
-    if wanted != Background::Acrylic {
+    match wanted {
+        Background::Acrylic => {}
         // Alpha 0 is treated as "no tint given" by some builds: keep 1/255.
-        accent_tint.a = 1.0 / 255.0;
+        Background::Blur => accent_tint.a = 1.0 / 255.0,
+        Background::Clear | Background::Solid => accent_tint.a = 0.0,
     }
     let applied = set_accent(hwnd, accent, &accent_tint);
     match wanted {
