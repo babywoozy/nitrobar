@@ -1,5 +1,9 @@
 //! Direct2D / DirectWrite drawing. All coordinates here are DIPs; the render
 //! target's DPI is set to the monitor DPI so Direct2D does the scaling.
+//!
+//! With the acrylic backdrop, pixels are cleared to transparent and DWM composes
+//! the blurred backdrop underneath; text then uses grayscale antialiasing
+//! (ClearType needs an opaque background).
 
 use std::collections::HashMap;
 
@@ -11,8 +15,8 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-    D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget,
-    ID2D1SolidColorBrush,
+    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -27,26 +31,14 @@ use windows::core::{Result, w};
 use crate::clock::ClockText;
 use crate::icons::Icon;
 use crate::layout;
+use crate::theme::Palette;
 
-const fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F {
-        r: r as f32 / 255.0,
-        g: g as f32 / 255.0,
-        b: b as f32 / 255.0,
-        a,
-    }
-}
-
-// Windows 11 dark taskbar palette.
-const BACKGROUND: D2D1_COLOR_F = rgba(0x1c, 0x1c, 0x1c, 1.0);
-const FOREGROUND: D2D1_COLOR_F = rgba(0xff, 0xff, 0xff, 1.0);
-const BUTTON_ACTIVE_BG: D2D1_COLOR_F = rgba(0xff, 0xff, 0xff, 0.06);
-const BUTTON_ATTENTION_BG: D2D1_COLOR_F = rgba(0xff, 0x8c, 0x00, 0.28);
-const INDICATOR_RUNNING: D2D1_COLOR_F = rgba(0xff, 0xff, 0xff, 0.55);
-const INDICATOR_ACTIVE: D2D1_COLOR_F = rgba(0x4c, 0xc2, 0xff, 1.0);
-const INDICATOR_ATTENTION: D2D1_COLOR_F = rgba(0xff, 0x8c, 0x00, 1.0);
-const PLACEHOLDER_ICON: D2D1_COLOR_F = rgba(0xff, 0xff, 0xff, 0.25);
-
+const TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 0.0,
+};
 const CLOCK_FONT_SIZE: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,14 +48,28 @@ pub enum ButtonState {
     Attention,
 }
 
+/// Pointer feedback for any clickable element.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pointer {
+    pub hover: bool,
+    pub pressed: bool,
+}
+
 pub struct ButtonView<'a> {
     pub rect: D2D_RECT_F,
     pub icon: Option<&'a Icon>,
     pub state: ButtonState,
+    pub pointer: Pointer,
 }
 
 pub struct Scene<'a> {
+    pub palette: Palette,
+    /// True when DWM draws an acrylic backdrop under transparent pixels.
+    pub translucent: bool,
+    pub start: (D2D_RECT_F, Pointer),
     pub buttons: Vec<ButtonView<'a>>,
+    pub clock_rect: D2D_RECT_F,
+    pub clock_pointer: Pointer,
     pub clock: ClockText,
 }
 
@@ -139,7 +145,7 @@ impl Renderer {
             let rt = self
                 .d2d
                 .CreateHwndRenderTarget(&raw const props, &raw const hwnd_props)?;
-            let brush = rt.CreateSolidColorBrush(&FOREGROUND, None)?;
+            let brush = rt.CreateSolidColorBrush(&TRANSPARENT, None)?;
             Ok(Target {
                 rt,
                 size,
@@ -168,17 +174,39 @@ impl Renderer {
             None => self.create_target(hwnd, size, dpi)?,
         };
 
+        let palette = &scene.palette;
         unsafe {
             target.rt.SetDpi(dpi, dpi);
+            target.rt.SetTextAntialiasMode(if scene.translucent {
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+            } else {
+                D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE
+            });
             target.rt.BeginDraw();
-            target.rt.Clear(Some(&BACKGROUND));
+            target.rt.Clear(Some(if scene.translucent {
+                &TRANSPARENT
+            } else {
+                &palette.background
+            }));
+            if scene.translucent {
+                let full = D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 100_000.0,
+                    bottom: 100_000.0,
+                };
+                target.brush.SetColor(&raw const palette.background);
+                target.rt.FillRectangle(&raw const full, &target.brush);
+            }
         }
+
+        Self::draw_start(&target, palette, scene.start.0, scene.start.1);
         let mut used = Vec::with_capacity(scene.buttons.len());
         for button in &scene.buttons {
-            Self::draw_button(&mut target, button, &mut used);
+            Self::draw_button(&mut target, palette, button, &mut used);
         }
         target.bitmaps.retain(|id, _| used.contains(id));
-        self.draw_clock(&target, &scene.clock);
+        self.draw_clock(&target, scene);
 
         match unsafe { target.rt.EndDraw(None, None) } {
             // Device lost: drop the target, it is recreated on the next paint.
@@ -205,27 +233,102 @@ impl Renderer {
         }
     }
 
-    fn draw_button(target: &mut Target, button: &ButtonView, used: &mut Vec<u64>) {
+    /// Hover / pressed / active background of a button.
+    fn draw_button_background(
+        target: &Target,
+        palette: &Palette,
+        rect: D2D_RECT_F,
+        active: bool,
+        pointer: Pointer,
+    ) {
+        let color = match (active, pointer.hover, pointer.pressed) {
+            (_, _, true) => Some(&palette.pressed),
+            (true, true, false) => Some(&palette.active_hover),
+            (true, false, false) => Some(&palette.active),
+            (false, true, false) => Some(&palette.hover),
+            (false, false, false) => None,
+        };
+        if let Some(color) = color {
+            Self::fill_rounded(target, rect, layout::CORNER_RADIUS, color);
+        }
+    }
+
+    /// The four-pane Windows logo, drawn as vectors so it is crisp at any DPI.
+    fn draw_start(target: &Target, palette: &Palette, rect: D2D_RECT_F, pointer: Pointer) {
+        Self::draw_button_background(target, palette, rect, false, pointer);
+        let size = if pointer.pressed {
+            layout::START_LOGO_SIZE * 0.85
+        } else {
+            layout::START_LOGO_SIZE
+        };
+        let logo = layout::centered_square(&rect, size, 0.0);
+        let gap = size * 0.06;
+        let pane = (size - gap) / 2.0;
+        let top_color = D2D1_COLOR_F {
+            r: 0.30,
+            g: 0.78,
+            b: 1.0,
+            a: 1.0,
+        };
+        let bottom_color = D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.56,
+            b: 0.94,
+            a: 1.0,
+        };
+        for row in 0..2 {
+            for col in 0..2 {
+                let left = logo.left + col as f32 * (pane + gap);
+                let top = logo.top + row as f32 * (pane + gap);
+                let pane_rect = D2D_RECT_F {
+                    left,
+                    top,
+                    right: left + pane,
+                    bottom: top + pane,
+                };
+                let color = if row == 0 { &top_color } else { &bottom_color };
+                Self::fill_rounded(target, pane_rect, size * 0.04, color);
+            }
+        }
+    }
+
+    fn icon_bitmap(target: &mut Target, icon: &Icon) -> Option<ID2D1Bitmap> {
+        if let Some(bitmap) = target.bitmaps.get(&icon.id) {
+            return Some(bitmap.clone());
+        }
+        let bitmap = unsafe { target.rt.CreateBitmapFromWicBitmap(&icon.bitmap, None) }.ok()?;
+        target.bitmaps.insert(icon.id, bitmap.clone());
+        Some(bitmap)
+    }
+
+    fn draw_button(
+        target: &mut Target,
+        palette: &Palette,
+        button: &ButtonView,
+        used: &mut Vec<u64>,
+    ) {
         let rect = button.rect;
-        match button.state {
-            ButtonState::Active => {
-                Self::fill_rounded(target, rect, layout::CORNER_RADIUS, &BUTTON_ACTIVE_BG);
-            }
-            ButtonState::Attention => {
-                Self::fill_rounded(target, rect, layout::CORNER_RADIUS, &BUTTON_ATTENTION_BG);
-            }
-            ButtonState::Running => {}
+        if button.state == ButtonState::Attention && !button.pointer.pressed {
+            Self::fill_rounded(target, rect, layout::CORNER_RADIUS, &palette.attention_bg);
+        } else {
+            Self::draw_button_background(
+                target,
+                palette,
+                rect,
+                button.state == ButtonState::Active,
+                button.pointer,
+            );
         }
 
-        let icon_rect = layout::centered_square(&rect, layout::ICON_SIZE, -1.0);
+        let icon_size = if button.pointer.pressed {
+            layout::ICON_SIZE_PRESSED
+        } else {
+            layout::ICON_SIZE
+        };
+        let icon_rect = layout::centered_square(&rect, icon_size, -1.0);
         let bitmap = button.icon.and_then(|icon| {
             used.push(icon.id);
-            if let Some(bitmap) = target.bitmaps.get(&icon.id) {
-                return Some(bitmap.clone());
-            }
-            let bitmap = unsafe { target.rt.CreateBitmapFromWicBitmap(&icon.bitmap, None) }.ok()?;
-            target.bitmaps.insert(icon.id, bitmap.clone());
-            Some(bitmap)
+            Self::icon_bitmap(target, icon)
         });
         match bitmap {
             Some(bitmap) => unsafe {
@@ -237,31 +340,32 @@ impl Renderer {
                     None,
                 );
             },
-            None => Self::fill_rounded(target, icon_rect, 4.0, &PLACEHOLDER_ICON),
+            None => Self::fill_rounded(target, icon_rect, 4.0, &palette.placeholder),
         }
 
         let (width, color) = match button.state {
-            ButtonState::Running => (layout::INDICATOR_RUNNING_WIDTH, &INDICATOR_RUNNING),
-            ButtonState::Active => (layout::INDICATOR_ACTIVE_WIDTH, &INDICATOR_ACTIVE),
-            ButtonState::Attention => (layout::INDICATOR_ACTIVE_WIDTH, &INDICATOR_ATTENTION),
+            ButtonState::Running => (layout::INDICATOR_RUNNING_WIDTH, &palette.indicator),
+            ButtonState::Active => (layout::INDICATOR_ACTIVE_WIDTH, &palette.accent),
+            ButtonState::Attention => (layout::INDICATOR_ACTIVE_WIDTH, &palette.attention),
         };
         let pill = layout::indicator(&rect, width);
         Self::fill_rounded(target, pill, layout::INDICATOR_HEIGHT / 2.0, color);
     }
 
-    fn draw_clock(&self, target: &Target, clock: &ClockText) {
+    fn draw_clock(&self, target: &Target, scene: &Scene) {
+        let rect = scene.clock_rect;
+        Self::draw_button_background(target, &scene.palette, rect, false, scene.clock_pointer);
+        let right = rect.right - layout::CLOCK_TEXT_PADDING;
+        let left = rect.left;
+        let mid = (rect.top + rect.bottom) / 2.0;
+        let lines = [
+            (&scene.clock.time, mid - layout::CLOCK_LINE_HEIGHT, mid),
+            (&scene.clock.date, mid, mid + layout::CLOCK_LINE_HEIGHT),
+        ];
         unsafe {
-            let bar = target.rt.GetSize();
-            let right = bar.width - layout::CLOCK_RIGHT_PADDING;
-            let left = right - layout::CLOCK_WIDTH;
-            let mid = bar.height / 2.0;
-            let lines = [
-                (&clock.time, mid - layout::CLOCK_LINE_HEIGHT, mid),
-                (&clock.date, mid, mid + layout::CLOCK_LINE_HEIGHT),
-            ];
-            target.brush.SetColor(&FOREGROUND);
+            target.brush.SetColor(&raw const scene.palette.text);
             for (text, top, bottom) in lines {
-                let rect = D2D_RECT_F {
+                let line = D2D_RECT_F {
                     left,
                     top,
                     right,
@@ -270,7 +374,7 @@ impl Renderer {
                 target.rt.DrawText(
                     text,
                     &self.clock_format,
-                    &raw const rect,
+                    &raw const line,
                     &target.brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,

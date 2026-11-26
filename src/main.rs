@@ -25,8 +25,10 @@ mod layout;
 mod menu;
 mod render;
 mod safety;
+mod shell;
 mod taskbar;
 mod tasks;
+mod theme;
 
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,

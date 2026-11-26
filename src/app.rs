@@ -8,7 +8,6 @@
 use std::cell::RefCell;
 
 use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
@@ -18,6 +17,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DeregisterShellHookWindow, DispatchMessageW, FindWindowW,
@@ -30,12 +30,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_PAINT, WM_QUERYENDSESSION, WM_SETTINGCHANGE, WM_TIMECHANGE, WM_TIMER, WM_WINDOWPOSCHANGED,
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowRect, WM_DWMCOLORIZATIONCOLORCHANGED, WM_MOUSEMOVE, WM_NCACTIVATE, WM_THEMECHANGED,
+};
 use windows::core::{PCWSTR, Result, w};
 
 use crate::icons::IconLoader;
-use crate::render::{ButtonState, ButtonView, Renderer, Scene};
+use crate::layout::{BarLayout, Hit};
+use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
 use crate::tasks::{self, TaskList};
-use crate::{appbar, clock, layout, menu, safety, taskbar};
+use crate::theme::{self, Theme};
+use crate::{appbar, clock, layout, menu, safety, shell, taskbar};
 
 const CLASS_NAME: PCWSTR = w!("NitrobarWindow");
 const TIMER_CLOCK: usize = 1;
@@ -43,6 +48,8 @@ const TIMER_CLOCK: usize = 1;
 const WM_APP_INIT: u32 = WM_APP + 2;
 /// `HSHELL_REDRAW | HSHELL_HIGHBIT`: a window is flashing for attention.
 const HSHELL_FLASH: usize = 0x8006;
+/// Sent after `TrackMouseEvent(TME_LEAVE)` when the pointer leaves the window.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 pub struct Options {
     pub hide_taskbar: bool,
@@ -56,12 +63,17 @@ struct App {
     cleaned_up: bool,
     msg_taskbar_created: u32,
     msg_shell_hook: u32,
-    renderer: Renderer,
+    /// `None` only while a paint is in progress (see `paint`).
+    renderer: Option<Renderer>,
     icons: IconLoader,
     icon_px: u32,
     tasks: TaskList,
-    /// Button index under the last left-button press.
-    pressed: Option<usize>,
+    theme: Theme,
+    /// Element under the pointer, and whether we asked for WM_MOUSELEAVE.
+    hover: Option<Hit>,
+    tracking_mouse: bool,
+    /// Element under the last left-button press, while the button is held.
+    pressed: Option<Hit>,
 }
 
 fn scale(dip: f32, dpi: u32) -> i32 {
@@ -128,10 +140,13 @@ fn run_window(options: Options) -> Result<()> {
             cleaned_up: false,
             msg_taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             msg_shell_hook: RegisterWindowMessageW(w!("SHELLHOOK")),
-            renderer,
+            renderer: Some(renderer),
             icons,
             icon_px: 0,
             tasks: TaskList::new(hwnd),
+            theme: Theme::from_system(),
+            hover: None,
+            tracking_mouse: false,
             pressed: None,
         };
         let cell = Box::into_raw(Box::new(RefCell::new(app)));
@@ -161,6 +176,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         // These only need the HWND, so they also work while App is borrowed.
         WM_ACTIVATE => appbar::activate(hwnd),
         WM_WINDOWPOSCHANGED => appbar::window_pos_changed(hwnd),
+        // The acrylic backdrop only renders for windows DWM considers active, and the
+        // bar never activates (WS_EX_NOACTIVATE): always report an active frame.
+        WM_NCACTIVATE => unsafe {
+            return DefWindowProcW(hwnd, msg, WPARAM(1), lparam);
+        },
         WM_CONTEXTMENU => {
             show_context_menu(hwnd, lparam);
             return LRESULT(0);
@@ -182,16 +202,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 /// The menu runs a nested message loop, so `App` is only borrowed before and after it.
 fn show_context_menu(hwnd: HWND, lparam: LPARAM) {
-    let screen = menu::menu_point(lparam);
+    let mut screen = menu::menu_point(lparam);
     let mut client = screen;
+    let mut bar = RECT::default();
     unsafe {
         let _ = ScreenToClient(hwnd, &raw mut client);
+        // Open upwards from the top edge of the bar, like the Windows 11 taskbar.
+        if GetWindowRect(hwnd, &raw mut bar).is_ok() {
+            screen.y = bar.top;
+        }
     }
-    let target = with_app(hwnd, |app| {
-        app.button_at(client.x, client.y).map(|i| {
-            let group = &app.tasks.groups[i];
-            (group.key.clone(), group.windows.len())
-        })
+    let target = with_app(hwnd, |app| match app.hit_at(client.x, client.y) {
+        Some(Hit::Task(i)) => app
+            .tasks
+            .groups
+            .get(i)
+            .map(|g| (g.key.clone(), g.windows.len())),
+        _ => None,
     })
     .flatten();
     let window_count = target.as_ref().map_or(0, |(_, count)| *count);
@@ -230,25 +257,37 @@ impl App {
             appbar::CALLBACK_MSG => self.on_appbar_notify(wparam.0 as u32, lparam),
             WM_TIMER if wparam.0 == TIMER_CLOCK => self.tick_clock(),
             WM_TIMECHANGE => self.tick_clock(),
-            WM_SETTINGCHANGE => {
-                // Locale / time format may have changed.
-                self.invalidate();
+            WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {
+                // Light/dark mode, accent color, locale or time format may have changed.
+                self.reload_theme();
                 return None;
             }
             WM_DISPLAYCHANGE | WM_DPICHANGED => self.reposition(),
             WM_PAINT => self.paint(),
+            WM_MOUSEMOVE => {
+                let (x, y) = mouse_pos(lparam);
+                self.on_mouse_move(x, y);
+            }
+            WM_MOUSELEAVE => {
+                self.tracking_mouse = false;
+                self.set_hover(None);
+                if self.pressed.take().is_some() {
+                    self.invalidate();
+                }
+            }
             WM_LBUTTONDOWN => {
                 let (x, y) = mouse_pos(lparam);
-                self.pressed = self.button_at(x, y);
+                self.pressed = self.hit_at(x, y);
+                self.invalidate();
             }
             WM_LBUTTONUP => {
                 let (x, y) = mouse_pos(lparam);
                 let pressed = self.pressed.take();
-                if let Some(index) = self.button_at(x, y)
-                    && pressed == Some(index)
-                {
-                    self.tasks.click(index);
+                let hit = self.hit_at(x, y);
+                if hit.is_some() && hit == pressed {
+                    self.activate(hit);
                 }
+                self.invalidate();
             }
             WM_QUERYENDSESSION => return Some(LRESULT(1)),
             WM_ENDSESSION => {
@@ -267,6 +306,7 @@ impl App {
     }
 
     fn init(&mut self) {
+        self.apply_theme();
         if self.options.hide_taskbar {
             taskbar::hide();
         }
@@ -279,6 +319,53 @@ impl App {
         }
         self.refresh_tasks();
         self.tick_clock();
+    }
+
+    fn apply_theme(&mut self) {
+        self.theme.acrylic = theme::apply_backdrop(self.hwnd, &self.theme);
+        theme::apply_menu_theme(self.theme.light);
+        unsafe {
+            SendMessageW(self.hwnd, WM_NCACTIVATE, Some(WPARAM(1)), None);
+        }
+    }
+
+    fn reload_theme(&mut self) {
+        let fresh = Theme::from_system();
+        if fresh.light != self.theme.light || fresh.accent != self.theme.accent {
+            self.theme = fresh;
+            self.apply_theme();
+        }
+        self.invalidate();
+    }
+
+    fn on_mouse_move(&mut self, x: i32, y: i32) {
+        if !self.tracking_mouse {
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            self.tracking_mouse = unsafe { TrackMouseEvent(&raw mut track) }.is_ok();
+        }
+        let hit = self.hit_at(x, y);
+        self.set_hover(hit);
+    }
+
+    fn set_hover(&mut self, hit: Option<Hit>) {
+        if hit != self.hover {
+            self.hover = hit;
+            self.invalidate();
+        }
+    }
+
+    fn activate(&mut self, hit: Option<Hit>) {
+        match hit {
+            Some(Hit::Start) => shell::open_start(),
+            Some(Hit::Task(index)) => self.tasks.click(index),
+            Some(Hit::Clock) => shell::open_notification_center(),
+            None => {}
+        }
     }
 
     fn on_explorer_restarted(&mut self) {
@@ -401,23 +488,33 @@ impl App {
         (rc.right - rc.left) as f32 * 96.0 / self.dpi as f32
     }
 
-    fn button_rects(&self) -> Vec<D2D_RECT_F> {
-        layout::center_buttons(self.bar_width_dip(), self.tasks.groups.len())
+    fn layout(&self) -> BarLayout {
+        BarLayout::new(self.bar_width_dip(), self.tasks.groups.len())
     }
 
-    /// Button index at a client-area pixel position.
-    fn button_at(&self, x: i32, y: i32) -> Option<usize> {
+    /// Element at a client-area pixel position.
+    fn hit_at(&self, x: i32, y: i32) -> Option<Hit> {
         let scale = 96.0 / self.dpi as f32;
-        layout::hit_test(&self.button_rects(), x as f32 * scale, y as f32 * scale)
+        self.layout().hit(x as f32 * scale, y as f32 * scale)
     }
 
-    fn scene(tasks: &TaskList, rects: Vec<D2D_RECT_F>) -> Scene<'_> {
-        let foreground = tasks.foreground;
-        let buttons = rects
-            .into_iter()
-            .zip(&tasks.groups)
-            .map(|(rect, group)| ButtonView {
-                rect,
+    fn pointer(&self, hit: Hit) -> Pointer {
+        Pointer {
+            hover: self.hover == Some(hit),
+            pressed: self.pressed == Some(hit),
+        }
+    }
+
+    fn scene(&self) -> Scene<'_> {
+        let layout = self.layout();
+        let foreground = self.tasks.foreground;
+        let buttons = layout
+            .tasks
+            .iter()
+            .zip(&self.tasks.groups)
+            .enumerate()
+            .map(|(i, (rect, group))| ButtonView {
+                rect: *rect,
                 icon: group.icon.as_ref(),
                 state: if group.contains(foreground) {
                     ButtonState::Active
@@ -426,10 +523,16 @@ impl App {
                 } else {
                     ButtonState::Running
                 },
+                pointer: self.pointer(Hit::Task(i)),
             })
             .collect();
         Scene {
+            palette: self.theme.palette(),
+            translucent: self.theme.acrylic,
+            start: (layout.start, self.pointer(Hit::Start)),
             buttons,
+            clock_rect: layout.clock,
+            clock_pointer: self.pointer(Hit::Clock),
             clock: clock::now(),
         }
     }
@@ -438,9 +541,13 @@ impl App {
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(self.hwnd, &raw mut ps);
-            let scene = Self::scene(&self.tasks, self.button_rects());
-            if let Err(err) = self.renderer.draw(self.hwnd, self.dpi, &scene) {
-                debug_log!("nitrobar: draw failed: {err}");
+            // The scene borrows `self`, so the renderer is moved out while drawing.
+            if let Some(mut renderer) = self.renderer.take() {
+                let result = renderer.draw(self.hwnd, self.dpi, &self.scene());
+                self.renderer = Some(renderer);
+                if let Err(err) = result {
+                    debug_log!("nitrobar: draw failed: {err}");
+                }
             }
             let _ = EndPaint(self.hwnd, &raw const ps);
         }

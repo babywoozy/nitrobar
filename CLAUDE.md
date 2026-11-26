@@ -17,7 +17,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon).
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB.
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -46,10 +46,25 @@ src/
   tasks.rs    danh sách cửa sổ, gom nhóm theo AppId, WinEvent hook, click/minimize
   icons.rs    icon thật -> IWICBitmap (AUMID/AppsFolder, WM_GETICON, icon file exe)
   menu.rs     menu chuột phải (TrackPopupMenu, chạy NGOÀI borrow của App)
+  theme.rs    sáng/tối + màu accent từ registry, Palette, nền acrylic (DWM), menu tối
+  shell.rs    mở UI của Windows bằng phím tắt giả lập (Start = Win, thông báo = Win+N)
 ```
 
-Dự kiến thêm: `start.rs` / `backdrop.rs` (GĐ3), `status/{network,volume,battery}.rs` (GĐ4),
-`config.rs` + `pins.rs` (GĐ5).
+Dự kiến thêm: `status/{network,volume,battery}.rs` (GĐ4), `config.rs` + `pins.rs` (GĐ5).
+
+### Giao diện (theme.rs, render.rs)
+
+- Màu lấy từ `Palette` (theme.rs), không hard-code màu trong render.rs. Theme đọc
+  `SystemUsesLightTheme` và `Explorer\Accent\AccentPalette` (tối dùng Light2, sáng dùng Dark1,
+  giống chỉ báo của taskbar Win11). Nạp lại khi có WM_SETTINGCHANGE / WM_THEMECHANGED /
+  WM_DWMCOLORIZATIONCOLORCHANGED.
+- Acrylic = `DwmExtendFrameIntoClientArea(-1)` + `DWMWA_SYSTEMBACKDROP_TYPE = TRANSIENTWINDOW`,
+  vẽ nền trong suốt + lớp tint `palette.background` có alpha. DWM chỉ vẽ backdrop cho cửa sổ
+  "active", nên wndproc luôn trả `WM_NCACTIVATE(TRUE)` (thanh là WS_EX_NOACTIVATE). Bỏ trick này
+  là nền thành màu xám đặc.
+- Khi trong suốt: text antialias GRAYSCALE (ClearType cần nền đặc).
+- Hover dùng `TrackMouseEvent(TME_LEAVE)`; nhấn giữ thu nhỏ icon (24 -> 20 DIP) như Win11.
+- Menu tối dùng uxtheme ordinal 135/136 (không công khai); nếu mất thì menu chỉ sáng lại.
 
 ### Danh sách app (tasks.rs)
 
@@ -110,9 +125,8 @@ Dự kiến thêm: `start.rs` / `backdrop.rs` (GĐ3), `status/{network,volume,ba
   qua các bản Windows 11). Ngoài phạm vi 5 giai đoạn; sẽ đánh giá riêng.
 - **Explorer tự hiện lại taskbar** (mở Start, đổi màn hình): đã có WinEvent hook EVENT_OBJECT_SHOW
   ẩn lại; cần theo dõi khi Windows cập nhật.
-- **Mở Start / Quick Settings**: không có API chính thức; dùng giả lập phím Win / Win+A.
-- **Mica/Acrylic** cho cửa sổ popup: `DWMWA_SYSTEMBACKDROP_TYPE` cần Windows 11 22H2+, và
-  phải vẽ nền có alpha (software target hiện tại hỗ trợ premultiplied alpha).
-- **Icon thật của app UWP/packaged**: `WM_GETICON` không có; cần `SHGetPropertyStoreForWindow`
-  + AppUserModelID.
+- **Mở Start / Quick Settings**: không có API chính thức; dùng giả lập phím Win / Win+A / Win+N
+  (`SendInput`, chỉ khi người dùng vừa bấm vào thanh).
+- **Acrylic**: `DWMWA_SYSTEMBACKDROP_TYPE` cần Windows 11 22H2+; máy cũ hơn tự về nền đặc.
+- **Icon app UWP/packaged**: đã giải quyết bằng AUMID -> `shell:AppsFolder` image factory.
 - **Đa màn hình**: giai đoạn 1 chỉ màn hình chính.
