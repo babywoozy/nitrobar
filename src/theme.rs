@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Dwm::{
-    DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_TRANSIENTWINDOW,
+    DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_DONOTROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
@@ -92,8 +92,10 @@ fn accent_palette() -> Option<[u8; 32]> {
 
 impl Theme {
     /// Reads the current Windows mode ("SystemUsesLightTheme") and accent color.
-    pub fn from_system() -> Self {
-        let light = reg_dword(PERSONALIZE, w!("SystemUsesLightTheme")) == Some(1);
+    /// `force_light` overrides the mode (config `theme = "dark" / "light"`).
+    pub fn from_system(force_light: Option<bool>) -> Self {
+        let light = force_light
+            .unwrap_or_else(|| reg_dword(PERSONALIZE, w!("SystemUsesLightTheme")) == Some(1));
         // Same shades the Windows 11 taskbar uses for its indicator.
         let index = if light { 4 } else { 1 };
         let accent = accent_palette().map_or(
@@ -152,9 +154,10 @@ impl Theme {
     }
 }
 
-/// Dark title-bar mode, square corners and the acrylic system backdrop.
-/// Returns false where unsupported (Windows 10, Windows 11 before 22H2): draw opaque then.
-pub fn apply_backdrop(hwnd: HWND, theme: &Theme) -> bool {
+/// Dark title-bar mode, square corners and (if `acrylic`) the acrylic system backdrop.
+/// Returns whether acrylic is active; false where unsupported (Windows 10, Windows 11
+/// before 22H2) or disabled in the config: the bar is drawn opaque then.
+pub fn apply_backdrop(hwnd: HWND, theme: &Theme, acrylic: bool) -> bool {
     unsafe {
         let dark = BOOL::from(!theme.light);
         let _ = DwmSetWindowAttribute(
@@ -170,25 +173,31 @@ pub fn apply_backdrop(hwnd: HWND, theme: &Theme) -> bool {
             (&raw const corners).cast::<c_void>(),
             size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
         );
-        // The whole client area becomes "frame", so DWM composes the backdrop under
-        // every pixel we leave transparent.
+        // With acrylic the whole client area becomes "frame", so DWM composes the
+        // backdrop under every pixel we leave transparent.
+        let extend = if acrylic { -1 } else { 0 };
         let margins = MARGINS {
-            cxLeftWidth: -1,
-            cxRightWidth: -1,
-            cyTopHeight: -1,
-            cyBottomHeight: -1,
+            cxLeftWidth: extend,
+            cxRightWidth: extend,
+            cyTopHeight: extend,
+            cyBottomHeight: extend,
         };
         if DwmExtendFrameIntoClientArea(hwnd, &raw const margins).is_err() {
             return false;
         }
-        let backdrop: DWM_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENTWINDOW;
-        DwmSetWindowAttribute(
+        let backdrop: DWM_SYSTEMBACKDROP_TYPE = if acrylic {
+            DWMSBT_TRANSIENTWINDOW
+        } else {
+            DWMSBT_NONE
+        };
+        let applied = DwmSetWindowAttribute(
             hwnd,
             DWMWA_SYSTEMBACKDROP_TYPE,
             (&raw const backdrop).cast::<c_void>(),
             size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
         )
-        .is_ok()
+        .is_ok();
+        acrylic && applied
     }
 }
 

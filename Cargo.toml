@@ -12,6 +12,9 @@ publish = false
 # Already a dependency of `windows`; listed directly because `#[implement]` (COM
 # callbacks in status/volume.rs) expands to `::windows_core` paths.
 windows-core = "0.62"
+# config.toml / pins.toml. Default features off: no datetime/indexmap extras.
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["std", "parse", "display", "serde"] }
 
 [dependencies.windows]
 version = "0.62"
@@ -31,6 +34,7 @@ features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WiFi",
     "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
     "Win32_Storage_EnhancedStorage",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

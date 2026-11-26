@@ -31,7 +31,7 @@ use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::clock::ClockText;
 use crate::icons::Icon;
-use crate::layout;
+use crate::layout::{self, Metrics};
 use crate::status::StatusView;
 use crate::theme::Palette;
 
@@ -45,6 +45,8 @@ const CLOCK_FONT_SIZE: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ButtonState {
+    /// Pinned but not running: no indicator.
+    Pinned,
     Running,
     Active,
     Attention,
@@ -65,6 +67,7 @@ pub struct ButtonView<'a> {
 }
 
 pub struct Scene<'a> {
+    pub metrics: Metrics,
     pub palette: Palette,
     /// True when DWM draws an acrylic backdrop under transparent pixels.
     pub translucent: bool,
@@ -262,10 +265,16 @@ impl Renderer {
             }
         }
 
-        Self::draw_start(&target, palette, scene.start.0, scene.start.1);
+        Self::draw_start(
+            &target,
+            palette,
+            &scene.metrics,
+            scene.start.0,
+            scene.start.1,
+        );
         let mut used = Vec::with_capacity(scene.buttons.len());
         for button in &scene.buttons {
-            Self::draw_button(&mut target, palette, button, &mut used);
+            Self::draw_button(&mut target, palette, &scene.metrics, button, &mut used);
         }
         target.bitmaps.retain(|id, _| used.contains(id));
         self.draw_status(&target, scene);
@@ -317,12 +326,18 @@ impl Renderer {
     }
 
     /// The four-pane Windows logo, drawn as vectors so it is crisp at any DPI.
-    fn draw_start(target: &Target, palette: &Palette, rect: D2D_RECT_F, pointer: Pointer) {
+    fn draw_start(
+        target: &Target,
+        palette: &Palette,
+        metrics: &Metrics,
+        rect: D2D_RECT_F,
+        pointer: Pointer,
+    ) {
         Self::draw_button_background(target, palette, rect, false, pointer);
         let size = if pointer.pressed {
-            layout::START_LOGO_SIZE * 0.85
+            metrics.start_logo_size() * 0.85
         } else {
-            layout::START_LOGO_SIZE
+            metrics.start_logo_size()
         };
         let logo = layout::centered_square(&rect, size, 0.0);
         let gap = size * 0.06;
@@ -367,6 +382,7 @@ impl Renderer {
     fn draw_button(
         target: &mut Target,
         palette: &Palette,
+        metrics: &Metrics,
         button: &ButtonView,
         used: &mut Vec<u64>,
     ) {
@@ -384,11 +400,13 @@ impl Renderer {
         }
 
         let icon_size = if button.pointer.pressed {
-            layout::ICON_SIZE_PRESSED
+            metrics.pressed_icon_size()
         } else {
-            layout::ICON_SIZE
+            metrics.icon_size
         };
-        let icon_rect = layout::centered_square(&rect, icon_size, -1.0);
+        // Nudge the icon away from the indicator side.
+        let nudge = if metrics.at_top { 1.0 } else { -1.0 };
+        let icon_rect = layout::centered_square(&rect, icon_size, nudge);
         let bitmap = button.icon.and_then(|icon| {
             used.push(icon.id);
             Self::icon_bitmap(target, icon)
@@ -407,11 +425,12 @@ impl Renderer {
         }
 
         let (width, color) = match button.state {
+            ButtonState::Pinned => return,
             ButtonState::Running => (layout::INDICATOR_RUNNING_WIDTH, &palette.indicator),
             ButtonState::Active => (layout::INDICATOR_ACTIVE_WIDTH, &palette.accent),
             ButtonState::Attention => (layout::INDICATOR_ACTIVE_WIDTH, &palette.attention),
         };
-        let pill = layout::indicator(&rect, width);
+        let pill = layout::indicator(&rect, width, metrics.at_top);
         Self::fill_rounded(target, pill, layout::INDICATOR_HEIGHT / 2.0, color);
     }
 
@@ -475,13 +494,20 @@ impl Renderer {
         let right = rect.right - layout::CLOCK_TEXT_PADDING;
         let left = rect.left;
         let mid = (rect.top + rect.bottom) / 2.0;
-        let lines = [
+        let half = layout::CLOCK_LINE_HEIGHT / 2.0;
+        let two_lines = [
             (&scene.clock.time, mid - layout::CLOCK_LINE_HEIGHT, mid),
             (&scene.clock.date, mid, mid + layout::CLOCK_LINE_HEIGHT),
         ];
+        let one_line = [(&scene.clock.time, mid - half, mid + half)];
+        let lines: &[(&Vec<u16>, f32, f32)] = if scene.clock.date.is_empty() {
+            &one_line
+        } else {
+            &two_lines
+        };
         unsafe {
             target.brush.SetColor(&raw const scene.palette.text);
-            for (text, top, bottom) in lines {
+            for &(text, top, bottom) in lines {
                 let line = D2D_RECT_F {
                     left,
                     top,

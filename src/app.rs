@@ -7,22 +7,29 @@
 
 use std::cell::RefCell;
 
-use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
+};
+use windows::Win32::Storage::FileSystem::{
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindCloseChangeNotification,
+    FindFirstChangeNotificationW, FindNextChangeNotification,
 };
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{ABN_FULLSCREENAPP, ABN_POSCHANGED};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DeregisterShellHookWindow, DispatchMessageW, FindWindowW,
-    GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, HWND_BOTTOM, HWND_TOPMOST,
-    IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HWND_BOTTOM, HWND_TOPMOST, IDC_ARROW,
+    KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterShellHookWindow, RegisterWindowMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
@@ -31,19 +38,26 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, PBT_APMPOWERSTATUSCHANGE, PBT_POWERSETTINGCHANGE,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_MOUSEMOVE, WM_NCACTIVATE, WM_POWERBROADCAST,
-    WM_THEMECHANGED,
+    GetWindowRect, MsgWaitForMultipleObjects, PBT_APMPOWERSTATUSCHANGE, PBT_POWERSETTINGCHANGE,
+    PM_REMOVE, PeekMessageW, QS_ALLINPUT, WM_DWMCOLORIZATIONCOLORCHANGED, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_NCACTIVATE, WM_POWERBROADCAST, WM_QUIT, WM_THEMECHANGED,
 };
-use windows::core::{PCWSTR, Result, w};
+use windows::core::{HSTRING, PCWSTR, Result, w};
 
+use crate::config::{self, Alignment, Config, Position, ThemeMode};
 use crate::icons::IconLoader;
-use crate::layout::{BarLayout, Hit};
+use crate::layout::{BarLayout, Hit, Metrics};
+use crate::pins::{self, Pins};
 use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
 use crate::status::{self, Status};
+use crate::tasks::AppId;
 use crate::tasks::{self, TaskList};
+use crate::theme::Palette;
 use crate::theme::{self, Theme};
 use crate::{appbar, clock, layout, menu, safety, shell, taskbar};
+
+/// Posted by the message loop when a file in the config directory changed.
+const WM_APP_CONFIG: u32 = WM_APP + 5;
 
 const CLASS_NAME: PCWSTR = w!("NitrobarWindow");
 const TIMER_CLOCK: usize = 1;
@@ -74,11 +88,42 @@ struct App {
     /// Started in `init` (needs the window); `None` after cleanup.
     status: Option<Status>,
     theme: Theme,
+    config: Config,
+    /// Last config.toml parse error (shown in the context menu).
+    config_error: Option<String>,
+    metrics: Metrics,
+    pins: Pins,
+    /// Whether we currently keep the native taskbar hidden.
+    native_hidden: bool,
     /// Element under the pointer, and whether we asked for WM_MOUSELEAVE.
     hover: Option<Hit>,
     tracking_mouse: bool,
     /// Element under the last left-button press, while the button is held.
     pressed: Option<Hit>,
+}
+
+/// One app button: a pinned app, a running app, or a pinned app that is running.
+#[derive(Clone, Copy)]
+struct BarItem {
+    pin: Option<usize>,
+    group: Option<usize>,
+}
+
+fn metrics_for(config: &Config) -> Metrics {
+    Metrics::new(
+        config.bar.height,
+        config.bar.icon_size,
+        config.bar.alignment == Alignment::Left,
+        config.bar.position == Position::Top,
+    )
+}
+
+fn forced_light(config: &Config) -> Option<bool> {
+    match config.bar.theme {
+        ThemeMode::Auto => None,
+        ThemeMode::Dark => Some(false),
+        ThemeMode::Light => Some(true),
+    }
 }
 
 fn scale(dip: f32, dpi: u32) -> i32 {
@@ -107,6 +152,10 @@ pub fn run(options: Options) -> Result<()> {
 fn run_window(options: Options) -> Result<()> {
     let renderer = Renderer::new()?;
     let icons = IconLoader::new()?;
+    let (config, config_error) = match config::load() {
+        Ok(config) => (config, None),
+        Err(err) => (Config::default(), Some(err)),
+    };
     unsafe {
         let instance = GetModuleHandleW(None)?.into();
         let class = WNDCLASSEXW {
@@ -150,7 +199,12 @@ fn run_window(options: Options) -> Result<()> {
             icon_px: 0,
             tasks: TaskList::new(hwnd),
             status: None,
-            theme: Theme::from_system(),
+            theme: Theme::from_system(forced_light(&config)),
+            metrics: metrics_for(&config),
+            config,
+            config_error,
+            pins: Pins::load(),
+            native_hidden: false,
             hover: None,
             tracking_mouse: false,
             pressed: None,
@@ -159,13 +213,50 @@ fn run_window(options: Options) -> Result<()> {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, cell as isize);
         SendMessageW(hwnd, WM_APP_INIT, None, None);
 
-        let mut msg = MSG::default();
-        while GetMessageW(&raw mut msg, None, 0, 0).0 > 0 {
-            let _ = TranslateMessage(&raw const msg);
-            DispatchMessageW(&raw const msg);
-        }
+        message_loop(hwnd);
     }
     Ok(())
+}
+
+/// Starts watching the config directory (no thread: the handle is waited on by
+/// the message loop itself).
+fn watch_config_dir() -> Option<HANDLE> {
+    let dir = config::dir()?;
+    let _ = std::fs::create_dir_all(&dir);
+    unsafe {
+        FindFirstChangeNotificationW(
+            &HSTRING::from(dir.as_os_str()),
+            false,
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME,
+        )
+    }
+    .ok()
+}
+
+/// A normal message loop that also wakes up when the config directory changes.
+fn message_loop(hwnd: HWND) {
+    let watch = watch_config_dir();
+    let handles: Vec<HANDLE> = watch.into_iter().collect();
+    let mut msg = MSG::default();
+    unsafe {
+        'outer: loop {
+            let wait = MsgWaitForMultipleObjects(Some(&handles), false, INFINITE, QS_ALLINPUT);
+            if !handles.is_empty() && wait == WAIT_OBJECT_0 {
+                let _ = FindNextChangeNotification(handles[0]);
+                let _ = PostMessageW(Some(hwnd), WM_APP_CONFIG, WPARAM(0), LPARAM(0));
+            }
+            while PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    break 'outer;
+                }
+                let _ = TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
+            }
+        }
+        if let Some(handle) = watch {
+            let _ = FindCloseChangeNotification(handle);
+        }
+    }
 }
 
 /// Runs `f` with the window's `App`, or returns `None` if it is unavailable / already borrowed.
@@ -213,36 +304,51 @@ fn show_context_menu(hwnd: HWND, lparam: LPARAM) {
     let mut bar = RECT::default();
     unsafe {
         let _ = ScreenToClient(hwnd, &raw mut client);
-        // Open upwards from the top edge of the bar, like the Windows 11 taskbar.
-        if GetWindowRect(hwnd, &raw mut bar).is_ok() {
-            screen.y = bar.top;
-        }
+        let _ = GetWindowRect(hwnd, &raw mut bar);
     }
-    let target = with_app(hwnd, |app| match app.hit_at(client.x, client.y) {
-        Some(Hit::Task(i)) => app
-            .tasks
-            .groups
-            .get(i)
-            .map(|g| (g.key.clone(), g.windows.len())),
-        _ => None,
-    })
-    .flatten();
-    let window_count = target.as_ref().map_or(0, |(_, count)| *count);
+    // (key, app) of the right-clicked app button, plus the menu description.
+    let Some((target, ctx)) = with_app(hwnd, |app| {
+        let target = match app.hit_at(client.x, client.y) {
+            Some(Hit::Task(i)) => app.items().get(i).map(|item| app.item_app(*item)),
+            _ => None,
+        };
+        let ctx = menu::MenuContext {
+            on_app: target.is_some(),
+            pinned: target
+                .as_ref()
+                .is_some_and(|(key, _)| app.pins.contains(key)),
+            window_count: target
+                .as_ref()
+                .and_then(|(key, _)| app.tasks.group_index(key))
+                .map_or(0, |g| app.tasks.groups[g].windows.len()),
+            config_error: app.config_error.clone(),
+            at_top: app.metrics.at_top,
+        };
+        (target, ctx)
+    }) else {
+        return;
+    };
+    // Open away from the screen edge, from the bar's inner edge, like the Windows 11 taskbar.
+    screen.y = if ctx.at_top { bar.bottom } else { bar.top };
 
-    match menu::show(hwnd, screen, window_count) {
-        Some(menu::Command::Exit) => unsafe {
+    let Some(command) = menu::show(hwnd, screen, &ctx) else {
+        return;
+    };
+    match command {
+        menu::Command::Exit => unsafe {
             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         },
-        Some(menu::Command::CloseWindows) => {
-            if let Some((key, _)) = target {
-                with_app(hwnd, |app| {
-                    if let Some(index) = app.tasks.group_index(&key) {
-                        app.tasks.close_group(index);
-                    }
-                });
+        menu::Command::OpenConfig => {
+            if let Some(path) = config::path() {
+                pins::open_file(&path);
             }
         }
-        None => {}
+        menu::Command::Pin | menu::Command::Unpin | menu::Command::CloseWindows => {
+            let Some((key, app_id)) = target else {
+                return;
+            };
+            with_app(hwnd, |app| app.on_app_command(command, &key, app_id));
+        }
     }
 }
 
@@ -259,6 +365,7 @@ impl App {
         }
         match msg {
             WM_APP_INIT => self.init(),
+            WM_APP_CONFIG => self.reload_config(),
             tasks::WM_APP_REFRESH => self.refresh_tasks(),
             status::WM_APP_STATUS => self.refresh_status(),
             WM_POWERBROADCAST => {
@@ -310,6 +417,15 @@ impl App {
                 }
                 self.invalidate();
             }
+            WM_MBUTTONUP => {
+                // Middle click: start another instance, like Windows.
+                let (x, y) = mouse_pos(lparam);
+                if let Some(Hit::Task(i)) = self.hit_at(x, y)
+                    && let Some(item) = self.items().get(i).copied()
+                {
+                    pins::launch(&self.item_app(item).1);
+                }
+            }
             WM_QUERYENDSESSION => return Some(LRESULT(1)),
             WM_ENDSESSION => {
                 if wparam.0 != 0 {
@@ -328,9 +444,7 @@ impl App {
 
     fn init(&mut self) {
         self.apply_theme();
-        if self.options.hide_taskbar {
-            taskbar::hide();
-        }
+        self.apply_native_taskbar();
         appbar::register(self.hwnd);
         self.reposition();
         tasks::install_hooks(self.hwnd);
@@ -339,6 +453,7 @@ impl App {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.status = Some(Status::new(self.hwnd));
+        self.pins.load_icons(&self.icons, self.icon_px, false);
         self.refresh_tasks();
         self.tick_clock();
     }
@@ -346,16 +461,122 @@ impl App {
     fn refresh_status(&mut self) {
         let sources = status::take_pending();
         if let Some(status) = &mut self.status {
-            let before = status.view();
+            let before = status.view(true);
             status.refresh(sources);
-            if status.view() != before {
+            if status.view(true) != before {
                 self.invalidate();
             }
         }
     }
 
+    fn wants_native_hidden(&self) -> bool {
+        self.options.hide_taskbar || self.config.bar.hide_native_taskbar
+    }
+
+    fn apply_native_taskbar(&mut self) {
+        let wanted = self.wants_native_hidden();
+        if wanted && !self.native_hidden {
+            taskbar::hide();
+        } else if !wanted && self.native_hidden {
+            taskbar::restore();
+        }
+        self.native_hidden = wanted;
+    }
+
+    /// config.toml changed on disk: re-apply if it parses and differs.
+    fn reload_config(&mut self) {
+        match config::load() {
+            Ok(config) => {
+                self.config_error = None;
+                if config != self.config {
+                    self.config = config;
+                    self.metrics = metrics_for(&self.config);
+                    self.theme = Theme::from_system(forced_light(&self.config));
+                    self.apply_theme();
+                    self.apply_native_taskbar();
+                    self.reposition();
+                }
+            }
+            Err(err) => {
+                debug_log!("nitrobar: config.toml: {err}");
+                self.config_error = Some(err);
+            }
+        }
+    }
+
+    /// Theme palette with the `[colors]` overrides from the config.
+    fn palette(&self) -> Palette {
+        let mut palette = self.theme.palette();
+        let colors = &self.config.colors;
+        if let Some(c) = config::parse_color(&colors.background) {
+            palette.background = c;
+        }
+        if let Some(c) = config::parse_color(&colors.text) {
+            palette.text = c;
+        }
+        if let Some(c) = config::parse_color(&colors.accent) {
+            palette.accent = c;
+        }
+        palette
+    }
+
+    /// Pinned apps first (in pin order, merged with their running windows), then
+    /// running apps that are not pinned.
+    fn items(&self) -> Vec<BarItem> {
+        let mut items: Vec<BarItem> = self
+            .pins
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, pin)| BarItem {
+                pin: Some(i),
+                group: self.tasks.group_index(&pin.key),
+            })
+            .collect();
+        items.extend(
+            self.tasks
+                .groups
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| !self.pins.contains(&g.key))
+                .map(|(i, _)| BarItem {
+                    pin: None,
+                    group: Some(i),
+                }),
+        );
+        items
+    }
+
+    /// Grouping key and identity of an item.
+    fn item_app(&self, item: BarItem) -> (String, AppId) {
+        if let Some(group) = item.group.and_then(|g| self.tasks.groups.get(g)) {
+            return (group.key.clone(), group.app.clone());
+        }
+        item.pin
+            .and_then(|p| self.pins.items.get(p))
+            .map(|pin| (pin.key.clone(), pin.app.clone()))
+            .unwrap_or_default()
+    }
+
+    fn on_app_command(&mut self, command: menu::Command, key: &str, app: AppId) {
+        match command {
+            menu::Command::Pin => {
+                self.pins.pin(app);
+                self.pins.load_icons(&self.icons, self.icon_px, false);
+            }
+            menu::Command::Unpin => self.pins.unpin(key),
+            menu::Command::CloseWindows => {
+                if let Some(index) = self.tasks.group_index(key) {
+                    self.tasks.close_group(index);
+                }
+            }
+            menu::Command::OpenConfig | menu::Command::Exit => {}
+        }
+        self.invalidate();
+    }
+
     fn apply_theme(&mut self) {
-        self.theme.acrylic = theme::apply_backdrop(self.hwnd, &self.theme);
+        self.theme.acrylic = theme::apply_backdrop(self.hwnd, &self.theme, self.config.bar.acrylic);
         theme::apply_menu_theme(self.theme.light);
         unsafe {
             SendMessageW(self.hwnd, WM_NCACTIVATE, Some(WPARAM(1)), None);
@@ -363,7 +584,7 @@ impl App {
     }
 
     fn reload_theme(&mut self) {
-        let fresh = Theme::from_system();
+        let fresh = Theme::from_system(forced_light(&self.config));
         if fresh.light != self.theme.light || fresh.accent != self.theme.accent {
             self.theme = fresh;
             self.apply_theme();
@@ -395,7 +616,17 @@ impl App {
     fn activate(&mut self, hit: Option<Hit>) {
         match hit {
             Some(Hit::Start) => shell::open_start(),
-            Some(Hit::Task(index)) => self.tasks.click(index),
+            Some(Hit::Task(index)) => match self.items().get(index).copied() {
+                Some(BarItem {
+                    group: Some(group), ..
+                }) => self.tasks.click(group),
+                Some(BarItem { pin: Some(pin), .. }) => {
+                    if let Some(pin) = self.pins.items.get(pin) {
+                        pins::launch(&pin.app);
+                    }
+                }
+                _ => {}
+            },
             Some(Hit::Status) => shell::open_quick_settings(),
             Some(Hit::Clock) => shell::open_notification_center(),
             None => {}
@@ -406,7 +637,7 @@ impl App {
         // Explorer forgets appbars when it restarts.
         appbar::unregister(self.hwnd);
         appbar::register(self.hwnd);
-        if self.options.hide_taskbar {
+        if self.native_hidden {
             taskbar::rehide();
         }
         self.reposition();
@@ -453,7 +684,7 @@ impl App {
         }
     }
 
-    /// Docks the bar to the bottom of the primary monitor at the current DPI.
+    /// Docks the bar to the top or bottom of the primary monitor at the current DPI.
     fn reposition(&mut self) {
         unsafe {
             let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
@@ -469,8 +700,8 @@ impl App {
             {
                 self.dpi = dpi_x;
             }
-            let height = scale(layout::BAR_HEIGHT, self.dpi);
-            let rc = appbar::set_pos(self.hwnd, info.rcMonitor, height);
+            let height = scale(self.metrics.bar_height, self.dpi);
+            let rc = appbar::set_pos(self.hwnd, info.rcMonitor, height, self.metrics.at_top);
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(self.z_order()),
@@ -481,10 +712,11 @@ impl App {
                 SWP_NOACTIVATE,
             );
         }
-        let icon_px = scale(layout::ICON_SIZE, self.dpi) as u32;
+        let icon_px = scale(self.metrics.icon_size, self.dpi) as u32;
         if icon_px != self.icon_px {
             self.icon_px = icon_px;
             self.tasks.reload_icons(&self.icons, icon_px);
+            self.pins.load_icons(&self.icons, icon_px, true);
         }
         self.invalidate();
     }
@@ -522,12 +754,22 @@ impl App {
         (rc.right - rc.left) as f32 * 96.0 / self.dpi as f32
     }
 
+    fn status_view(&self) -> status::StatusView {
+        self.status
+            .as_ref()
+            .map(|s| s.view(self.config.status.show_battery_percent))
+            .unwrap_or_default()
+    }
+
     fn layout(&self) -> BarLayout {
-        let width = self.status.as_ref().map_or(0.0, |s| {
-            let view = s.view();
-            layout::status_width(view.icons.len(), view.percent.is_some())
-        });
-        BarLayout::new(self.bar_width_dip(), self.tasks.groups.len(), width)
+        let view = self.status_view();
+        let width = layout::status_width(view.icons.len(), view.percent.is_some());
+        BarLayout::new(
+            self.bar_width_dip(),
+            self.items().len(),
+            width,
+            &self.metrics,
+        )
     }
 
     /// Element at a client-area pixel position.
@@ -549,32 +791,42 @@ impl App {
         let buttons = layout
             .tasks
             .iter()
-            .zip(&self.tasks.groups)
+            .zip(self.items())
             .enumerate()
-            .map(|(i, (rect, group))| ButtonView {
-                rect: *rect,
-                icon: group.icon.as_ref(),
-                state: if group.contains(foreground) {
-                    ButtonState::Active
-                } else if group.attention {
-                    ButtonState::Attention
-                } else {
-                    ButtonState::Running
-                },
-                pointer: self.pointer(Hit::Task(i)),
+            .map(|(i, (rect, item))| {
+                let group = item.group.and_then(|g| self.tasks.groups.get(g));
+                let pin = item.pin.and_then(|p| self.pins.items.get(p));
+                ButtonView {
+                    rect: *rect,
+                    icon: group
+                        .and_then(|g| g.icon.as_ref())
+                        .or_else(|| pin.and_then(|p| p.icon.as_ref())),
+                    state: match group {
+                        None => ButtonState::Pinned,
+                        Some(g) if g.contains(foreground) => ButtonState::Active,
+                        Some(g) if g.attention => ButtonState::Attention,
+                        Some(_) => ButtonState::Running,
+                    },
+                    pointer: self.pointer(Hit::Task(i)),
+                }
             })
             .collect();
+        let mut clock = clock::now();
+        if !self.config.clock.show_date {
+            clock.date.clear();
+        }
         Scene {
-            palette: self.theme.palette(),
+            metrics: self.metrics,
+            palette: self.palette(),
             translucent: self.theme.acrylic,
             start: (layout.start, self.pointer(Hit::Start)),
             buttons,
             status_rect: layout.status,
             status_pointer: self.pointer(Hit::Status),
-            status: self.status.as_ref().map(Status::view).unwrap_or_default(),
+            status: self.status_view(),
             clock_rect: layout.clock,
             clock_pointer: self.pointer(Hit::Clock),
-            clock: clock::now(),
+            clock,
         }
     }
 

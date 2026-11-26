@@ -121,7 +121,7 @@ impl Status {
         self.battery = battery::read();
     }
 
-    pub fn view(&self) -> StatusView {
+    pub fn view(&self, show_percent: bool) -> StatusView {
         let mut icons = Vec::with_capacity(3);
         icons.push(match self.net {
             NetState::Wifi {
@@ -166,7 +166,9 @@ impl Status {
                 glyph: base + step,
                 track: None,
             });
-            percent = Some(format!("{}%", battery.percent).encode_utf16().collect());
+            if show_percent {
+                percent = Some(format!("{}%", battery.percent).encode_utf16().collect());
+            }
         }
         StatusView { icons, percent }
     }

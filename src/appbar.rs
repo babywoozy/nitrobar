@@ -2,8 +2,8 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::UI::Shell::{
-    ABE_BOTTOM, ABM_ACTIVATE, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, ABM_WINDOWPOSCHANGED,
-    APPBARDATA, SHAppBarMessage,
+    ABE_BOTTOM, ABE_TOP, ABM_ACTIVATE, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS,
+    ABM_WINDOWPOSCHANGED, APPBARDATA, SHAppBarMessage,
 };
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
@@ -32,19 +32,30 @@ pub fn unregister(hwnd: HWND) {
     }
 }
 
-/// Docks the bar to the bottom of `monitor` and returns the rectangle the shell granted.
-pub fn set_pos(hwnd: HWND, monitor: RECT, height: i32) -> RECT {
+/// Docks the bar to the top or bottom of `monitor`; returns the rectangle the shell granted.
+pub fn set_pos(hwnd: HWND, monitor: RECT, height: i32, top: bool) -> RECT {
     let mut d = data(hwnd);
-    d.uEdge = ABE_BOTTOM;
-    d.rc = RECT {
-        top: monitor.bottom - height,
-        ..monitor
+    d.uEdge = if top { ABE_TOP } else { ABE_BOTTOM };
+    d.rc = if top {
+        RECT {
+            bottom: monitor.top + height,
+            ..monitor
+        }
+    } else {
+        RECT {
+            top: monitor.bottom - height,
+            ..monitor
+        }
     };
     unsafe {
-        SHAppBarMessage(ABM_QUERYPOS, &mut d);
-        // The shell may move `bottom` up (another appbar on this edge); keep our height.
-        d.rc.top = d.rc.bottom - height;
-        SHAppBarMessage(ABM_SETPOS, &mut d);
+        SHAppBarMessage(ABM_QUERYPOS, &raw mut d);
+        // The shell may move our edge (another appbar there); keep our height.
+        if top {
+            d.rc.bottom = d.rc.top + height;
+        } else {
+            d.rc.top = d.rc.bottom - height;
+        }
+        SHAppBarMessage(ABM_SETPOS, &raw mut d);
     }
     d.rc
 }

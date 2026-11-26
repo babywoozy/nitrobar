@@ -8,6 +8,7 @@ Taskbar thay thế cho Windows 11, viết bằng Rust. Ưu tiên số 1: **nhẹ
 cargo build --release                               # build chính thức
 cargo clippy --release --all-targets -- -D warnings # phải sạch trước khi commit
 cargo fmt                                           # format trước khi commit
+cargo test --release                                # unit test (config, layout)
 .\target\release\nitrobar.exe [--hide-taskbar]      # chạy
 .\target\release\nitrobar.exe --quit                # tắt instance đang chạy
 .\target\release\nitrobar.exe --restore-taskbar     # cứu taskbar gốc nếu bị kẹt ẩn
@@ -17,7 +18,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB.
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB; GĐ5 9.2 MB / 33 MB, exe 486 KB.
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -27,9 +28,10 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Phụ thuộc
 
-- Chỉ dùng crate `windows` (windows-rs) + `windows-core` (cho `#[implement]`). Không dùng framework
-  GUI (egui, Tauri, webview, winit...).
-- Thêm crate mới phải có lý do rõ ràng (ví dụ `toml` + `serde` cho giai đoạn 5) và ghi vào đây.
+- Crate đang dùng: `windows` (Win32), `windows-core` (cho `#[implement]`), `serde` (derive) +
+  `toml` (tắt default features) cho config.toml / pins.toml. Không dùng framework GUI (egui,
+  Tauri, webview, winit...).
+- Thêm crate mới phải có lý do rõ ràng và ghi vào đây.
 - Feature của `windows` bật tối thiểu; thêm feature khi cần, giữ danh sách theo thứ tự ABC.
 
 ## Kiến trúc
@@ -52,9 +54,21 @@ src/
               thông báo = Win+N)
   status/     wifi / âm lượng / pin: mod.rs (gộp thông báo, StatusView), network.rs,
               volume.rs (COM callback), battery.rs
+  config.rs   %APPDATA%\nitrobar\config.toml: parse + clamp, file mặc định có chú thích, màu
+  pins.rs     %APPDATA%\nitrobar\pins.toml (app tự ghi), mở app qua shell:AppsFolder / exe
 ```
 
-Dự kiến thêm: `config.rs` + `pins.rs` (GĐ5).
+### Cấu hình và ghim (config.rs, pins.rs)
+
+- `DEFAULT_CONFIG` (có chú thích) phải parse ra đúng `Config::default()`: có unit test. Thêm
+  khoá mới thì sửa cả hai, cả README.
+- Tải lại trực tiếp: `FindFirstChangeNotificationW` trên thư mục config, handle được chờ ngay
+  trong message loop (`MsgWaitForMultipleObjects`), không có thread riêng. File lỗi -> giữ
+  config cũ, lỗi hiện thành mục mờ trong menu chuột phải.
+- Kích thước lấy từ `layout::Metrics` (theo config), không dùng hằng số cố định cho thanh/nút/icon.
+- Pins tách khỏi config.toml để app ghi lại mà không xoá chú thích của người dùng.
+- Thứ tự nút: app ghim (theo thứ tự ghim, gộp với nhóm đang chạy cùng key) rồi app đang chạy
+  chưa ghim. `Hit::Task(i)` là chỉ số trong danh sách gộp này (`App::items()`).
 
 ### Trạng thái hệ thống (status/)
 
@@ -138,6 +152,10 @@ Dự kiến thêm: `config.rs` + `pins.rs` (GĐ5).
 - Thử tương tác bằng một cửa sổ riêng (ví dụ WinForms tiêu đề `nitrobar-test`), KHÔNG bấm vào
   cửa sổ thật của người dùng. Notepad Win11 là app đóng gói và tự mở lại tab cũ: không dùng để test.
 - Gửi click giả bằng `PostMessage(WM_LBUTTONDOWN/UP)` vào cửa sổ thanh; `WM_CONTEXTMENU` cho menu.
+- Dò vị trí nút theo pixel chỉ đúng khi nền đặc: khi test, tạm đặt `acrylic = false` +
+  `background = "#202020"` trong config.toml (áp dụng trực tiếp) rồi trả lại file cũ.
+- Trước khi chọn mục menu bằng phím, chụp ảnh menu để chắc đúng menu: một lần chọn nhầm
+  "Mở file cấu hình" đã mở tab config.toml trong VS Code của người dùng.
 
 ## Rủi ro / phần khó đã biết
 
@@ -150,4 +168,5 @@ Dự kiến thêm: `config.rs` + `pins.rs` (GĐ5).
   (`SendInput`, chỉ khi người dùng vừa bấm vào thanh).
 - **Acrylic**: `DWMWA_SYSTEMBACKDROP_TYPE` cần Windows 11 22H2+; máy cũ hơn tự về nền đặc.
 - **Icon app UWP/packaged**: đã giải quyết bằng AUMID -> `shell:AppsFolder` image factory.
-- **Đa màn hình**: giai đoạn 1 chỉ màn hình chính.
+- **Đa màn hình**: thanh chỉ ở màn hình chính.
+- **Xem trước cửa sổ khi hover** (thumbnail): chưa làm; `DwmRegisterThumbnail` là hướng đi.

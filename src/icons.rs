@@ -64,6 +64,18 @@ impl IconLoader {
         Some(Icon { id, bitmap })
     }
 
+    /// Icon of an app that may not be running (pinned): AppsFolder entry, else the exe.
+    pub fn load_app(&self, app: &AppId, px: u32) -> Option<Icon> {
+        let bitmap = app
+            .aumid
+            .as_deref()
+            .and_then(|aumid| self.apps_folder_bitmap(aumid, px))
+            .or_else(|| app.exe.as_deref().and_then(|exe| self.file_bitmap(exe, px)))?;
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        Some(Icon { id, bitmap })
+    }
+
     fn apps_folder_bitmap(&self, aumid: &str, px: u32) -> Option<IWICBitmap> {
         let factory: IShellItemImageFactory = unsafe {
             SHCreateItemInKnownFolder(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, &HSTRING::from(aumid))

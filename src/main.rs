@@ -20,9 +20,11 @@ macro_rules! debug_log {
 mod app;
 mod appbar;
 mod clock;
+mod config;
 mod icons;
 mod layout;
 mod menu;
+mod pins;
 mod render;
 mod safety;
 mod shell;
