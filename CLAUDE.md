@@ -309,6 +309,14 @@ src/
 - Vị trí nội dung lúc thu gọn nằm hết ở `island::rest_layout` (dùng chung cho app và ảnh chụp, có
   test lề). `pill_padding`: nội dung = 0.68 * cao. Giờ cách đầu viên 0.31 * cao (nhìn cân với lề quanh
   linh vật; căn theo toán học 17 px thì trông lệch).
+- Góc liên tục (`shape.rs`): superellipse (viên: số mũ 2.35, vươn 1.3 x nửa cao; plate hover: 3.4),
+  dựng thành `ID2D1PathGeometry` đa giác. Kính (glass) vẫn bo tròn thường vì blur clip bằng rounded
+  rect. KHÔNG viền ở kiểu đen (đường 1 DIP khử răng cưa theo cung trông đậm nhạt); bóng đổ = nét
+  geometry rộng dần, alpha thấp. Không nội dung nào vào đoạn cong: cách hai đầu đúng nửa chiều cao.
+- Giờ một dòng "6:47" (`[clock] hour_format` auto/12/24, không AM/PM), nét light; chữ số căn giữa
+  theo baseline - cap height (`draw_time_centered`), không theo hộp dòng.
+- Icon: xin shell ảnh LỚN rồi thu bằng WIC Fant (exe: max(48, 2px); app đóng gói: 4px) và giữ thêm
+  bản 2x (`Icon::large`) cho lúc phóng to. Xin đúng 24 px thì File Explorer, Claude bị rỗ mép.
 - Chụp thiết kế KHÔNG cần chạy app (không làm phiền người dùng):
   `NB_SHOTS=<thư mục> cargo test --release render_island_states -- --ignored` => BMP phóng 5x của
   nghỉ / ngủ / nhạc / dải. Đổi giao diện thì chụp và so trước khi chạy thật.

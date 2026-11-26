@@ -327,9 +327,8 @@ pub fn geometry(width: f32, strip_height: f32, config: &BarConfig, at_top: bool)
 /// Equalizer bar width and the space between bars, DIPs.
 pub const BAR_WIDTH: f32 = 4.0;
 pub const BAR_GAP: f32 = 3.0;
-/// Clock's distance from the pill's end, as a share of the pill's height: matches
-/// the visible gap around the mascot on the other side.
-const CLOCK_INSET: f32 = 0.31;
+/// Empty space on each side of the flame inside its box (3 of 24 units).
+const MASCOT_SIDE: f32 = 3.0 / 24.0;
 const CLOCK_TEXT_WIDTH: f32 = 90.0;
 
 /// (content size, padding) of a pill `height` tall: the content is centered with the
@@ -370,21 +369,21 @@ pub fn rest_layout(pill: &D2D_RECT_F) -> RestLayout {
             mid + content / 2.0,
         )
     };
-    // The flame has some room around it inside its box (3/24 at the sides), which
-    // makes up for the pill's end curving in toward its widest part.
-    let mascot = square(pill.left + pad);
-    let inset = (h * CLOCK_INSET).round();
+    // Nothing reaches into the curved ends: the visible content starts half a pill
+    // height in from either side.
+    let inset = (h / 2.0).round();
+    let mascot = square(pill.left + inset - content * MASCOT_SIDE);
     let clock_right = pill.right - inset;
     let clock = rect(
         clock_right - CLOCK_TEXT_WIDTH,
         pill.top,
         clock_right,
-        pill.bottom - 1.0,
+        pill.bottom,
     );
-    let art = square(pill.left + pad);
+    let art = square(pill.left + inset);
     let bars_w = BARS as f32 * (BAR_WIDTH + BAR_GAP) - BAR_GAP;
     let bars_h = (h * 0.42).round();
-    let bars_right = pill.right - (h - bars_h) / 2.0;
+    let bars_right = pill.right - inset;
     let bars = rect(
         bars_right - bars_w,
         mid - bars_h / 2.0,
@@ -436,9 +435,9 @@ pub fn strip_layout(
 ) -> StripLayout {
     let button = icon_size + 16.0;
     let panel_h = (button + 12.0).max(config.island_height);
-    // The same space at the ends as above and below: the first button's round
-    // plate sits concentric in the panel's round end.
-    let pad = (panel_h - button) / 2.0;
+    // The first icon and the clock's text start half a panel height from the ends,
+    // clear of the curves (a button is 8 wider than its icon on each side).
+    let pad = panel_h / 2.0 - (button - icon_size) / 2.0;
     let status_gap = if status_width > 0.0 { STATUS_GAP } else { 0.0 };
     let tail = status_width + status_gap + CLOCK_WIDTH;
     let divider_w = |apps: bool| {
@@ -745,13 +744,14 @@ mod tests {
         };
         let l = rest_layout(&pill);
         let (content, pad) = pill_padding(44.0);
-        // Cover: same gap at the end, above and below; concentric with the round end.
-        assert_eq!(l.art.left - pill.left, pad);
+        // Nothing in the curved ends, and the same inset on both sides.
+        assert_eq!(l.art.left - pill.left, 22.0);
+        assert_eq!(pill.right - l.bars.right, 22.0);
+        assert_eq!(pill.right - l.clock.right, 22.0);
+        assert!((l.mascot.left + content * MASCOT_SIDE - pill.left - 22.0).abs() < 0.01);
+        // Centered vertically.
         assert_eq!(l.art.top - pill.top, pad);
         assert_eq!(pill.bottom - l.art.bottom, pad);
-        assert_eq!(content / 2.0, 44.0 / 2.0 - pad, "nested radius");
-        // Bars: centered, as far from the end as from the top.
-        assert_eq!(pill.right - l.bars.right, l.bars.top - pill.top);
         assert_eq!(l.bars.top - pill.top, pill.bottom - l.bars.bottom);
         // Two text lines centered between the cover and the bars.
         assert!(l.title.left > l.art.right && l.title.right < l.bars.left);

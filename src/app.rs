@@ -103,18 +103,12 @@ const REST_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 0.031,
     a: 1.0,
 };
-const REST_BORDER: D2D1_COLOR_F = D2D1_COLOR_F {
-    r: 1.0,
-    g: 1.0,
-    b: 1.0,
-    a: 0.09,
-};
 /// Hairline around the glass pill.
 const GLASS_BORDER: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
     g: 1.0,
     b: 1.0,
-    a: 0.40,
+    a: 0.08,
 };
 const REST_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
@@ -1634,7 +1628,7 @@ impl App {
                 }
             })
             .collect();
-        let mut clock = clock::now();
+        let mut clock = clock::now(self.config.clock.hour_format);
         if !self.config.clock.show_date {
             clock.date.clear();
         }
@@ -2563,7 +2557,13 @@ impl App {
         let deep = pulse.clamp(0.0, 1.0);
         let pill_rect = island::pulsed_pill(&g, pulse);
         let panel = island::lerp_rect(&pill_rect, &strip, t);
-        let mut border = if glass { GLASS_BORDER } else { REST_BORDER };
+        // No hairline on the black pill (an anti-aliased 1 DIP line along a curve
+        // looks uneven); the glass keeps a faint one.
+        let mut border = if glass {
+            GLASS_BORDER
+        } else {
+            D2D1_COLOR_F::default()
+        };
         // An app asking for attention: the hairline takes the accent color.
         if attention {
             border = D2D1_COLOR_F { a: 0.95, ..accent };
@@ -2608,6 +2608,8 @@ impl App {
             radius: (panel.bottom - panel.top) / 2.0,
             fill: pill,
             border,
+            // Continuous corners; the glass keeps round ones to match its blur clip.
+            squircle: !glass,
             // The glass is see-through: a shadow under it would darken the blur.
             shadow: if glass { 0.0 } else { 1.0 },
             // Icons appear over the last two thirds of the expansion.

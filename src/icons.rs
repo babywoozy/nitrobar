@@ -18,8 +18,8 @@ use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HPALETTE};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, GUID_WICPixelFormat32bppPBGRA,
     IWICBitmap, IWICBitmapSource, IWICImagingFactory, WICBitmapCacheOnLoad,
-    WICBitmapDitherTypeNone, WICBitmapInterpolationModeHighQualityCubic,
-    WICBitmapPaletteTypeCustom, WICBitmapUseAlpha,
+    WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom,
+    WICBitmapUseAlpha,
 };
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_RelaunchIconResource;
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -48,6 +48,18 @@ pub struct Icon {
     pub bitmap: IWICBitmap,
     /// Width = height in pixels (at most the requested size; smaller icons are not enlarged).
     pub px: u32,
+    /// The same picture at up to twice that size, for drawing it magnified.
+    pub large: IWICBitmap,
+}
+
+/// A decoded icon at the size asked for, and a larger copy.
+type Pair = (IWICBitmap, IWICBitmap);
+
+/// Size the shell is asked for: icons are always reduced from a bigger image (a
+/// 24 px frame straight from the shell has ragged edges, e.g. Explorer, Claude).
+/// Packaged apps have large assets (4x); classic icon files usually stop at 48.
+fn source_size(px: u32, packaged: bool) -> u32 {
+    if packaged { px * 4 } else { (px * 2).max(48) }
 }
 
 pub struct IconLoader {
@@ -86,7 +98,7 @@ impl IconLoader {
         })
     }
 
-    fn finish(&self, bitmap: IWICBitmap) -> Option<Icon> {
+    fn finish(&self, (bitmap, large): Pair) -> Option<Icon> {
         let (mut w, mut h) = (0, 0);
         unsafe { bitmap.GetSize(&raw mut w, &raw mut h) }.ok()?;
         let id = self.next_id.get();
@@ -95,6 +107,7 @@ impl IconLoader {
             id,
             bitmap,
             px: w.max(h),
+            large,
         })
     }
 
@@ -113,7 +126,7 @@ impl IconLoader {
             )
         }
         .ok()?;
-        self.finish(bitmap)
+        self.finish((bitmap.clone(), bitmap))
     }
 
     /// Icon for a running window of `app`.
@@ -142,36 +155,37 @@ impl IconLoader {
         self.finish(bitmap)
     }
 
-    fn apps_folder_bitmap(&self, aumid: &str, px: u32) -> Option<IWICBitmap> {
+    fn apps_folder_bitmap(&self, aumid: &str, px: u32) -> Option<Pair> {
         let factory: IShellItemImageFactory = unsafe {
             SHCreateItemInKnownFolder(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, &HSTRING::from(aumid))
         }
         .ok()?;
-        self.image_factory_bitmap(&factory, px)
+        self.image_factory_bitmap(&factory, px, source_size(px, true))
     }
 
-    fn file_bitmap(&self, path: &str, px: u32) -> Option<IWICBitmap> {
+    fn file_bitmap(&self, path: &str, px: u32) -> Option<Pair> {
         let factory: IShellItemImageFactory =
             unsafe { SHCreateItemFromParsingName(&HSTRING::from(path), None) }.ok()?;
-        self.image_factory_bitmap(&factory, px)
+        self.image_factory_bitmap(&factory, px, source_size(px, false))
     }
 
-    /// The shell picks the icon image closest to `px` (exact-size resources win).
+    /// Asks the shell for a `source` px image and reduces it to `px`.
     fn image_factory_bitmap(
         &self,
         factory: &IShellItemImageFactory,
         px: u32,
-    ) -> Option<IWICBitmap> {
+        source: u32,
+    ) -> Option<Pair> {
         let size = SIZE {
-            cx: px as i32,
-            cy: px as i32,
+            cx: source as i32,
+            cy: source as i32,
         };
         let hbitmap: HBITMAP = unsafe { factory.GetImage(size, SIIGBF_ICONONLY) }.ok()?;
         let bitmap = self.bitmap_from_hbitmap(hbitmap);
         unsafe {
             let _ = DeleteObject(hbitmap.into());
         }
-        self.normalize(&bitmap?.cast().ok()?, px)
+        self.pair(&bitmap?.cast().ok()?, px)
     }
 
     /// Copies an HBITMAP from the shell, fixing up its alpha channel.
@@ -201,7 +215,7 @@ impl IconLoader {
 
     /// `System.AppUserModel.RelaunchIconResource` ("path,index") set on the window,
     /// e.g. Chrome's per-profile icon with the profile badge. The taskbar uses it too.
-    fn relaunch_icon_bitmap(&self, hwnd: HWND, px: u32) -> Option<IWICBitmap> {
+    fn relaunch_icon_bitmap(&self, hwnd: HWND, px: u32) -> Option<Pair> {
         let resource = window_string_property(hwnd, &PKEY_AppUserModel_RelaunchIconResource)?;
         let (path, index) = match resource.rsplit_once(',') {
             Some((path, index)) => (path, index.trim().parse().ok()?),
@@ -215,7 +229,7 @@ impl IconLoader {
                 0,
                 Some(&raw mut hicon),
                 None,
-                px & 0xFFFF,
+                source_size(px, false) & 0xFFFF,
             )
             .ok()
             .ok()?;
@@ -227,18 +241,23 @@ impl IconLoader {
         unsafe {
             let _ = DestroyIcon(hicon);
         }
-        self.normalize(&wic.ok()?.cast().ok()?, px)
+        self.pair(&wic.ok()?.cast().ok()?, px)
     }
 
-    fn window_bitmap(&self, hwnd: HWND, px: u32) -> Option<IWICBitmap> {
+    fn window_bitmap(&self, hwnd: HWND, px: u32) -> Option<Pair> {
         let hicon = window_icon(hwnd)?;
         // The HICON belongs to the other process / class: copy it, never destroy it.
         // CreateBitmapFromHICON applies the icon mask and yields straight-alpha BGRA.
         let wic = unsafe { self.wic.CreateBitmapFromHICON(hicon) }.ok()?;
-        self.normalize(&wic.cast().ok()?, px)
+        self.pair(&wic.cast().ok()?, px)
     }
 
-    /// Converts to premultiplied BGRA, scales *down* to `px` with a high-quality
+    /// `source` reduced to `px` and to `2 px`.
+    fn pair(&self, source: &IWICBitmapSource, px: u32) -> Option<Pair> {
+        Some((self.normalize(source, px)?, self.normalize(source, px * 2)?))
+    }
+
+    /// Converts to premultiplied BGRA, scales *down* to `px` with an area-averaging
     /// filter (never up), and decodes into owned memory.
     fn normalize(&self, source: &IWICBitmapSource, px: u32) -> Option<IWICBitmap> {
         unsafe {
@@ -263,12 +282,7 @@ impl IconLoader {
             }
             let scaler = self.wic.CreateBitmapScaler().ok()?;
             scaler
-                .Initialize(
-                    &converter,
-                    px,
-                    px,
-                    WICBitmapInterpolationModeHighQualityCubic,
-                )
+                .Initialize(&converter, px, px, WICBitmapInterpolationModeFant)
                 .ok()?;
             self.wic
                 .CreateBitmapFromSource(&scaler, WICBitmapCacheOnLoad)

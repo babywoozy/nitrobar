@@ -33,6 +33,7 @@ mod pins;
 mod preview;
 mod render;
 mod safety;
+mod shape;
 mod shell;
 mod status;
 mod taskbar;

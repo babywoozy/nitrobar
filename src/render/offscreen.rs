@@ -70,6 +70,7 @@ fn cover(wic: &IWICImagingFactory, size: u32) -> Icon {
     .unwrap();
     Icon {
         id: 1,
+        large: bitmap.clone(),
         bitmap,
         px: size,
     }
@@ -168,7 +169,7 @@ fn render_island_states() {
     let renderer = Renderer::new().unwrap();
     let palette = palette();
     let clock = ClockText {
-        time: wide("10:42 AM"),
+        time: wide("6:47"),
         date: wide("27/11/2026"),
     };
     let pill = |width: f32| D2D_RECT_F {
@@ -202,8 +203,9 @@ fn render_island_states() {
             panel,
             radius: (panel.bottom - panel.top) / 2.0,
             fill: color(0.027, 0.027, 0.031, 1.0),
-            border: color(1.0, 1.0, 1.0, 0.09),
+            border: D2D1_COLOR_F::default(),
             content_opacity: 0.0,
+            squircle: true,
             shadow: 1.0,
             badge: None,
             rest: Some(RestView {
@@ -286,6 +288,27 @@ fn render_island_states() {
             lift: 0.0,
         })
         .collect();
+    // Real icons, loaded the way the bar loads them.
+    let loader = crate::icons::IconLoader::new().unwrap();
+    let apps: Vec<Option<Icon>> = [
+        "Microsoft.Windows.Explorer",
+        "Claude_pzs8sxrjxfjjc!Claude",
+        "Chrome",
+        "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App",
+        "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+    ]
+    .iter()
+    .map(|aumid| {
+        let app = crate::tasks::AppId {
+            aumid: Some((*aumid).to_string()),
+            exe: None,
+        };
+        loader.load_app(&app, None, 24)
+    })
+    .collect();
+    for (button, icon) in scene.buttons.iter_mut().zip(&apps) {
+        button.icon = icon.as_ref();
+    }
     scene.status_rect = layout.status;
     scene.status_pointer.hover = true;
     scene.status = StatusView {

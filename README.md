@@ -106,7 +106,8 @@ text = ""
 accent = ""                  # màu vạch của app đang mở
 
 [clock]
-show_date = true
+show_date = true             # ngày dưới giờ (island: chỉ khi đang mở rộng)
+hour_format = "auto"         # "12", "24" hoặc "auto" (theo Windows)
 
 [status]
 show_battery_percent = true

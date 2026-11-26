@@ -141,15 +141,32 @@ pub struct ColorConfig {
     pub accent: String,
 }
 
+/// 12 or 24 hour clock; "auto" follows the Windows setting.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HourFormat {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "12")]
+    H12,
+    #[serde(rename = "24")]
+    H24,
+}
+
 #[derive(Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct ClockConfig {
+    /// Date under the time in the expanded island / on the full bar.
     pub show_date: bool,
+    pub hour_format: HourFormat,
 }
 
 impl Default for ClockConfig {
     fn default() -> Self {
-        Self { show_date: true }
+        Self {
+            show_date: true,
+            hour_format: HourFormat::Auto,
+        }
     }
 }
 
@@ -242,7 +259,8 @@ text = ""
 accent = ""                  # màu vạch của app đang mở
 
 [clock]
-show_date = true
+show_date = true             # ngày dưới giờ (island: chỉ khi đang mở rộng)
+hour_format = "auto"         # "12", "24" hoặc "auto" (theo Windows)
 
 [status]
 show_battery_percent = true
@@ -495,6 +513,13 @@ island_style = \"neon\"
             ))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn hour_format_parses() {
+        let c = Config::parse("[clock]\nhour_format = \"24\"\n").unwrap();
+        assert_eq!(c.clock.hour_format, HourFormat::H24);
+        assert!(Config::parse("[clock]\nhour_format = \"13\"\n").is_err());
     }
 
     #[test]

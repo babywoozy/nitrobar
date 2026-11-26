@@ -25,8 +25,9 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_WEIGHT_SEMI_LIGHT,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
+    DWRITE_FONT_WEIGHT_LIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    DWRITE_FONT_WEIGHT_SEMI_LIGHT, DWRITE_LINE_METRICS, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
@@ -38,12 +39,15 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{BOOL, PCWSTR, Result, w};
 use windows_numerics::{Matrix3x2, Vector2};
 
+use windows::Win32::Graphics::Imaging::IWICBitmap;
+
 use crate::clock::ClockText;
 use crate::config::Background;
 use crate::icons::Icon;
 use crate::island::{BAR_GAP, BAR_WIDTH};
 use crate::layout::{self, Metrics};
 use crate::media::BARS;
+use crate::shape;
 use crate::status::StatusView;
 use crate::theme::Palette;
 
@@ -54,6 +58,11 @@ const TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
     a: 0.0,
 };
 const CLOCK_FONT_SIZE: f32 = 12.0;
+const TIME_FONT_SIZE: f32 = 15.0;
+/// Cache key bit of an icon's larger copy.
+const LARGE_ICON: u64 = 1 << 63;
+/// Height of Segoe UI's digits relative to the font size.
+const DIGIT_HEIGHT: f32 = 0.70;
 /// Island shadow: this many stacked, slightly growing translucent copies of the
 /// panel, `SHADOW_STEP` DIPs apart, shifted down by `SHADOW_DROP`.
 const SHADOW_LAYERS: u32 = 8;
@@ -131,6 +140,8 @@ pub struct IslandView {
     pub border: D2D1_COLOR_F,
     /// Opacity of the bar content (icons fade in while expanding).
     pub content_opacity: f32,
+    /// Continuous (superellipse) corners instead of circular ones.
+    pub squircle: bool,
     /// Soft shadow strength under the panel, 0..1.
     pub shadow: f32,
     pub rest: Option<RestView>,
@@ -275,6 +286,23 @@ fn icon_font_family(dwrite: &IDWriteFactory) -> PCWSTR {
     }
 }
 
+/// A closed filled shape through `points`.
+fn polygon(d2d: &ID2D1Factory, points: &[(f32, f32)]) -> Result<ID2D1PathGeometry> {
+    unsafe {
+        let geometry = d2d.CreatePathGeometry()?;
+        let sink = geometry.Open()?;
+        let mut vertices = points.iter().map(|&(x, y)| Vector2 { X: x, Y: y });
+        if let Some(first) = vertices.next() {
+            sink.BeginFigure(first, D2D1_FIGURE_BEGIN_FILLED);
+            let rest: Vec<Vector2> = vertices.collect();
+            sink.AddLines(&rest);
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        }
+        sink.Close()?;
+        Ok(geometry)
+    }
+}
+
 /// A closed filled shape from a start point and cubic Bezier segments.
 fn path(
     d2d: &ID2D1Factory,
@@ -375,8 +403,8 @@ impl Renderer {
             let time_format = weighted_format(
                 &dwrite,
                 ui_font,
-                14.0,
-                DWRITE_FONT_WEIGHT_SEMI_LIGHT,
+                TIME_FONT_SIZE,
+                DWRITE_FONT_WEIGHT_LIGHT,
                 DWRITE_TEXT_ALIGNMENT_TRAILING,
             )?;
             let strip_time_format = weighted_format(
@@ -617,10 +645,18 @@ impl Renderer {
             radiusX: island.radius,
             radiusY: island.radius,
         };
+        let outline = if island.squircle {
+            shape::pill(&island.panel)
+        } else {
+            Vec::new()
+        };
+        let squircle = (!outline.is_empty())
+            .then(|| polygon(&self.d2d, &outline).ok())
+            .flatten();
         unsafe {
             if island.shadow > 0.0 {
-                // Stacked copies, biggest (faintest) first: summed alpha falls off
-                // smoothly away from the panel.
+                // Strokes of growing width, faintest summed furthest out: a soft
+                // falloff around the shape (the inner halves end up under the fill).
                 let color = D2D1_COLOR_F {
                     r: 0.0,
                     g: 0.0,
@@ -628,45 +664,57 @@ impl Renderer {
                     a: SHADOW_ALPHA * island.shadow,
                 };
                 target.brush.SetColor(&raw const color);
-                for i in (1..=SHADOW_LAYERS).rev() {
-                    let grow = i as f32 * SHADOW_STEP;
-                    let layer = D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: island.panel.left - grow,
-                            top: island.panel.top - grow + SHADOW_DROP,
-                            right: island.panel.right + grow,
-                            bottom: island.panel.bottom + grow + SHADOW_DROP,
-                        },
-                        radiusX: island.radius + grow,
-                        radiusY: island.radius + grow,
-                    };
-                    target
-                        .rt
-                        .FillRoundedRectangle(&raw const layer, &target.brush);
+                let drop = Matrix3x2::translation(-origin.0, SHADOW_DROP - origin.1);
+                target.rt.SetTransform(&raw const drop);
+                for i in 1..=SHADOW_LAYERS {
+                    let width = 2.0 * i as f32 * SHADOW_STEP;
+                    match &squircle {
+                        Some(geometry) => {
+                            target.rt.DrawGeometry(geometry, &target.brush, width, None)
+                        }
+                        None => target.rt.DrawRoundedRectangle(
+                            &raw const rounded,
+                            &target.brush,
+                            width,
+                            None,
+                        ),
+                    }
                 }
+                let reset = Matrix3x2::translation(-origin.0, -origin.1);
+                target.rt.SetTransform(&raw const reset);
             }
             if island.fill.a > 0.0 {
                 target.brush.SetColor(&raw const island.fill);
-                target
-                    .rt
-                    .FillRoundedRectangle(&raw const rounded, &target.brush);
+                match &squircle {
+                    Some(geometry) => target.rt.FillGeometry(geometry, &target.brush, None),
+                    None => target
+                        .rt
+                        .FillRoundedRectangle(&raw const rounded, &target.brush),
+                }
             }
             if island.border.a > 0.0 {
-                // Hairline inside the panel edge.
-                let inner = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: island.panel.left + 0.5,
-                        top: island.panel.top + 0.5,
-                        right: island.panel.right - 0.5,
-                        bottom: island.panel.bottom - 0.5,
-                    },
-                    radiusX: (island.radius - 0.5).max(0.0),
-                    radiusY: (island.radius - 0.5).max(0.0),
+                // Centered half a DIP inside the edge, so it covers whole pixels.
+                let inner = D2D_RECT_F {
+                    left: island.panel.left + 0.5,
+                    top: island.panel.top + 0.5,
+                    right: island.panel.right - 0.5,
+                    bottom: island.panel.bottom - 0.5,
                 };
                 target.brush.SetColor(&raw const island.border);
-                target
-                    .rt
-                    .DrawRoundedRectangle(&raw const inner, &target.brush, 1.0, None);
+                if island.squircle {
+                    if let Ok(geometry) = polygon(&self.d2d, &shape::pill(&inner)) {
+                        target.rt.DrawGeometry(&geometry, &target.brush, 1.0, None);
+                    }
+                } else {
+                    let line = D2D1_ROUNDED_RECT {
+                        rect: inner,
+                        radiusX: (island.radius - 0.5).max(0.0),
+                        radiusY: (island.radius - 0.5).max(0.0),
+                    };
+                    target
+                        .rt
+                        .DrawRoundedRectangle(&raw const line, &target.brush, 1.0, None);
+                }
             }
         }
         if let Some(rest) = &island.rest
@@ -681,7 +729,14 @@ impl Renderer {
                 if let Some((text, rect)) = &rest.clock {
                     let mut color = rest.text;
                     color.a *= idle;
-                    self.draw_time(target, text, &self.time_format, *rect, &color);
+                    self.draw_time_centered(
+                        target,
+                        text,
+                        &self.time_format,
+                        TIME_FONT_SIZE,
+                        *rect,
+                        &color,
+                    );
                 }
             }
             if music > 0.01
@@ -709,6 +764,52 @@ impl Renderer {
             }
         }
         island.content_opacity
+    }
+
+    /// Like `draw_time`, with the digits (not the line box) centered vertically.
+    fn draw_time_centered(
+        &self,
+        target: &Target,
+        text: &[u16],
+        format: &IDWriteTextFormat,
+        size: f32,
+        rect: D2D_RECT_F,
+        color: &D2D1_COLOR_F,
+    ) {
+        unsafe {
+            let Ok(layout) =
+                self.dwrite
+                    .CreateTextLayout(text, format, rect.right - rect.left, size * 3.0)
+            else {
+                return;
+            };
+            let all = DWRITE_TEXT_RANGE {
+                startPosition: 0,
+                length: text.len() as u32,
+            };
+            let _ = layout.SetTypography(&self.tabular, all);
+            let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            let mut line = [DWRITE_LINE_METRICS::default()];
+            let mut count = 0;
+            if layout
+                .GetLineMetrics(Some(&mut line), &raw mut count)
+                .is_err()
+            {
+                return;
+            }
+            let middle = (rect.top + rect.bottom) / 2.0;
+            let top = middle + size * DIGIT_HEIGHT / 2.0 - line[0].baseline;
+            target.brush.SetColor(color);
+            target.rt.DrawTextLayout(
+                Vector2 {
+                    X: rect.left,
+                    Y: top,
+                },
+                &layout,
+                &target.brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
     }
 
     /// Text laid out with tabular figures.
@@ -997,7 +1098,25 @@ impl Renderer {
             (false, false, false) => None,
         };
         if let Some(color) = color {
+            Self::fill_plate(target, rect, radius, color);
+        }
+    }
+
+    /// A hover / press plate: a squircle when it is fully round (the island's),
+    /// else a rounded rectangle.
+    fn fill_plate(target: &Target, rect: D2D_RECT_F, radius: f32, color: &D2D1_COLOR_F) {
+        if radius < (rect.bottom - rect.top) / 2.0 {
             Self::fill_rounded(target, rect, radius, color);
+            return;
+        }
+        unsafe {
+            let Ok(factory) = target.rt.GetFactory() else {
+                return;
+            };
+            if let Ok(geometry) = polygon(&factory, &shape::plate(&rect)) {
+                target.brush.SetColor(color);
+                target.rt.FillGeometry(&geometry, &target.brush, None);
+            }
         }
     }
 
@@ -1047,11 +1166,15 @@ impl Renderer {
     }
 
     fn icon_bitmap(target: &mut Target, icon: &Icon) -> Option<ID2D1Bitmap> {
-        if let Some(bitmap) = target.bitmaps.get(&icon.id) {
+        Self::cached_bitmap(target, icon.id, &icon.bitmap)
+    }
+
+    fn cached_bitmap(target: &mut Target, key: u64, source: &IWICBitmap) -> Option<ID2D1Bitmap> {
+        if let Some(bitmap) = target.bitmaps.get(&key) {
             return Some(bitmap.clone());
         }
-        let bitmap = unsafe { target.rt.CreateBitmapFromWicBitmap(&icon.bitmap, None) }.ok()?;
-        target.bitmaps.insert(icon.id, bitmap.clone());
+        let bitmap = unsafe { target.rt.CreateBitmapFromWicBitmap(source, None) }.ok()?;
+        target.bitmaps.insert(key, bitmap.clone());
         Some(bitmap)
     }
 
@@ -1075,11 +1198,11 @@ impl Renderer {
             layout::CORNER_RADIUS
         };
         if button.state == ButtonState::Attention && !button.pointer.pressed {
-            Self::fill_rounded(target, rect, radius, &palette.attention_bg);
+            Self::fill_plate(target, rect, radius, &palette.attention_bg);
         } else if flat {
             // Dock style: the zoom is the hover feedback; only a press shows a plate.
             if button.pointer.pressed {
-                Self::fill_rounded(target, rect, radius, &palette.pressed);
+                Self::fill_plate(target, rect, radius, &palette.pressed);
             }
         } else {
             Self::draw_button_background(
@@ -1114,7 +1237,13 @@ impl Renderer {
         };
         let bitmap = button.icon.and_then(|icon| {
             used.push(icon.id);
-            Self::icon_bitmap(target, icon)
+            if zoomed {
+                // Reduced from the 2x copy: stays smooth while magnified.
+                used.push(icon.id | LARGE_ICON);
+                Self::cached_bitmap(target, icon.id | LARGE_ICON, &icon.large)
+            } else {
+                Self::icon_bitmap(target, icon)
+            }
         });
         match bitmap {
             Some(bitmap) => unsafe {

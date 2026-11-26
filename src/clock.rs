@@ -1,10 +1,13 @@
 //! Clock text, formatted with the user's locale (same format as the native taskbar).
 
 use windows::Win32::Globalization::{
-    DATE_SHORTDATE, GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS,
+    DATE_SHORTDATE, GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, LOCALE_ITIME,
+    TIME_FORMAT_FLAGS,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, w};
+
+use crate::config::HourFormat;
 
 pub struct ClockText {
     pub time: Vec<u16>,
@@ -17,7 +20,21 @@ fn written(buf: &[u16], len: i32) -> Vec<u16> {
     buf[..len.min(buf.len())].to_vec()
 }
 
-pub fn now() -> ClockText {
+/// Whether the user's locale writes the time with 24 hours.
+fn locale_is_24h() -> bool {
+    let mut value = [0u16; 4];
+    let len = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_ITIME, Some(&mut value)) };
+    len > 0 && value[0] == u16::from(b'1')
+}
+
+/// The time as "6:47" / "18:47" (no AM / PM) in the chosen style, and the short date.
+pub fn now(hours: HourFormat) -> ClockText {
+    let twenty_four = match hours {
+        HourFormat::Auto => locale_is_24h(),
+        HourFormat::H12 => false,
+        HourFormat::H24 => true,
+    };
+    let format = if twenty_four { w!("H:mm") } else { w!("h:mm") };
     let st = unsafe { GetLocalTime() };
     let mut time = [0u16; 64];
     let mut date = [0u16; 64];
@@ -25,9 +42,9 @@ pub fn now() -> ClockText {
     let time_len = unsafe {
         GetTimeFormatEx(
             PCWSTR::null(),
-            TIME_NOSECONDS,
+            TIME_FORMAT_FLAGS(0),
             Some(&st),
-            PCWSTR::null(),
+            format,
             Some(&mut time),
         )
     };

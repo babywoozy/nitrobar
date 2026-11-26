@@ -12,7 +12,7 @@ pub const EDGE_MARGIN: f32 = 8.0;
 pub const CLOCK_WIDTH: f32 = 84.0;
 pub const CLOCK_TEXT_PADDING: f32 = 8.0;
 /// The island strip's clock sits closer to the panel's end.
-pub const ISLAND_CLOCK_PADDING: f32 = 5.0;
+pub const ISLAND_CLOCK_PADDING: f32 = 8.0;
 pub const CLOCK_LINE_HEIGHT: f32 = 16.0;
 
 pub const STATUS_PADDING: f32 = 8.0;
