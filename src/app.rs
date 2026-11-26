@@ -5,13 +5,13 @@
 //! so messages that arrive while `App` is borrowed fall back to stateless
 //! handling / `DefWindowProc` instead of aliasing `&mut App`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
 use windows::Win32::Foundation::{
     GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
-use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
+use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
@@ -87,6 +87,23 @@ const WM_APP_INIT: u32 = WM_APP + 2;
 const HSHELL_FLASH: usize = 0x8006;
 /// Sent after `TrackMouseEvent(TME_LEAVE)` when the pointer leaves the window.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Shell hook code: Windows asks where a window minimizes to / restores from.
+/// lParam points to a `SHELLHOOKINFO`; the answer is written into its `rc`.
+const HSHELL_GETMINRECT: usize = 5;
+
+/// `SHELLHOOKINFO` (winuser.h).
+#[repr(C)]
+struct ShellHookInfo {
+    hwnd: HWND,
+    rc: RECT,
+}
+
+thread_local! {
+    /// The registered "SHELLHOOK" message, readable without borrowing `App`.
+    static SHELL_HOOK_MSG: Cell<u32> = const { Cell::new(0) };
+    /// Minimize target used when `App` is busy: the island pill / the bar.
+    static MIN_RECT: Cell<RECT> = const { Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }) };
+}
 
 pub struct Options {
     pub hide_taskbar: bool,
@@ -257,6 +274,7 @@ fn run_window(options: Options) -> Result<()> {
             bar_rect: RECT::default(),
             origin: (0.0, 0.0),
         };
+        SHELL_HOOK_MSG.set(app.msg_shell_hook);
         let cell = Box::into_raw(Box::new(RefCell::new(app)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, cell as isize);
         SendMessageW(hwnd, WM_APP_INIT, None, None);
@@ -338,6 +356,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             show_context_menu(hwnd, lparam);
             return LRESULT(0);
         }
+        // Sent synchronously while another app minimizes / restores a window: answer
+        // even when `App` is borrowed (the app waits for us).
+        _ if msg != 0 && msg == SHELL_HOOK_MSG.get() && wparam.0 == HSHELL_GETMINRECT => {
+            return on_get_min_rect(hwnd, lparam);
+        }
         WM_NCDESTROY => unsafe {
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut RefCell<App>;
             if !ptr.is_null() {
@@ -351,6 +374,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// `HSHELL_GETMINRECT`: the rect a window minimizes to / restores from: the
+/// island pill, or the app's button when the bar is shown in full.
+///
+/// Measured on Windows 11 (26300): the first shell hook window that answers wins,
+/// and once we answer, Explorer is not asked and Windows plays *no* minimize /
+/// restore animation at all (the window just disappears / appears). Windows'
+/// own animation cannot be redirected to the island; we draw our own.
+fn on_get_min_rect(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let Some(info) = (unsafe { (lparam.0 as *mut ShellHookInfo).as_mut() }) else {
+        return LRESULT(0);
+    };
+    let rc = with_app(hwnd, |app| app.min_rect(info.hwnd))
+        .flatten()
+        .unwrap_or_else(|| MIN_RECT.get());
+    if rc.right <= rc.left {
+        return LRESULT(0);
+    }
+    info.rc = rc;
+    LRESULT(1)
 }
 
 /// The menu runs a nested message loop, so `App` is only borrowed before and after it.
@@ -894,6 +938,7 @@ impl App {
             }
         }
         self.place_island();
+        MIN_RECT.set(self.default_min_rect().unwrap_or_default());
         let icon_px = scale(self.metrics.icon_size, self.dpi) as u32;
         if icon_px != self.icon_px {
             self.icon_px = icon_px;
@@ -1046,6 +1091,49 @@ impl App {
             }
             let _ = EndPaint(self.hwnd, &raw const ps);
         }
+    }
+
+    /// Bar-space DIPs -> screen pixels.
+    fn bar_to_screen(&self, r: &D2D_RECT_F) -> RECT {
+        let bar = self.bar_rect;
+        RECT {
+            left: bar.left + scale(r.left, self.dpi),
+            top: bar.top + scale(r.top, self.dpi),
+            right: bar.left + scale(r.right, self.dpi),
+            bottom: bar.top + scale(r.bottom, self.dpi),
+        }
+    }
+
+    /// Where `target` minimizes to: its app button while the bar is shown in full,
+    /// otherwise the island pill. `None` = let Windows decide.
+    fn min_rect(&self, target: HWND) -> Option<RECT> {
+        let shown = self
+            .island
+            .as_ref()
+            .is_none_or(|s| s.anim.expanded() && !s.small_window);
+        if shown {
+            let layout = self.layout();
+            let button = self.items().iter().position(|item| {
+                item.group
+                    .and_then(|g| self.tasks.groups.get(g))
+                    .is_some_and(|g| g.contains(target))
+            });
+            if let Some(rect) = button.and_then(|i| layout.tasks.get(i)) {
+                return Some(self.bar_to_screen(rect));
+            }
+        }
+        self.default_min_rect()
+    }
+
+    /// The pill in island mode, the whole bar in full mode.
+    fn default_min_rect(&self) -> Option<RECT> {
+        if self.bar_rect.right <= self.bar_rect.left || self.fullscreen() {
+            return None;
+        }
+        Some(match &self.island {
+            Some(_) => self.bar_to_screen(&self.island_geometry().pill),
+            None => self.bar_rect,
+        })
     }
 
     // ----- island mode -----

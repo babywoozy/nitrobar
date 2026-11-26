@@ -202,6 +202,16 @@ src/
 - Đo: thu gọn 8.6 MB, sau nhiều lần bung/thu ~14.5 MB; CPU 0 khi đứng yên; ~57 ms CPU cho mỗi lần
   chuyển động ~180 ms (software render cả dải 60 fps).
 
+### Hiệu ứng thu nhỏ / khôi phục cửa sổ
+
+- `HSHELL_GETMINRECT` (shell hook, wParam 5, lParam -> `SHELLHOOKINFO {hwnd, rc}`): Windows hỏi
+  rect đích lúc thu nhỏ VÀ lúc khôi phục, gửi đồng bộ (app đang chờ) => trả lời ở nhánh stateless
+  của `wndproc`, `App` bận thì dùng `MIN_RECT` (viên / cả thanh).
+- Đã đo trên Win11 26300: cửa sổ shell hook nào trả lời trước thì thắng; nitrobar trả lời =>
+  Explorer không được hỏi và Windows KHÔNG chạy hiệu ứng nào (cửa sổ biến mất / hiện ra ngay), dù
+  rect ở đâu, to hay nhỏ. Không thể bắt hiệu ứng gốc bay vào island; bỏ qua (trả 0) thì hiệu ứng
+  gốc bay về nút của taskbar gốc đang ẩn.
+
 ## Bất biến an toàn: taskbar gốc PHẢI hiện lại
 
 - Khi taskbar gốc đang ẩn và Start / Quick Settings mở, Explorer hiện lại taskbar; ẩn nó ngay lúc
