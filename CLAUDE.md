@@ -194,9 +194,18 @@ src/
   cửa sổ không có nút như desktop / flyout giữ icon cũ), đổi thì crossfade 240 ms; bên phải giờ.
   Con số trong config nhớ rằng file config.toml ĐÃ TẠO TRƯỚC KHI đổi mặc định vẫn ghi giá trị cũ
   (`island_width = 120`...): khi test thiết kế mới phải tạm đổi config (`cfgswap.ps1`) và trả lại.
-  `island::strip_height` = dải cao tới mức chứa viên activity + gap + lề (cửa sổ island KHÔNG còn bằng
-  `bar_height`); thanh đầy đủ (tạm thời) là một băng `Geometry::bar` ở sát mép trong dải đó.
-  Bung ra theo lò xo (`EXPAND_SPRING`, vượt ~3%), thu lại ease-in-out.
+  `island::strip_height` = dải cao tới mức chứa viên nghỉ / activity / dải icon + gap + lề (cửa sổ
+  island KHÔNG liên quan `bar_height`, dùng `icon_size`).
+- Dải icon (`island::strip_layout`, thuần hình học, có test): các nút ở VỊ TRÍ CUỐI, panel lớn dần từ
+  viên tới `StripLayout::panel` (nội dung mờ vào qua layer, kẹp vào panel). Panel = viên bo tròn hết,
+  nền đen cố định; nút thừa thì bỏ. Cửa sổ khi mở = `StripLayout::window` (panel + bóng + chỗ cho độ
+  vượt của lò xo ~3%) hợp với `activity_hit`; danh sách app đổi lúc đang mở thì `place_island` lại.
+  Bung ra theo lò xo (`EXPAND_SPRING`), thu lại ease-in-out. Không có nút Start (Win mở Start).
+  Màu nội dung = `App::island_palette` (trắng trên đen bất kể theme); `text_shadow` tắt trong island.
+- Zoom kiểu dock: `ButtonView::scale` = 1 + 0.30 * zoom * exp(-(dx/(1.1*nút))^2) quanh con trỏ,
+  `App::zoom` (0..1) đuổi theo đích bằng ease 70 ms trong `on_frame` (chỉ chạy frame khi còn đang
+  đổi); mỗi `WM_MOUSEMOVE` vẽ lại. Icon phóng to vẽ từ bitmap cỡ gốc nên hơi mềm; ở 1x vẫn 1:1 theo
+  pixel. Hit-test dùng rect không phóng to. `ButtonState::Minimized` = mọi cửa sổ iconic => chấm mờ.
 - Khung hình: `morph::start_clock` = thread `nitrobar-frames` gọi `DwmFlush` (chờ lần compose kế
   tiếp = theo tần số màn hình, 60/120/144 Hz) rồi post `WM_APP_FRAME` (tối đa 1 message đang chờ).
   Dùng chung cho bung/thu, viên nảy, overlay thu nhỏ; `on_frame` dừng thread khi mọi thứ đứng yên.
@@ -215,9 +224,8 @@ src/
   chừng thì chỉ tốn phần còn lại. Khung morph từ viên -> cả thanh; icon hiện dần qua layer
   (opacity, clip vào khung). Dùng lại MỘT `ID2D1Layer` cho mỗi render target: `PushLayer(.., None)`
   cấp layer mới mỗi frame, RAM riêng lên 16-17 MB thay vì 14 MB.
-- Cửa sổ island luôn dùng accent "clear"; khung do mình vẽ. Viên: `palette.island` (kính mờ nhẹ +
-  viền mảnh), app cần chú ý => màu `attention`. Khi bung với `background = "clear"`: kính alpha 0.85
-  (thanh đè lên cửa sổ app, trong suốt hẳn thì chữ lẫn vào nội dung bên dưới).
+- Cửa sổ island luôn dùng accent "clear"; khung do mình vẽ (đen, viền mảnh); app cần chú ý => màu
+  `attention`. `[bar] background` / `[colors]` chỉ dùng cho mode full.
 - Đo: thu gọn 8.6 MB, sau nhiều lần bung/thu ~14.5 MB; CPU 0 khi đứng yên; ~57 ms CPU cho mỗi lần
   chuyển động ~180 ms (software render cả dải 60 fps).
 - "Activity" (`Pulse`): app vào / ra island => viên phồng tới `Geometry::activity` (+48 DIP rộng, cao

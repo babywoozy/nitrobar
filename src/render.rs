@@ -72,6 +72,8 @@ pub enum ButtonState {
     Running,
     Active,
     Attention,
+    /// Running, but all its windows are minimized: a faint dot.
+    Minimized,
 }
 
 /// Pointer feedback for any clickable element.
@@ -86,6 +88,10 @@ pub struct ButtonView<'a> {
     pub icon: Option<&'a Icon>,
     pub state: ButtonState,
     pub pointer: Pointer,
+    /// Icon magnification (1 = normal) and how far the icon is lifted, DIPs
+    /// (island: the dock-like zoom under the pointer).
+    pub scale: f32,
+    pub lift: f32,
 }
 
 pub struct Scene<'a> {
@@ -101,6 +107,8 @@ pub struct Scene<'a> {
     pub clock_rect: D2D_RECT_F,
     pub clock_pointer: Pointer,
     pub clock: ClockText,
+    /// Island: line between the app buttons and the status area.
+    pub divider: Option<D2D_RECT_F>,
     /// DIP offset of the window inside bar space (island: the collapsed window is
     /// only the pill area).
     pub origin: (f32, f32),
@@ -148,7 +156,8 @@ impl Scene<'_> {
     /// Shadow color for text and glyphs when the bar shows the wallpaper (clear or
     /// light blur): dark under light text, light under dark text.
     fn text_shadow(&self) -> Option<D2D1_COLOR_F> {
-        if !matches!(self.backdrop, Background::Clear | Background::Blur) {
+        // The island is a solid dark panel: nothing to protect the text from.
+        if self.island.is_some() || !matches!(self.backdrop, Background::Clear | Background::Blur) {
             return None;
         }
         let t = self.palette.text;
@@ -524,23 +533,23 @@ impl Renderer {
     /// Start, app buttons, status and clock.
     fn draw_content(&self, target: &mut Target, scene: &Scene, dpi: f32, used: &mut Vec<u64>) {
         let palette = &scene.palette;
-        Self::draw_start(
-            target,
-            palette,
-            &scene.metrics,
-            scene.start.0,
-            scene.start.1,
-        );
-        for button in &scene.buttons {
-            Self::draw_button(
+        // The island has no Start button (the Win key opens Start).
+        if scene.start.0.right > scene.start.0.left {
+            Self::draw_start(
                 target,
                 palette,
                 &scene.metrics,
-                dpi,
-                scene.text_shadow(),
-                button,
-                used,
+                scene.start.0,
+                scene.start.1,
             );
+        }
+        for button in &scene.buttons {
+            Self::draw_button(target, scene, dpi, button, used);
+        }
+        if let Some(line) = &scene.divider {
+            let mut color = scene.palette.text;
+            color.a = 0.18;
+            Self::fill_rounded(target, *line, 0.5, &color);
         }
         self.draw_status(target, scene);
         self.draw_clock(target, scene);
@@ -636,16 +645,23 @@ impl Renderer {
 
     fn draw_button(
         target: &mut Target,
-        palette: &Palette,
-        metrics: &Metrics,
+        scene: &Scene,
         dpi: f32,
-        shadow: Option<D2D1_COLOR_F>,
         button: &ButtonView,
         used: &mut Vec<u64>,
     ) {
+        let palette = &scene.palette;
+        let metrics = &scene.metrics;
+        let shadow = scene.text_shadow();
+        let flat = scene.island.is_some();
         let rect = button.rect;
         if button.state == ButtonState::Attention && !button.pointer.pressed {
             Self::fill_rounded(target, rect, layout::CORNER_RADIUS, &palette.attention_bg);
+        } else if flat {
+            // Dock style: the zoom is the hover feedback; only a press shows a plate.
+            if button.pointer.pressed {
+                Self::fill_rounded(target, rect, layout::CORNER_RADIUS, &palette.pressed);
+            }
         } else {
             Self::draw_button_background(
                 target,
@@ -665,11 +681,17 @@ impl Renderer {
         let nudge = if metrics.at_top { 1.0 } else { -1.0 };
         // Icons are drawn at their own pixel size (never enlarged), on whole pixels:
         // 1:1 copies stay sharp at every DPI.
-        let wanted_px = (icon_size * dpi / 96.0).round();
-        let icon_px = button
-            .icon
-            .map_or(wanted_px, |icon| wanted_px.min(icon.px as f32));
-        let icon_rect = layout::pixel_square(&rect, icon_px, nudge, dpi);
+        let zoomed = button.scale > 1.01;
+        let wanted_px = (icon_size * button.scale * dpi / 96.0).round();
+        let icon_rect = if zoomed {
+            // Magnified: scaled up from the icon bitmap (a bit soft), not on the pixel grid.
+            layout::centered_square(&rect, wanted_px * 96.0 / dpi, nudge - button.lift)
+        } else {
+            let icon_px = button
+                .icon
+                .map_or(wanted_px, |icon| wanted_px.min(icon.px as f32));
+            layout::pixel_square(&rect, icon_px, nudge, dpi)
+        };
         let bitmap = button.icon.and_then(|icon| {
             used.push(icon.id);
             Self::icon_bitmap(target, icon)
@@ -687,11 +709,16 @@ impl Renderer {
             None => Self::fill_rounded(target, icon_rect, 4.0, &palette.placeholder),
         }
 
+        let faint = D2D1_COLOR_F {
+            a: palette.indicator.a * 0.5,
+            ..palette.indicator
+        };
         let (width, color) = match button.state {
             ButtonState::Pinned => return,
-            ButtonState::Running => (layout::INDICATOR_RUNNING_WIDTH, &palette.indicator),
-            ButtonState::Active => (layout::INDICATOR_ACTIVE_WIDTH, &palette.accent),
-            ButtonState::Attention => (layout::INDICATOR_ACTIVE_WIDTH, &palette.attention),
+            ButtonState::Running => (layout::INDICATOR_RUNNING_WIDTH, palette.indicator),
+            ButtonState::Active => (layout::INDICATOR_ACTIVE_WIDTH, palette.accent),
+            ButtonState::Attention => (layout::INDICATOR_ACTIVE_WIDTH, palette.attention),
+            ButtonState::Minimized => (layout::INDICATOR_HEIGHT, faint),
         };
         let pill = layout::indicator(&rect, width, metrics.at_top);
         if let Some(mut halo) = shadow {
@@ -705,7 +732,7 @@ impl Renderer {
             };
             Self::fill_rounded(target, outer, layout::INDICATOR_HEIGHT / 2.0 + 1.0, &halo);
         }
-        Self::fill_rounded(target, pill, layout::INDICATOR_HEIGHT / 2.0, color);
+        Self::fill_rounded(target, pill, layout::INDICATOR_HEIGHT / 2.0, &color);
     }
 
     /// Draws `text` in `color`; with `shadow`, first a soft halo + drop shadow so it

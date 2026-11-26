@@ -85,9 +85,9 @@ const TIMER_COLLAPSE: usize = 3;
 const TIMER_PULSE: usize = 4;
 /// A restore we started ourselves still gets its own `HSHELL_GETMINRECT`; ignore it.
 const OWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-/// Glass opacity of the expanded island bar with `background = "clear"` (it lies
-/// over app windows; the collapsed pill uses the lighter `palette.island`).
-const ISLAND_EXPANDED_ALPHA: f32 = 0.85;
+/// Dock-like zoom of the icon under the pointer, and how fast it follows (s).
+const ZOOM_MAX: f32 = 0.30;
+const ZOOM_EASE: f32 = 0.07;
 /// The resting pill: black like the Dynamic Island, with a faint hairline.
 const REST_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 0.035,
@@ -188,6 +188,12 @@ struct App {
     hit_rect: RECT,
     /// Island: icon of the active app shown at rest, and the one it replaces.
     rest_icon: RestIcon,
+    /// Island strip: pointer x in bar space (DIPs), whether it is over the strip,
+    /// and the eased zoom amount (0..1) of the icons under it.
+    pointer_x: f32,
+    pointer_in: bool,
+    zoom: f32,
+    last_frame: Option<Instant>,
     /// Minimize / restore animation overlay.
     morph: Option<Morph>,
     /// A window we are restoring ourselves (after the grow-out animation).
@@ -326,6 +332,10 @@ fn run_window(options: Options) -> Result<()> {
             origin: (0.0, 0.0),
             hit_rect: RECT::default(),
             rest_icon: RestIcon::default(),
+            pointer_x: 0.0,
+            pointer_in: false,
+            zoom: 0.0,
+            last_frame: None,
             morph: None,
             own_restore: None,
         };
@@ -616,6 +626,10 @@ impl App {
             }
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
+                self.pointer_in = false;
+                if self.zoom > 0.001 {
+                    self.start_frames();
+                }
                 self.island_pointer(false);
                 self.set_hover(None);
                 if self.pressed.take().is_some() {
@@ -892,6 +906,15 @@ impl App {
         }
         self.island_pointer(true);
         let hit = self.hit_at(x, y);
+        if self.island.as_ref().is_some_and(|s| !s.small_window) {
+            // Island strip: the icons zoom around the pointer.
+            self.pointer_x = x as f32 * 96.0 / self.dpi as f32 + self.origin.0;
+            self.pointer_in = true;
+            self.invalidate();
+            if self.zoom < 0.999 {
+                self.start_frames();
+            }
+        }
         self.set_hover(hit);
     }
 
@@ -1047,6 +1070,10 @@ impl App {
 
     fn refresh_tasks(&mut self) {
         if self.tasks.refresh(&self.icons, self.icon_px) {
+            if self.island.as_ref().is_some_and(|s| !s.small_window) {
+                // The strip is open: it grows / shrinks with the list.
+                self.place_island();
+            }
             self.invalidate();
         }
         if self.native_hidden {
@@ -1096,19 +1123,27 @@ impl App {
     }
 
     fn layout(&self) -> BarLayout {
+        if self.island.is_some() {
+            return Self::strip_as_layout(&self.strip());
+        }
         let view = self.status_view();
         let width = layout::status_width(view.icons.len(), view.percent.is_some());
-        let layout = BarLayout::new(
+        BarLayout::new(
             self.bar_width_dip(),
             self.items().len(),
             width,
             &self.metrics,
-        );
-        if self.island.is_some() {
-            // The bar is a band inside the taller island strip.
-            return layout.shifted(self.island_geometry().bar.top);
+        )
+    }
+
+    /// The island strip in the shape drawing and hit-testing use (no Start button).
+    fn strip_as_layout(strip: &island::StripLayout) -> BarLayout {
+        BarLayout {
+            start: D2D_RECT_F::default(),
+            tasks: strip.buttons.clone(),
+            status: strip.status,
+            clock: strip.clock,
         }
-        layout
     }
 
     /// Element at a client-area pixel position.
@@ -1134,8 +1169,18 @@ impl App {
     }
 
     fn scene(&self) -> Scene<'_> {
-        let layout = self.layout();
+        let strip = self.island.is_some().then(|| self.strip());
+        let layout = match &strip {
+            Some(strip) => Self::strip_as_layout(strip),
+            None => self.layout(),
+        };
+        let palette = if strip.is_some() {
+            self.island_palette()
+        } else {
+            self.palette()
+        };
         let foreground = self.tasks.foreground;
+        let button_width = self.metrics.icon_size + 16.0;
         let buttons = layout
             .tasks
             .iter()
@@ -1144,6 +1189,10 @@ impl App {
             .map(|(i, (rect, item))| {
                 let group = item.group.and_then(|g| self.tasks.groups.get(g));
                 let pin = item.pin.and_then(|p| self.pins.items.get(p));
+                // Dock zoom: a smooth bump around the pointer.
+                let center = (rect.left + rect.right) / 2.0;
+                let reach = (self.pointer_x - center) / (button_width * 1.1);
+                let scale = 1.0 + ZOOM_MAX * self.zoom * (-reach * reach).exp();
                 ButtonView {
                     rect: *rect,
                     icon: group
@@ -1153,9 +1202,14 @@ impl App {
                         None => ButtonState::Pinned,
                         Some(g) if g.contains(foreground) => ButtonState::Active,
                         Some(g) if g.attention => ButtonState::Attention,
+                        Some(g) if g.windows.iter().all(|&w| unsafe { IsIconic(w) }.as_bool()) => {
+                            ButtonState::Minimized
+                        }
                         Some(_) => ButtonState::Running,
                     },
                     pointer: self.pointer(Hit::Task(i)),
+                    scale,
+                    lift: (scale - 1.0) * 8.0,
                 }
             })
             .collect();
@@ -1165,7 +1219,7 @@ impl App {
         }
         Scene {
             metrics: self.metrics,
-            palette: self.palette(),
+            palette,
             backdrop: self.theme.backdrop,
             start: (layout.start, self.pointer(Hit::Start)),
             buttons,
@@ -1176,8 +1230,32 @@ impl App {
             clock_pointer: self.pointer(Hit::Clock),
             island: self.island_view(&clock),
             clock,
+            divider: strip.and_then(|s| s.divider),
             origin: self.origin,
         }
+    }
+
+    /// Colors for the content of the island: light on its black panel, whatever the theme.
+    fn island_palette(&self) -> Palette {
+        let white = |a: f32| D2D1_COLOR_F {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a,
+        };
+        let mut p = self.theme.palette();
+        p.text = REST_TEXT;
+        p.hover = white(0.10);
+        p.pressed = white(0.16);
+        p.active = white(0.12);
+        p.active_hover = white(0.16);
+        p.indicator = white(0.6);
+        p.placeholder = white(0.18);
+        p.attention_bg = D2D1_COLOR_F {
+            a: 0.3,
+            ..p.attention
+        };
+        p
     }
 
     fn paint(&mut self) {
@@ -1275,14 +1353,27 @@ impl App {
 
     /// Height of the strip along the screen edge that the island lives in (DIPs).
     fn island_strip_height(&self) -> f32 {
-        island::strip_height(&self.config.bar, self.metrics.bar_height)
+        island::strip_height(&self.config.bar, self.metrics.icon_size)
+    }
+
+    /// The expanded island: panel, icon buttons and the status area.
+    fn strip(&self) -> island::StripLayout {
+        let view = self.status_view();
+        island::strip_layout(
+            self.bar_width_dip(),
+            self.island_strip_height(),
+            &self.config.bar,
+            self.metrics.icon_size,
+            self.items().len(),
+            layout::status_width(view.icons.len(), view.percent.is_some()),
+            self.metrics.at_top,
+        )
     }
 
     fn island_geometry(&self) -> island::Geometry {
         island::geometry(
             self.bar_width_dip(),
             self.island_strip_height(),
-            self.metrics.bar_height,
             &self.config.bar,
             self.metrics.at_top,
         )
@@ -1387,6 +1478,25 @@ impl App {
         let mut running = false;
         let mut repaint = false;
 
+        // Icon zoom follows the pointer with a short ease.
+        if self.island.is_some() {
+            let open = self.island.as_ref().is_some_and(|s| !s.small_window);
+            let target = if open && self.pointer_in { 1.0 } else { 0.0 };
+            if (self.zoom - target).abs() > 0.002 {
+                let dt = self
+                    .last_frame
+                    .map_or(0.016, |at| now.saturating_duration_since(at).as_secs_f32())
+                    .min(0.05);
+                self.zoom += (target - self.zoom) * (1.0 - (-dt / ZOOM_EASE).exp());
+                if (self.zoom - target).abs() < 0.01 {
+                    self.zoom = target;
+                } else {
+                    running = true;
+                }
+                repaint = true;
+            }
+        }
+
         if let Some(state) = &mut self.island
             && state.anim.animating()
         {
@@ -1452,6 +1562,7 @@ impl App {
             }
         }
 
+        self.last_frame = running.then_some(now);
         if repaint {
             self.paint();
         }
@@ -1621,11 +1732,17 @@ impl App {
         let rc = if small {
             to_screen(&geometry.activity_hit)
         } else {
-            bar
+            // Expanded: the strip panel's window (with room for its spring overshoot).
+            let strip = self.strip().window;
+            let a = geometry.activity_hit;
+            to_screen(&D2D_RECT_F {
+                left: strip.left.min(a.left),
+                top: strip.top.min(a.top),
+                right: strip.right.max(a.right),
+                bottom: strip.bottom.max(a.bottom),
+            })
         };
-        let hit = if !small {
-            bar
-        } else if pulsing {
+        let hit = if !small || pulsing {
             rc
         } else {
             to_screen(&geometry.hit)
@@ -1763,37 +1880,18 @@ impl App {
         if attention {
             pill.a = 0.95;
         }
-        // The expanded fill follows `[bar] background` (clear = none, solid = opaque).
-        let mut full = Theme {
-            backdrop: self.config.bar.background,
-            ..self.theme
-        }
-        .palette()
-        .background;
-        if let Some(c) = config::parse_color(&self.config.colors.background) {
-            full = c;
-        }
-        if full.a == 0.0 {
-            // The expanded island lies over app windows (it reserves no space): a
-            // fully clear bar would mix its text with theirs. Use dark glass.
-            full = palette.island;
-            full.a = ISLAND_EXPANDED_ALPHA;
-        }
+        let strip = self.strip().panel;
         // An app going in / out: the pill grows (with spring overshoot) and shows the
         // app's icon instead of its usual content.
         let now = Instant::now();
         let pulse = state.pulse.as_ref().map_or(0.0, |p| p.value(now));
         let deep = pulse.clamp(0.0, 1.0);
         let pill_rect = island::pulsed_pill(&g, pulse);
-        let mix = |a: f32, b: f32| island::lerp(a, b, t);
-        let pill_radius = (pill_rect.bottom - pill_rect.top) / 2.0;
+        let panel = island::lerp_rect(&pill_rect, &strip, t);
         let mut border = REST_BORDER;
-        // The hairline stays (fainter) on the expanded bar as its edge toward the windows.
-        border.a *= if attention {
-            0.0
-        } else {
-            1.0 - 0.5 * t_clamped
-        };
+        if attention {
+            border.a = 0.0;
+        }
 
         // Rest content: active app icon on the left, time on the right.
         let pill_h = g.pill.bottom - g.pill.top;
@@ -1828,16 +1926,12 @@ impl App {
             )
         });
         Some(IslandView {
-            panel: island::lerp_rect(&pill_rect, &g.bar, t),
-            radius: mix(pill_radius, 0.0),
-            fill: D2D1_COLOR_F {
-                r: mix(pill.r, full.r),
-                g: mix(pill.g, full.g),
-                b: mix(pill.b, full.b),
-                a: mix(pill.a, full.a),
-            },
+            panel,
+            // Fully rounded at every size, like the Dynamic Island.
+            radius: (panel.bottom - panel.top) / 2.0,
+            fill: pill,
             border,
-            shadow: (1.0 - t_clamped).max(0.0),
+            shadow: 1.0,
             // Icons appear over the last two thirds of the expansion.
             content_opacity: ((t_clamped - 0.35) / 0.65).clamp(0.0, 1.0),
             rest: Some(RestView {

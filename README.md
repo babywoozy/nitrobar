@@ -8,11 +8,15 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
 - **Chế độ island (mặc định)**: một viên đen bo tròn nổi ở giữa mép dưới màn hình (200×40 DIP, cách
   mép 10 DIP, có bóng đổ mềm). Bên trái là icon của app đang active (đổi app thì icon mờ chuyển sang
   icon mới), bên phải là giờ. Thanh không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc
-  được ẩn). Rê chuột vào viên hoặc chạm mép dưới ở bất kỳ đâu (~100 ms) thì viên giãn ra thành thanh
-  app, rời chuột ~600 ms thì thu lại. Nhấn phím Win (mở Start) cũng làm thanh bung ra.
-  Không thu lại khi đang mở menu chuột phải, Start, Quick Settings, trung tâm thông báo hay đang kéo
-  thả. App cần chú ý thì viên đổi sang màu cam. Đang chơi game / xem video toàn màn hình thì viên ẩn
-  đi và chạm mép không làm thanh bung ra.
+  được ẩn).
+  - Rê chuột vào viên hoặc chạm mép dưới ở bất kỳ đâu (~100 ms): viên giãn ngang bằng lò xo thành dải
+    icon các app (app ghim + đang chạy, gom theo app), vẫn là một khối bo tròn nổi, rộng vừa đủ. Vạch
+    ngắn dưới app đang mở, vạch dài màu nhấn dưới app đang active, chấm mờ dưới app đã thu nhỏ hết
+    cửa sổ, nền cam khi app cần chú ý. Icon dưới con trỏ phóng to nhẹ như dock macOS. Wifi / âm lượng
+    / pin / đồng hồ nằm cuối dải, ngăn cách bằng một vạch mờ. Rời chuột ~600 ms thì thu về viên.
+  - Nhấn phím Win (mở Start) cũng làm thanh bung ra. Không thu lại khi đang mở menu chuột phải, Start,
+    Quick Settings, trung tâm thông báo hay đang kéo thả. Đang chơi game / xem video toàn màn hình thì
+    viên ẩn đi và chạm mép không làm thanh bung ra. Dải island không có nút Start (dùng phím Win).
 - **Chế độ full**: thanh luôn hiện ở đáy (hoặc đỉnh), đăng ký AppBar: cửa sổ phóng to không đè lên thanh.
 - Nút Start (mở Start menu của Windows), app đang chạy gom nhóm theo ứng dụng với icon thật.
   Vạch ngắn = đang chạy, vạch dài màu nhấn = đang mở, nền cam = app cần chú ý.
@@ -115,9 +119,9 @@ ghim thêm trong nitrobar. nitrobar không sửa danh sách ghim của Windows; 
 - [x] Chế độ island: viên thu gọn, bung ra khi rê chuột / chạm mép / nhấn Win, có hiệu ứng
 - [x] Hiệu ứng thu nhỏ / khôi phục cửa sổ vào island (DWM thumbnail + viên nảy)
 
-Chưa có: khay hệ thống (icon app chạy nền), xem trước cửa sổ khi hover, nhiều màn hình
-(thanh chỉ ở màn hình chính). Ở chế độ island, `background = "blur"` / `"acrylic"` chỉ còn lớp màu
-(không làm mờ), vì hiệu ứng mờ của Windows không đi theo được khung bo tròn đang co giãn. Hiệu ứng
+Chưa có: khay hệ thống (icon app chạy nền), nhiều màn hình (thanh chỉ ở màn hình chính). Ở chế độ
+island, `background` và `[colors]` không áp dụng: viên luôn đen (nền trong suốt hẳn không đọc được
+khi thanh đè lên cửa sổ app); chúng chỉ dùng cho chế độ `full`. Hiệu ứng
 thu nhỏ: góc bo của ảnh cửa sổ hơi răng cưa (DWM không cho bo góc thumbnail, phải cắt bằng region),
 cửa sổ biến mất ~1-2 khung hình trước khi hiệu ứng bắt đầu, và khi khôi phục có thể thấy một khung
 tối lúc app vẽ lại.

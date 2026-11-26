@@ -30,6 +30,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::config::BarConfig;
 use crate::icons::Icon;
+use crate::layout::{CLOCK_WIDTH, STATUS_GAP};
 use crate::morph::spring;
 use crate::tasks;
 
@@ -207,8 +208,6 @@ impl Pulse {
 /// edge: full monitor width, `strip_height` tall.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geometry {
-    /// The full bar (band at the screen edge) the pill expands into.
-    pub bar: D2D_RECT_F,
     /// The pill at rest.
     pub pill: D2D_RECT_F,
     /// Window rectangle while collapsed: the pill plus a hover / shadow margin,
@@ -225,31 +224,34 @@ pub fn pulsed_pill(g: &Geometry, v: f32) -> D2D_RECT_F {
     lerp_rect(&g.pill, &g.activity, v)
 }
 
-/// Height of the strip the island lives in: the full bar, or at least the
-/// activity pill plus its gap and margins.
-pub fn strip_height(config: &BarConfig, bar_height: f32) -> f32 {
+/// Height of the strip the island lives in: gap + the tallest of its shapes (rest,
+/// activity, expanded) + room for the shadow and the bounce.
+pub fn strip_height(config: &BarConfig, icon_size: f32) -> f32 {
     let activity = config.island_height + ACTIVITY_EXTRA_HEIGHT;
-    bar_height.max(config.island_gap + activity + HIT_MARGIN + 4.0)
+    let expanded = config.island_height.max(icon_size + 28.0);
+    config.island_gap + activity.max(expanded) + HIT_MARGIN + 8.0
 }
 
-pub fn geometry(
+/// A band `dist` away from the screen edge, `h` tall, inside the strip: (top, bottom).
+fn band_y(at_top: bool, strip_height: f32, dist: f32, h: f32) -> (f32, f32) {
+    if at_top {
+        (dist, dist + h)
+    } else {
+        (strip_height - dist - h, strip_height - dist)
+    }
+}
+
+/// Window rect for a pill-like shape: grown by `margin_x` sideways and `margin_y`
+/// inward, reaching the screen edge.
+fn edge_window(
+    r: &D2D_RECT_F,
+    margin_x: f32,
+    margin_y: f32,
     width: f32,
     strip_height: f32,
-    bar_height: f32,
-    config: &BarConfig,
     at_top: bool,
-) -> Geometry {
-    // A band `dist` away from the screen edge, `h` tall: (top, bottom).
-    let band = |dist: f32, h: f32| {
-        if at_top {
-            (dist, dist + h)
-        } else {
-            (strip_height - dist - h, strip_height - dist)
-        }
-    };
-    // Window rect for a pill-like shape: grown by `margin_x` sideways and `margin_y`
-    // inward, reaching the screen edge.
-    let window = |r: &D2D_RECT_F, margin_x: f32, margin_y: f32| D2D_RECT_F {
+) -> D2D_RECT_F {
+    D2D_RECT_F {
         left: (r.left - margin_x).max(0.0),
         right: (r.right + margin_x).min(width),
         top: if at_top {
@@ -262,7 +264,13 @@ pub fn geometry(
         } else {
             strip_height
         },
-    };
+    }
+}
+
+pub fn geometry(width: f32, strip_height: f32, config: &BarConfig, at_top: bool) -> Geometry {
+    let band = |dist: f32, h: f32| band_y(at_top, strip_height, dist, h);
+    let window =
+        |r: &D2D_RECT_F, mx: f32, my: f32| edge_window(r, mx, my, width, strip_height, at_top);
     let gap = config.island_gap;
     let pill_w = config.island_width.min(width);
     let pill_h = config.island_height.min(strip_height - gap);
@@ -292,22 +300,113 @@ pub fn geometry(
         (act_w - pill_w) * 0.25 + HIT_MARGIN,
         (act_h - pill_h) * 0.25 + HIT_MARGIN,
     );
-    let (bar_top, bar_bottom) = if at_top {
-        (0.0, bar_height)
-    } else {
-        (strip_height - bar_height, strip_height)
-    };
     Geometry {
         activity,
         activity_hit,
-        bar: D2D_RECT_F {
-            left: 0.0,
-            top: bar_top,
-            right: width,
-            bottom: bar_bottom,
-        },
         pill,
         hit,
+    }
+}
+
+/// Space around the icons inside the expanded pill, between buttons, and around the divider.
+const STRIP_PAD: f32 = 12.0;
+const STRIP_GAP: f32 = 2.0;
+const DIVIDER_SPACE: f32 = 8.0;
+/// Height of the divider line between the apps and the status area.
+const DIVIDER_HEIGHT: f32 = 22.0;
+
+/// The pill expanded into the strip of app icons (bar space, DIPs). Buttons are
+/// laid out at their final positions; the panel grows from the pill to `panel`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StripLayout {
+    pub panel: D2D_RECT_F,
+    /// Window rect that holds the panel, its shadow and the spring overshoot.
+    pub window: D2D_RECT_F,
+    pub buttons: Vec<D2D_RECT_F>,
+    pub divider: Option<D2D_RECT_F>,
+    /// Zero width when there is nothing to show.
+    pub status: D2D_RECT_F,
+    pub clock: D2D_RECT_F,
+}
+
+/// Lays out `items` app buttons, then a divider, then `status_width` and the clock,
+/// in one rounded panel centered on the screen. Buttons that don't fit are dropped.
+pub fn strip_layout(
+    width: f32,
+    strip_height: f32,
+    config: &BarConfig,
+    icon_size: f32,
+    items: usize,
+    status_width: f32,
+    at_top: bool,
+) -> StripLayout {
+    let button = icon_size + 16.0;
+    let panel_h = (button + 12.0).max(config.island_height);
+    let status_gap = if status_width > 0.0 { STATUS_GAP } else { 0.0 };
+    let tail = status_width + status_gap + CLOCK_WIDTH;
+    let divider_w = |apps: bool| {
+        if apps { DIVIDER_SPACE * 2.0 + 1.0 } else { 0.0 }
+    };
+    let fixed = STRIP_PAD * 2.0 + tail + divider_w(items > 0);
+    let room = (width - 32.0 - fixed + STRIP_GAP) / (button + STRIP_GAP);
+    let n = items.min(room.floor().max(0.0) as usize);
+    let apps_w = if n > 0 {
+        n as f32 * button + (n - 1) as f32 * STRIP_GAP
+    } else {
+        0.0
+    };
+    let panel_w = (STRIP_PAD * 2.0 + apps_w + divider_w(n > 0) + tail)
+        .max(config.island_width)
+        .min(width);
+    let left = ((width - panel_w) / 2.0).round();
+    let (top, bottom) = band_y(at_top, strip_height, config.island_gap, panel_h);
+    let panel = D2D_RECT_F {
+        left,
+        top,
+        right: left + panel_w,
+        bottom,
+    };
+    // Content row, vertically centered in the panel.
+    let row_top = top + (panel_h - button) / 2.0;
+    let row = |l: f32, w: f32| D2D_RECT_F {
+        left: l,
+        top: row_top,
+        right: l + w,
+        bottom: row_top + button,
+    };
+    let first = left + STRIP_PAD;
+    let buttons: Vec<D2D_RECT_F> = (0..n)
+        .map(|i| row(first + i as f32 * (button + STRIP_GAP), button))
+        .collect();
+    let mut x = first + apps_w;
+    let divider = (n > 0).then(|| {
+        let line = D2D_RECT_F {
+            left: x + DIVIDER_SPACE,
+            top: (top + bottom) / 2.0 - DIVIDER_HEIGHT / 2.0,
+            right: x + DIVIDER_SPACE + 1.0,
+            bottom: (top + bottom) / 2.0 + DIVIDER_HEIGHT / 2.0,
+        };
+        x += divider_w(true);
+        line
+    });
+    let status = row(x, status_width);
+    let clock = row(x + status_width + status_gap, CLOCK_WIDTH);
+    let overshoot = (panel_w - config.island_width).max(0.0) * 0.06;
+    let window = edge_window(
+        &panel,
+        HIT_MARGIN + 8.0 + overshoot,
+        HIT_MARGIN + 6.0,
+        width,
+        strip_height,
+        at_top,
+    );
+    StripLayout {
+        panel,
+        window,
+        buttons,
+        divider,
+        status,
+        clock,
     }
 }
 
@@ -518,8 +617,8 @@ mod tests {
     #[test]
     fn pill_floats_above_the_edge() {
         let config = BarConfig::default();
-        let strip = strip_height(&config, 48.0);
-        let g = geometry(1920.0, strip, 48.0, &config, false);
+        let strip = strip_height(&config, 24.0);
+        let g = geometry(1920.0, strip, &config, false);
         assert_eq!(
             (g.pill.right - g.pill.left, g.pill.bottom - g.pill.top),
             (200.0, 40.0)
@@ -527,20 +626,58 @@ mod tests {
         assert_eq!((g.pill.left + g.pill.right) / 2.0, 960.0);
         assert_eq!(g.pill.bottom, strip - config.island_gap, "gap to the edge");
         assert_eq!(g.hit.bottom, strip, "window reaches the screen edge");
-        assert_eq!(g.bar.bottom, strip);
-        assert_eq!(g.bar.top, strip - 48.0);
-        let top = geometry(1920.0, strip, 48.0, &config, true);
+        let top = geometry(1920.0, strip, &config, true);
         assert_eq!(top.pill.top, config.island_gap);
         assert_eq!(top.hit.top, 0.0);
-        assert_eq!(top.bar.top, 0.0);
-        // The activity pill and its hover margin always fit in the strip.
-        assert!(g.activity_hit.top >= 0.0 && strip >= 48.0);
+        assert!(g.activity_hit.top >= 0.0);
+    }
+
+    #[test]
+    fn strip_holds_buttons_divider_status_and_clock() {
+        let config = BarConfig::default();
+        let strip = strip_height(&config, 24.0);
+        let l = strip_layout(1920.0, strip, &config, 24.0, 5, 100.0, false);
+        assert_eq!(l.buttons.len(), 5);
+        let inside = |r: &D2D_RECT_F| {
+            r.left >= l.panel.left
+                && r.right <= l.panel.right
+                && r.top >= l.panel.top
+                && r.bottom <= l.panel.bottom
+        };
+        assert!(l.buttons.iter().all(inside));
+        assert!(inside(&l.status) && inside(&l.clock));
+        let divider = l.divider.unwrap();
+        assert!(divider.left > l.buttons[4].right && divider.right < l.status.left);
+        assert!(l.clock.left >= l.status.right && l.clock.right < l.panel.right);
+        // Centered on the screen, bottom edge on the pill's baseline, window holds it.
+        assert!(((l.panel.left + l.panel.right) / 2.0 - 960.0).abs() <= 1.0);
+        assert_eq!(l.panel.bottom, strip - config.island_gap);
+        assert!(l.window.left < l.panel.left && l.window.right > l.panel.right);
+        assert_eq!(l.window.bottom, strip);
+        assert!(l.window.top >= 0.0);
+        // Wider than the pill, and never narrower.
+        assert!(l.panel.right - l.panel.left > config.island_width);
+        let few = strip_layout(1920.0, strip, &config, 24.0, 0, 0.0, false);
+        assert!(few.buttons.is_empty() && few.divider.is_none());
+        assert!(few.panel.right - few.panel.left >= config.island_width);
+    }
+
+    #[test]
+    fn strip_drops_buttons_that_do_not_fit() {
+        let config = BarConfig::default();
+        let strip = strip_height(&config, 24.0);
+        let l = strip_layout(600.0, strip, &config, 24.0, 40, 100.0, false);
+        assert!(l.buttons.len() < 40 && !l.buttons.is_empty());
+        assert!(l.panel.left >= 0.0 && l.panel.right <= 600.0);
+        let top = strip_layout(1920.0, strip, &config, 24.0, 3, 0.0, true);
+        assert_eq!(top.panel.top, config.island_gap);
+        assert_eq!(top.window.top, 0.0);
     }
 
     #[test]
     fn activity_holds_the_pill_and_its_bounce() {
         let config = BarConfig::default();
-        let g = geometry(1920.0, strip_height(&config, 48.0), 48.0, &config, false);
+        let g = geometry(1920.0, strip_height(&config, 24.0), &config, false);
         let inside = |a: &D2D_RECT_F, b: &D2D_RECT_F| {
             a.left >= b.left && a.top >= b.top && a.right <= b.right && a.bottom <= b.bottom
         };
