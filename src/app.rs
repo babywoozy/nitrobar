@@ -149,6 +149,33 @@ thread_local! {
     static MIN_RECT: Cell<RECT> = const { Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }) };
 }
 
+/// Brightness of the desktop around the island, measured off the UI thread
+/// (`GetPixel` on the screen DC costs ~15 ms per pixel: sampling on the UI thread
+/// froze the start of the expansion for ~140 ms).
+static BACKDROP_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BACKDROP_LUMA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Posted by the sampling thread when `BACKDROP_LUMA` is fresh.
+const WM_APP_BACKDROP: u32 = WM_APP + 11;
+
+/// Average luma (0..1) of the screen pixels at `points`; `None` if none is on screen.
+fn sample_luma(points: &[(i32, i32)]) -> Option<f32> {
+    let (mut total, mut count) = (0.0, 0.0);
+    unsafe {
+        let hdc = GetDC(None);
+        for &(x, y) in points {
+            let c = GetPixel(hdc, x, y).0;
+            if c == 0xFFFF_FFFF {
+                continue; // off screen
+            }
+            let (r, g, b) = (c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff);
+            total += (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
+            count += 1.0;
+        }
+        ReleaseDC(None, hdc);
+    }
+    (count > 0.0).then(|| total / count)
+}
+
 pub struct Options {
     pub hide_taskbar: bool,
 }
@@ -204,6 +231,7 @@ struct App {
     /// pill is light (text / icons turn dark).
     glass: Option<Glass>,
     backdrop_light: bool,
+    backdrop_fg: HWND,
     /// Island strip: pointer x in bar space (DIPs), whether it is over the strip,
     /// and the eased zoom amount (0..1) of the icons under it.
     zoom: Vec<f32>,
@@ -358,6 +386,7 @@ fn run_window(options: Options) -> Result<()> {
             rest_icon: RestIcon::default(),
             glass: None,
             backdrop_light: false,
+            backdrop_fg: HWND::default(),
             zoom: Vec::new(),
             last_frame: None,
             preview: None,
@@ -483,6 +512,7 @@ fn on_busy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         return;
     }
     let keep = msg == WM_APP_MINIMIZED
+        || msg == WM_APP_BACKDROP
         || msg == WM_APP_CONFIG
         || msg == WM_APP_PINS
         || msg == preview::WM_APP_PREVIEW
@@ -665,6 +695,7 @@ impl App {
                 self.start_frames();
             }
             morph::WM_APP_FRAME => self.on_frame(),
+            WM_APP_BACKDROP => self.on_backdrop_luma(),
             preview::WM_APP_PREVIEW => match wparam.0 {
                 preview::ENTER => {
                     self.preview_hover = true;
@@ -893,25 +924,41 @@ impl App {
             (panel.right + 10.0, panel.bottom),
         ];
         points.extend((1..=5).map(|i| (panel.left + w * i as f32 / 6.0, above)));
-        let mut total = 0.0;
-        let mut count = 0.0;
-        unsafe {
-            let hdc = GetDC(None);
-            for (x, y) in points {
-                let c = GetPixel(hdc, bar.left + px(x), bar.top + px(y)).0;
-                if c == 0xFFFF_FFFF {
-                    continue; // off screen
-                }
-                let (r, g, b) = (c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff);
-                total += (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
-                count += 1.0;
-            }
-            ReleaseDC(None, hdc);
-        }
-        if count == 0.0 {
+        // Screen pixels, sampled on a short-lived thread; the answer comes back as
+        // `WM_APP_BACKDROP`. At most one sample runs at a time.
+        let points: Vec<(i32, i32)> = points
+            .into_iter()
+            .map(|(x, y)| (bar.left + px(x), bar.top + px(y)))
+            .collect();
+        if BACKDROP_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
-        let luma = total / count;
+        let target = self.hwnd.0 as usize;
+        let spawned = std::thread::Builder::new()
+            .name("nitrobar-backdrop".into())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                if let Some(luma) = sample_luma(&points) {
+                    BACKDROP_LUMA.store(luma.to_bits(), std::sync::atomic::Ordering::Release);
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(target as *mut _)),
+                            WM_APP_BACKDROP,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+                BACKDROP_BUSY.store(false, std::sync::atomic::Ordering::Release);
+            });
+        if spawned.is_err() {
+            BACKDROP_BUSY.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The sampling thread measured the desktop around the island.
+    fn on_backdrop_luma(&mut self) {
+        let luma = f32::from_bits(BACKDROP_LUMA.load(std::sync::atomic::Ordering::Acquire));
         // Hysteresis: no flicker around the threshold.
         let light = if self.backdrop_light {
             luma > 0.48
@@ -1263,7 +1310,12 @@ impl App {
         if self.island.is_some() {
             self.update_rest_icon();
             self.on_foreground_changed();
-            self.refresh_backdrop();
+            // Title changes etc. also refresh the list: only a new foreground app
+            // can change what is behind the island.
+            if self.tasks.foreground != self.backdrop_fg {
+                self.backdrop_fg = self.tasks.foreground;
+                self.refresh_backdrop();
+            }
         }
     }
 
