@@ -17,7 +17,7 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Ngân sách hiệu năng (bắt buộc)
 
-- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB.
+- RAM: private bytes < 20 MB (bắt buộc), mục tiêu < 10 MB. Working set tính cả trang DLL hệ thống dùng chung nên chỉ để tham khảo. Đo được: GĐ1 4.6 MB / 17 MB; GĐ2 9.1 MB / 31 MB (WIC + shell COM cho icon); GĐ3 9.3 MB / 31 MB; GĐ4 9.5 MB / 32 MB.
 - CPU: 0 ms khi không có sự kiện. Đo lại sau mỗi giai đoạn (Process.TotalProcessorTime trong 5 giây).
 - Không polling. Mọi cập nhật đến từ sự kiện: WinEvent hook, shell hook, appbar callback,
   WM_SETTINGCHANGE, notification COM... Timer chỉ dùng khi không có sự kiện tương ứng, và
@@ -27,7 +27,8 @@ Bản debug có console (thấy log `debug_log!`); bản release là GUI subsyst
 
 ## Phụ thuộc
 
-- Chỉ dùng crate `windows` (windows-rs). Không dùng framework GUI (egui, Tauri, webview, winit...).
+- Chỉ dùng crate `windows` (windows-rs) + `windows-core` (cho `#[implement]`). Không dùng framework
+  GUI (egui, Tauri, webview, winit...).
 - Thêm crate mới phải có lý do rõ ràng (ví dụ `toml` + `serde` cho giai đoạn 5) và ghi vào đây.
 - Feature của `windows` bật tối thiểu; thêm feature khi cần, giữ danh sách theo thứ tự ABC.
 
@@ -47,10 +48,30 @@ src/
   icons.rs    icon thật -> IWICBitmap (AUMID/AppsFolder, WM_GETICON, icon file exe)
   menu.rs     menu chuột phải (TrackPopupMenu, chạy NGOÀI borrow của App)
   theme.rs    sáng/tối + màu accent từ registry, Palette, nền acrylic (DWM), menu tối
-  shell.rs    mở UI của Windows bằng phím tắt giả lập (Start = Win, thông báo = Win+N)
+  shell.rs    mở UI của Windows bằng phím tắt giả lập (Start = Win, Quick Settings = Win+A,
+              thông báo = Win+N)
+  status/     wifi / âm lượng / pin: mod.rs (gộp thông báo, StatusView), network.rs,
+              volume.rs (COM callback), battery.rs
 ```
 
-Dự kiến thêm: `status/{network,volume,battery}.rs` (GĐ4), `config.rs` + `pins.rs` (GĐ5).
+Dự kiến thêm: `config.rs` + `pins.rs` (GĐ5).
+
+### Trạng thái hệ thống (status/)
+
+- **Không bao giờ gọi dịch vụ hệ thống có thể chậm trên UI thread.** WLAN service có lúc mất
+  vài giây (lần đầu sau khi boot): GĐ4 từng treo UI thread ở `LpcReply` vì vậy. Mạng được khởi
+  tạo trên thread `nitrobar-network`, trạng thái tính lại ngay trong callback (thread pool) và
+  lưu vào `Mutex`; UI chỉ đọc `network::current()`.
+- Âm lượng: `IAudioEndpointVolumeCallback::OnNotify` mang sẵn level + mute -> lưu atomics;
+  `IMMNotificationClient::OnDefaultDeviceChanged` -> UI thread re-bind thiết bị mới.
+- Pin: `RegisterPowerSettingNotification` (phần trăm pin, nguồn AC) -> `WM_POWERBROADCAST`.
+  Máy không có pin thì ẩn icon pin.
+- Callback ở thread khác chỉ gọi `status::notify(bit)`: gộp bit vào `PENDING`, post một
+  `WM_APP_STATUS`. UI chỉ vẽ lại khi `StatusView` thay đổi.
+- Icon dùng font "Segoe Fluent Icons" (dự phòng "Segoe MDL2 Assets"). Mã đã kiểm tra bằng
+  cách render: wifi E872/E873/E874/E701, offline F384, ethernet E839, loa E992-E995, mute
+  E74F, pin EBA0+n, đang sạc EBAB+n (n = 0..10).
+- `#[implement]` cần `windows-core` là dependency trực tiếp (đã có sẵn qua `windows`).
 
 ### Giao diện (theme.rs, render.rs)
 

@@ -8,7 +8,7 @@ Nhẹ (~9 MB private memory), chạy theo sự kiện (0% CPU khi rảnh).
 - [x] Giai đoạn 1: thanh ở đáy màn hình, đăng ký AppBar, đồng hồ, ẩn/khôi phục taskbar gốc
 - [x] Giai đoạn 2: danh sách app đang chạy (gom nhóm theo app), icon thật, bấm để chuyển / thu nhỏ, menu chuột phải (Đóng cửa sổ / Thoát)
 - [x] Giai đoạn 3: nút Start, hover / nhấn, nút bo góc, nền acrylic, theme sáng/tối + màu accent, menu tối
-- [ ] Giai đoạn 4: wifi, âm lượng, pin, mở Quick Settings
+- [x] Giai đoạn 4: wifi, âm lượng, pin (%), bấm mở Quick Settings; đồng hồ mở trung tâm thông báo
 - [ ] Giai đoạn 5: ghim app, menu chuột phải, cấu hình TOML
 
 ## Dùng

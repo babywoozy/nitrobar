@@ -31,13 +31,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, WM_DWMCOLORIZATIONCOLORCHANGED, WM_MOUSEMOVE, WM_NCACTIVATE, WM_THEMECHANGED,
+    GetWindowRect, PBT_APMPOWERSTATUSCHANGE, PBT_POWERSETTINGCHANGE,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_MOUSEMOVE, WM_NCACTIVATE, WM_POWERBROADCAST,
+    WM_THEMECHANGED,
 };
 use windows::core::{PCWSTR, Result, w};
 
 use crate::icons::IconLoader;
 use crate::layout::{BarLayout, Hit};
 use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
+use crate::status::{self, Status};
 use crate::tasks::{self, TaskList};
 use crate::theme::{self, Theme};
 use crate::{appbar, clock, layout, menu, safety, shell, taskbar};
@@ -68,6 +71,8 @@ struct App {
     icons: IconLoader,
     icon_px: u32,
     tasks: TaskList,
+    /// Started in `init` (needs the window); `None` after cleanup.
+    status: Option<Status>,
     theme: Theme,
     /// Element under the pointer, and whether we asked for WM_MOUSELEAVE.
     hover: Option<Hit>,
@@ -144,6 +149,7 @@ fn run_window(options: Options) -> Result<()> {
             icons,
             icon_px: 0,
             tasks: TaskList::new(hwnd),
+            status: None,
             theme: Theme::from_system(),
             hover: None,
             tracking_mouse: false,
@@ -254,6 +260,21 @@ impl App {
         match msg {
             WM_APP_INIT => self.init(),
             tasks::WM_APP_REFRESH => self.refresh_tasks(),
+            status::WM_APP_STATUS => self.refresh_status(),
+            WM_POWERBROADCAST => {
+                if matches!(
+                    wparam.0 as u32,
+                    PBT_APMPOWERSTATUSCHANGE | PBT_POWERSETTINGCHANGE
+                ) && let Some(status) = &mut self.status
+                {
+                    let before = status.battery;
+                    status.refresh_battery();
+                    if status.battery != before {
+                        self.invalidate();
+                    }
+                }
+                return Some(LRESULT(1));
+            }
             appbar::CALLBACK_MSG => self.on_appbar_notify(wparam.0 as u32, lparam),
             WM_TIMER if wparam.0 == TIMER_CLOCK => self.tick_clock(),
             WM_TIMECHANGE => self.tick_clock(),
@@ -317,8 +338,20 @@ impl App {
             let _ = RegisterShellHookWindow(self.hwnd);
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
+        self.status = Some(Status::new(self.hwnd));
         self.refresh_tasks();
         self.tick_clock();
+    }
+
+    fn refresh_status(&mut self) {
+        let sources = status::take_pending();
+        if let Some(status) = &mut self.status {
+            let before = status.view();
+            status.refresh(sources);
+            if status.view() != before {
+                self.invalidate();
+            }
+        }
     }
 
     fn apply_theme(&mut self) {
@@ -363,6 +396,7 @@ impl App {
         match hit {
             Some(Hit::Start) => shell::open_start(),
             Some(Hit::Task(index)) => self.tasks.click(index),
+            Some(Hit::Status) => shell::open_quick_settings(),
             Some(Hit::Clock) => shell::open_notification_center(),
             None => {}
         }
@@ -489,7 +523,11 @@ impl App {
     }
 
     fn layout(&self) -> BarLayout {
-        BarLayout::new(self.bar_width_dip(), self.tasks.groups.len())
+        let width = self.status.as_ref().map_or(0.0, |s| {
+            let view = s.view();
+            layout::status_width(view.icons.len(), view.percent.is_some())
+        });
+        BarLayout::new(self.bar_width_dip(), self.tasks.groups.len(), width)
     }
 
     /// Element at a client-area pixel position.
@@ -531,6 +569,9 @@ impl App {
             translucent: self.theme.acrylic,
             start: (layout.start, self.pointer(Hit::Start)),
             buttons,
+            status_rect: layout.status,
+            status_pointer: self.pointer(Hit::Status),
+            status: self.status.as_ref().map(Status::view).unwrap_or_default(),
             clock_rect: layout.clock,
             clock_pointer: self.pointer(Hit::Clock),
             clock: clock::now(),
@@ -559,6 +600,9 @@ impl App {
         }
         self.cleaned_up = true;
         tasks::remove_hooks();
+        if let Some(mut status) = self.status.take() {
+            status.shutdown();
+        }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_CLOCK);
             let _ = DeregisterShellHookWindow(self.hwnd);

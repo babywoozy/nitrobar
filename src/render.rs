@@ -21,16 +21,18 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
     DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
     IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-use windows::core::{Result, w};
+use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::clock::ClockText;
 use crate::icons::Icon;
 use crate::layout;
+use crate::status::StatusView;
 use crate::theme::Palette;
 
 const TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
@@ -68,6 +70,9 @@ pub struct Scene<'a> {
     pub translucent: bool,
     pub start: (D2D_RECT_F, Pointer),
     pub buttons: Vec<ButtonView<'a>>,
+    pub status_rect: D2D_RECT_F,
+    pub status_pointer: Pointer,
+    pub status: StatusView,
     pub clock_rect: D2D_RECT_F,
     pub clock_pointer: Pointer,
     pub clock: ClockText,
@@ -85,7 +90,58 @@ struct Target {
 pub struct Renderer {
     d2d: ID2D1Factory,
     clock_format: IDWriteTextFormat,
+    icon_format: IDWriteTextFormat,
+    percent_format: IDWriteTextFormat,
     target: Option<Target>,
+}
+
+/// "Segoe Fluent Icons" (Windows 11), else "Segoe MDL2 Assets" (same code points).
+fn icon_font_family(dwrite: &IDWriteFactory) -> PCWSTR {
+    let fluent = w!("Segoe Fluent Icons");
+    let found = unsafe {
+        let mut collection = None;
+        if dwrite
+            .GetSystemFontCollection(&raw mut collection, false)
+            .is_err()
+        {
+            return fluent;
+        }
+        let mut index = 0u32;
+        let mut exists = BOOL::default();
+        collection.is_some_and(|c| {
+            c.FindFamilyName(fluent, &raw mut index, &raw mut exists)
+                .is_ok()
+                && exists.as_bool()
+        })
+    };
+    if found {
+        fluent
+    } else {
+        w!("Segoe MDL2 Assets")
+    }
+}
+
+fn text_format(
+    dwrite: &IDWriteFactory,
+    family: PCWSTR,
+    size: f32,
+    align: DWRITE_TEXT_ALIGNMENT,
+) -> Result<IDWriteTextFormat> {
+    unsafe {
+        let format = dwrite.CreateTextFormat(
+            family,
+            None,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            size,
+            w!(""),
+        )?;
+        format.SetTextAlignment(align)?;
+        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        Ok(format)
+    }
 }
 
 impl Renderer {
@@ -93,21 +149,27 @@ impl Renderer {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let clock_format = dwrite.CreateTextFormat(
-                w!("Segoe UI Variable Text"),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                CLOCK_FONT_SIZE,
-                w!(""),
-            )?;
-            clock_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-            clock_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            clock_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let ui_font = w!("Segoe UI Variable Text");
             Ok(Self {
                 d2d,
-                clock_format,
+                clock_format: text_format(
+                    &dwrite,
+                    ui_font,
+                    CLOCK_FONT_SIZE,
+                    DWRITE_TEXT_ALIGNMENT_TRAILING,
+                )?,
+                icon_format: text_format(
+                    &dwrite,
+                    icon_font_family(&dwrite),
+                    layout::STATUS_GLYPH_SIZE,
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                )?,
+                percent_format: text_format(
+                    &dwrite,
+                    ui_font,
+                    CLOCK_FONT_SIZE,
+                    DWRITE_TEXT_ALIGNMENT_LEADING,
+                )?,
                 target: None,
             })
         }
@@ -206,6 +268,7 @@ impl Renderer {
             Self::draw_button(&mut target, palette, button, &mut used);
         }
         target.bitmaps.retain(|id, _| used.contains(id));
+        self.draw_status(&target, scene);
         self.draw_clock(&target, scene);
 
         match unsafe { target.rt.EndDraw(None, None) } {
@@ -350,6 +413,60 @@ impl Renderer {
         };
         let pill = layout::indicator(&rect, width);
         Self::fill_rounded(target, pill, layout::INDICATOR_HEIGHT / 2.0, color);
+    }
+
+    fn draw_text(
+        &self,
+        target: &Target,
+        text: &[u16],
+        format: &IDWriteTextFormat,
+        rect: D2D_RECT_F,
+    ) {
+        unsafe {
+            target.rt.DrawText(
+                text,
+                format,
+                &raw const rect,
+                &target.brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
+    fn draw_status(&self, target: &Target, scene: &Scene) {
+        let rect = scene.status_rect;
+        if rect.right <= rect.left {
+            return;
+        }
+        Self::draw_button_background(target, &scene.palette, rect, false, scene.status_pointer);
+        let mut track_color = scene.palette.text;
+        track_color.a *= 0.35;
+        let mut left = rect.left + layout::STATUS_PADDING;
+        for icon in &scene.status.icons {
+            let cell = D2D_RECT_F {
+                left,
+                top: rect.top,
+                right: left + layout::STATUS_CELL,
+                bottom: rect.bottom,
+            };
+            if let Some(track) = icon.track {
+                unsafe { target.brush.SetColor(&raw const track_color) };
+                self.draw_text(target, &[track], &self.icon_format, cell);
+            }
+            unsafe { target.brush.SetColor(&raw const scene.palette.text) };
+            self.draw_text(target, &[icon.glyph], &self.icon_format, cell);
+            left += layout::STATUS_CELL;
+        }
+        if let Some(percent) = &scene.status.percent {
+            let cell = D2D_RECT_F {
+                left: left + 2.0,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            self.draw_text(target, percent, &self.percent_format, cell);
+        }
     }
 
     fn draw_clock(&self, target: &Target, scene: &Scene) {

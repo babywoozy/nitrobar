@@ -6,7 +6,7 @@
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
-    VIRTUAL_KEY, VK_LWIN, VK_N,
+    VIRTUAL_KEY, VK_A, VK_LWIN, VK_N,
 };
 
 fn key(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -37,6 +37,11 @@ fn chord(keys: &[VIRTUAL_KEY]) {
 /// Toggles the Start menu (Win).
 pub fn open_start() {
     chord(&[VK_LWIN]);
+}
+
+/// Toggles Quick Settings: Wi-Fi, volume, battery (Win+A).
+pub fn open_quick_settings() {
+    chord(&[VK_LWIN, VK_A]);
 }
 
 /// Toggles the notification center + calendar (Win+N).

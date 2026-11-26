@@ -26,6 +26,7 @@ mod menu;
 mod render;
 mod safety;
 mod shell;
+mod status;
 mod taskbar;
 mod tasks;
 mod theme;

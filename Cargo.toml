@@ -8,6 +8,11 @@ description = "A lightweight, event-driven Windows 11 taskbar replacement writte
 repository = "https://github.com/babywoozy/nitrobar"
 publish = false
 
+[dependencies]
+# Already a dependency of `windows`; listed directly because `#[implement]` (COM
+# callbacks in status/volume.rs) expands to `::windows_core` paths.
+windows-core = "0.62"
+
 [dependencies.windows]
 version = "0.62"
 features = [
@@ -20,6 +25,12 @@ features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinSock",
     "Win32_Storage_EnhancedStorage",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
@@ -27,8 +38,10 @@ features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
+    "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_Accessibility",

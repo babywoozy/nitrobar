@@ -21,17 +21,35 @@ pub const CLOCK_TEXT_PADDING: f32 = 8.0;
 pub const CLOCK_LINE_HEIGHT: f32 = 16.0;
 pub const RIGHT_MARGIN: f32 = 8.0;
 
+pub const STATUS_PADDING: f32 = 8.0;
+pub const STATUS_CELL: f32 = 24.0;
+pub const STATUS_GLYPH_SIZE: f32 = 16.0;
+pub const STATUS_PERCENT_WIDTH: f32 = 34.0;
+pub const STATUS_GAP: f32 = 2.0;
+
+/// Width of the status button for `icons` glyphs (+ battery percentage).
+pub fn status_width(icons: usize, percent: bool) -> f32 {
+    if icons == 0 {
+        return 0.0;
+    }
+    let text = if percent { STATUS_PERCENT_WIDTH } else { 0.0 };
+    STATUS_PADDING * 2.0 + icons as f32 * STATUS_CELL + text
+}
+
 /// What the pointer is over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
     Start,
     Task(usize),
+    Status,
     Clock,
 }
 
 pub struct BarLayout {
     pub start: D2D_RECT_F,
     pub tasks: Vec<D2D_RECT_F>,
+    /// Network / volume / battery button, left of the clock (zero width if empty).
+    pub status: D2D_RECT_F,
     pub clock: D2D_RECT_F,
 }
 
@@ -42,7 +60,7 @@ fn button_top() -> f32 {
 impl BarLayout {
     /// Start + task buttons centered like Windows 11; clock on the right.
     /// Task buttons that would run into the right-hand area are dropped.
-    pub fn new(bar_width: f32, task_count: usize) -> Self {
+    pub fn new(bar_width: f32, task_count: usize, status_width: f32) -> Self {
         let top = button_top();
         let clock_right = bar_width - RIGHT_MARGIN;
         let clock = D2D_RECT_F {
@@ -52,7 +70,14 @@ impl BarLayout {
             bottom: top + BUTTON_HEIGHT,
         };
 
-        let limit = clock.left - BUTTON_GAP;
+        let status = D2D_RECT_F {
+            left: clock.left - STATUS_GAP - status_width,
+            top,
+            right: clock.left - STATUS_GAP,
+            bottom: top + BUTTON_HEIGHT,
+        };
+
+        let limit = status.left - BUTTON_GAP;
         let step = BUTTON_WIDTH + BUTTON_GAP;
         let max_fit = ((limit + BUTTON_GAP) / step).max(1.0) as usize;
         let count = (task_count + 1).min(max_fit);
@@ -72,6 +97,7 @@ impl BarLayout {
         Self {
             start,
             tasks: rects.collect(),
+            status,
             clock,
         }
     }
@@ -82,6 +108,9 @@ impl BarLayout {
         }
         if let Some(i) = self.tasks.iter().position(|r| contains(r, x, y)) {
             return Some(Hit::Task(i));
+        }
+        if self.status.right > self.status.left && contains(&self.status, x, y) {
+            return Some(Hit::Status);
         }
         contains(&self.clock, x, y).then_some(Hit::Clock)
     }
