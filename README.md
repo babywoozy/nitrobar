@@ -5,18 +5,14 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
 
 ## Tính năng
 
-- **Chế độ island (mặc định)**: thanh thu gọn thành một viên nhỏ bo tròn ở giữa mép dưới màn
-  hình, không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc được ẩn). Rê chuột vào
-  viên hoặc chạm mép dưới ở bất kỳ đâu (~100 ms) thì thanh giãn ra mượt thành thanh đầy đủ, nằm đè
-  lên trên cửa sổ; rời chuột ~600 ms thì thu lại. Nhấn phím Win (mở Start) cũng làm thanh bung ra.
+- **Chế độ island (mặc định)**: một viên đen bo tròn nổi ở giữa mép dưới màn hình (200×40 DIP, cách
+  mép 10 DIP, có bóng đổ mềm). Bên trái là icon của app đang active (đổi app thì icon mờ chuyển sang
+  icon mới), bên phải là giờ. Thanh không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc
+  được ẩn). Rê chuột vào viên hoặc chạm mép dưới ở bất kỳ đâu (~100 ms) thì viên giãn ra thành thanh
+  app, rời chuột ~600 ms thì thu lại. Nhấn phím Win (mở Start) cũng làm thanh bung ra.
   Không thu lại khi đang mở menu chuột phải, Start, Quick Settings, trung tâm thông báo hay đang kéo
   thả. App cần chú ý thì viên đổi sang màu cam. Đang chơi game / xem video toàn màn hình thì viên ẩn
   đi và chạm mép không làm thanh bung ra.
-- **Hiệu ứng thu nhỏ kiểu Dynamic Island**: bấm nút thu nhỏ (—) của bất kỳ cửa sổ nào thì cửa sổ co
-  lại, bo tròn và tối dần thành một khối đen rồi "chui" vào island; viên nảy lên như nuốt vào và hiện
-  icon app ~1,5 giây. Bấm nút app trên thanh để khôi phục thì cửa sổ bung ngược ra từ đó (khôi phục
-  bằng Alt+Tab thì chỉ có viên nảy). Chạy theo tần số màn hình (60/120/144 Hz). Tắt "Animation
-  effects" của Windows hoặc đặt `window_animation = false` thì không có hiệu ứng.
 - **Chế độ full**: thanh luôn hiện ở đáy (hoặc đỉnh), đăng ký AppBar: cửa sổ phóng to không đè lên thanh.
 - Nút Start (mở Start menu của Windows), app đang chạy gom nhóm theo ứng dụng với icon thật.
   Vạch ngắn = đang chạy, vạch dài màu nhấn = đang mở, nền cam = app cần chú ý.
@@ -78,11 +74,12 @@ theme = "auto"               # "auto" (theo Windows), "dark" hoặc "light"
 background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acrylic" hoặc "solid" (đặc)
 
 mode = "island"              # "island" (thu gọn, rê chuột thì bung ra) hoặc "full" (luôn hiện)
-island_width = 120           # cỡ viên khi thu gọn (DIP, 40..600)
-island_height = 8            # (DIP, 4..40)
+island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
+island_height = 40           # (DIP, 4..80)
+island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
 expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
-island_show_clock = false    # hiện giờ nhỏ trong viên
+island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)
 window_animation = true      # thu nhỏ cửa sổ "chui" vào island; false = hiệu ứng của Windows
 
 [colors]                     # để trống = theo theme Windows; "#RRGGBB" hoặc "#RRGGBBAA"

@@ -140,6 +140,20 @@ impl BarLayout {
         }
     }
 
+    /// The same layout moved down by `dy` (island mode: the bar is a band inside a
+    /// taller strip).
+    pub fn shifted(mut self, dy: f32) -> Self {
+        let shift = |r: &mut D2D_RECT_F| {
+            r.top += dy;
+            r.bottom += dy;
+        };
+        shift(&mut self.start);
+        shift(&mut self.status);
+        shift(&mut self.clock);
+        self.tasks.iter_mut().for_each(shift);
+        self
+    }
+
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
         if contains(&self.start, x, y) {
             return Some(Hit::Start);

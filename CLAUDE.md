@@ -58,7 +58,7 @@ src/
   config.rs   %APPDATA%\nitrobar\config.toml: parse + clamp, file mặc định có chú thích, màu
   pins.rs     danh sách ghim = ghim của Windows + pins.toml ([[pin]] thêm, [[hide]] bỏ), mở app
   winpins.rs  đọc ghim của taskbar gốc (blob Taskband\Favorites -> PIDL), theo dõi registry
-  island.rs   chế độ island: hiệu ứng (ease-out), hình học viên + "activity" (Pulse), cảm biến mép,
+  island.rs   chế độ island: hiệu ứng (lò xo), hình học viên + "activity" (Pulse), cảm biến mép,
               flyout, fullscreen
   morph.rs    hiệu ứng thu nhỏ / khôi phục: overlay + DWM thumbnail, đồng hồ khung hình (DwmFlush)
 ```
@@ -188,6 +188,15 @@ src/
   được hit-test), chỉ hiện khi thu gọn; post `WM_APP_EDGE`. Không quét chuột: chỉ `WM_MOUSEMOVE`,
   `TrackMouseEvent(TME_LEAVE)` và timer one-shot: `TIMER_EXPAND` (trễ bung), `TIMER_COLLAPSE` (trễ thu;
   nếu bị chặn thì hẹn lại, chỉ khi đang mở và bị chặn), `TIMER_PULSE` (hết lúc viên giữ yên).
+- Viên lúc nghỉ: đen (`REST_FILL`), bo tròn hết, bóng đổ giả bằng 8 lớp `FillRoundedRectangle` alpha
+  thấp chồng nhau (cửa sổ phải chừa `HIT_MARGIN` 14 DIP để bóng không bị cắt; effect của D2D cần GPU
+  nên không dùng). Bên trái icon của app active (`App::rest_icon`, nhóm chứa `tasks.foreground`;
+  cửa sổ không có nút như desktop / flyout giữ icon cũ), đổi thì crossfade 240 ms; bên phải giờ.
+  Con số trong config nhớ rằng file config.toml ĐÃ TẠO TRƯỚC KHI đổi mặc định vẫn ghi giá trị cũ
+  (`island_width = 120`...): khi test thiết kế mới phải tạm đổi config (`cfgswap.ps1`) và trả lại.
+  `island::strip_height` = dải cao tới mức chứa viên activity + gap + lề (cửa sổ island KHÔNG còn bằng
+  `bar_height`); thanh đầy đủ (tạm thời) là một băng `Geometry::bar` ở sát mép trong dải đó.
+  Bung ra theo lò xo (`EXPAND_SPRING`, vượt ~3%), thu lại ease-in-out.
 - Khung hình: `morph::start_clock` = thread `nitrobar-frames` gọi `DwmFlush` (chờ lần compose kế
   tiếp = theo tần số màn hình, 60/120/144 Hz) rồi post `WM_APP_FRAME` (tối đa 1 message đang chờ).
   Dùng chung cho bung/thu, viên nảy, overlay thu nhỏ; `on_frame` dừng thread khi mọi thứ đứng yên.

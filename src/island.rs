@@ -38,25 +38,22 @@ pub const WM_APP_EDGE: u32 = WM_APP + 7;
 /// Sent after `TrackMouseEvent(TME_LEAVE)` when the pointer leaves the window.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-pub const EXPAND_DURATION: Duration = Duration::from_millis(180);
-pub const COLLAPSE_DURATION: Duration = Duration::from_millis(200);
-/// Gap between the pill and the screen edge, DIPs.
-const PILL_GAP: f32 = 4.0;
-/// Extra hover area around the pill, DIPs.
-const HIT_MARGIN: f32 = 8.0;
+pub const EXPAND_DURATION: Duration = Duration::from_millis(480);
+pub const COLLAPSE_DURATION: Duration = Duration::from_millis(260);
+/// Spring (rad/s, damping ratio) of the expansion: a small overshoot.
+const EXPAND_SPRING: (f32, f32) = (22.0, 0.72);
+/// Extra hover area around the pill, DIPs. Also room for its soft shadow.
+pub const HIT_MARGIN: f32 = 14.0;
 /// "Activity" pill shown while an app goes into / comes out of the island: grows
 /// by this much in width, to this height (DIPs), and holds for `PULSE_HOLD`.
-const ACTIVITY_EXTRA_WIDTH: f32 = 48.0;
-const ACTIVITY_HEIGHT: f32 = 34.0;
+const ACTIVITY_EXTRA_WIDTH: f32 = 56.0;
+const ACTIVITY_EXTRA_HEIGHT: f32 = 8.0;
 pub const PULSE_HOLD: Duration = Duration::from_millis(1500);
 /// Springs (rad/s, damping ratio): a lively bounce out, a calmer return.
 const PULSE_OUT: (f32, f32) = (20.0, 0.42);
 const PULSE_BACK: (f32, f32) = (18.0, 0.75);
 /// Time the return spring needs to settle.
 const PULSE_SETTLE: f32 = 0.55;
-/// Minimum pill size when it shows the clock, DIPs.
-const CLOCK_PILL_WIDTH: f32 = 64.0;
-const CLOCK_PILL_HEIGHT: f32 = 20.0;
 
 pub fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -110,8 +107,21 @@ impl Island {
         self.position != self.target
     }
 
+    /// Panel progress: 0 = pill, 1 = full. Expanding follows a spring and may
+    /// overshoot 1 a little; collapsing is a plain smooth ease.
     pub fn eased(&self) -> f32 {
-        ease_out_cubic(self.position)
+        if self.position >= 1.0 {
+            return 1.0;
+        }
+        if self.target == 1.0 {
+            spring(
+                self.position * EXPAND_DURATION.as_secs_f32(),
+                EXPAND_SPRING.0,
+                EXPAND_SPRING.1,
+            )
+        } else {
+            crate::morph::ease_in_out_cubic(self.position)
+        }
     }
 
     /// Starts moving toward expanded (`true`) or collapsed. Returns false if
@@ -193,13 +203,16 @@ impl Pulse {
     }
 }
 
-/// Island geometry in bar space (DIPs; the full bar is `0, 0, width, height`).
+/// Island geometry in bar space (DIPs). Bar space is the strip along the screen
+/// edge: full monitor width, `strip_height` tall.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geometry {
+    /// The full bar (band at the screen edge) the pill expands into.
     pub bar: D2D_RECT_F,
+    /// The pill at rest.
     pub pill: D2D_RECT_F,
-    /// Window rectangle while collapsed: the pill plus a hover margin, reaching
-    /// the screen edge.
+    /// Window rectangle while collapsed: the pill plus a hover / shadow margin,
+    /// reaching the screen edge.
     pub hit: D2D_RECT_F,
     /// The pill grown for an app going in / out (`Pulse`), and the window rect
     /// that holds it with its overshoot.
@@ -212,78 +225,86 @@ pub fn pulsed_pill(g: &Geometry, v: f32) -> D2D_RECT_F {
     lerp_rect(&g.pill, &g.activity, v)
 }
 
-pub fn geometry(width: f32, height: f32, config: &BarConfig, at_top: bool) -> Geometry {
-    let (mut pill_w, mut pill_h) = (config.island_width, config.island_height);
-    if config.island_show_clock {
-        pill_w = pill_w.max(CLOCK_PILL_WIDTH);
-        pill_h = pill_h.max(CLOCK_PILL_HEIGHT);
-    }
-    let pill_w = pill_w.min(width);
-    let pill_h = pill_h.min(height - PILL_GAP);
-    let left = ((width - pill_w) / 2.0).round();
-    let top = if at_top {
-        PILL_GAP
-    } else {
-        height - PILL_GAP - pill_h
+/// Height of the strip the island lives in: the full bar, or at least the
+/// activity pill plus its gap and margins.
+pub fn strip_height(config: &BarConfig, bar_height: f32) -> f32 {
+    let activity = config.island_height + ACTIVITY_EXTRA_HEIGHT;
+    bar_height.max(config.island_gap + activity + HIT_MARGIN + 4.0)
+}
+
+pub fn geometry(
+    width: f32,
+    strip_height: f32,
+    bar_height: f32,
+    config: &BarConfig,
+    at_top: bool,
+) -> Geometry {
+    // A band `dist` away from the screen edge, `h` tall: (top, bottom).
+    let band = |dist: f32, h: f32| {
+        if at_top {
+            (dist, dist + h)
+        } else {
+            (strip_height - dist - h, strip_height - dist)
+        }
     };
+    // Window rect for a pill-like shape: grown by `margin_x` sideways and `margin_y`
+    // inward, reaching the screen edge.
+    let window = |r: &D2D_RECT_F, margin_x: f32, margin_y: f32| D2D_RECT_F {
+        left: (r.left - margin_x).max(0.0),
+        right: (r.right + margin_x).min(width),
+        top: if at_top {
+            0.0
+        } else {
+            (r.top - margin_y).max(0.0)
+        },
+        bottom: if at_top {
+            (r.bottom + margin_y).min(strip_height)
+        } else {
+            strip_height
+        },
+    };
+    let gap = config.island_gap;
+    let pill_w = config.island_width.min(width);
+    let pill_h = config.island_height.min(strip_height - gap);
+    let (top, bottom) = band(gap, pill_h);
+    let left = ((width - pill_w) / 2.0).round();
     let pill = D2D_RECT_F {
         left,
         top,
         right: left + pill_w,
-        bottom: top + pill_h,
+        bottom,
     };
-    let hit = D2D_RECT_F {
-        left: (pill.left - HIT_MARGIN).max(0.0),
-        top: if at_top {
-            0.0
-        } else {
-            (pill.top - HIT_MARGIN).max(0.0)
-        },
-        right: (pill.right + HIT_MARGIN).min(width),
-        bottom: if at_top {
-            (pill.bottom + HIT_MARGIN).min(height)
-        } else {
-            height
-        },
-    };
+    let hit = window(&pill, HIT_MARGIN, HIT_MARGIN);
+
     let act_w = (pill_w + ACTIVITY_EXTRA_WIDTH).min(width);
-    let act_h = ACTIVITY_HEIGHT.max(pill_h).min(height - PILL_GAP);
-    let act_left = ((width - act_w) / 2.0).round();
-    let act_top = if at_top {
-        PILL_GAP
-    } else {
-        height - PILL_GAP - act_h
-    };
+    let act_h = (pill_h + ACTIVITY_EXTRA_HEIGHT).min(strip_height - gap);
+    let (top, bottom) = band(gap, act_h);
+    let left = ((width - act_w) / 2.0).round();
     let activity = D2D_RECT_F {
-        left: act_left,
-        top: act_top,
-        right: act_left + act_w,
-        bottom: act_top + act_h,
+        left,
+        top,
+        right: left + act_w,
+        bottom,
     };
-    // Room for the bounce overshoot (~20% past the activity size).
-    let over_w = (act_w - pill_w) * 0.25 + HIT_MARGIN;
-    let activity_hit = D2D_RECT_F {
-        left: (activity.left - over_w).max(0.0),
-        top: if at_top {
-            0.0
-        } else {
-            (activity.top - (act_h - pill_h) * 0.25).max(0.0)
-        },
-        right: (activity.right + over_w).min(width),
-        bottom: if at_top {
-            (activity.bottom + (act_h - pill_h) * 0.25).min(height)
-        } else {
-            height
-        },
+    // Room for the bounce overshoot (~25% past the activity size).
+    let activity_hit = window(
+        &activity,
+        (act_w - pill_w) * 0.25 + HIT_MARGIN,
+        (act_h - pill_h) * 0.25 + HIT_MARGIN,
+    );
+    let (bar_top, bar_bottom) = if at_top {
+        (0.0, bar_height)
+    } else {
+        (strip_height - bar_height, strip_height)
     };
     Geometry {
         activity,
         activity_hit,
         bar: D2D_RECT_F {
             left: 0.0,
-            top: 0.0,
+            top: bar_top,
             right: width,
-            bottom: height,
+            bottom: bar_bottom,
         },
         pill,
         hit,
@@ -468,7 +489,10 @@ mod tests {
         assert!(!island.set_target(true, t0), "already heading there");
         assert!(island.tick(t0 + EXPAND_DURATION / 2));
         let half = island.eased();
-        assert!(half > 0.5 && half < 1.0);
+        assert!(
+            half > 0.5 && half < 1.2,
+            "spring is well on its way: {half}"
+        );
         // Reverse mid-way: collapsing takes only the remaining distance.
         let t1 = t0 + EXPAND_DURATION / 2;
         assert!(island.set_target(false, t1));
@@ -477,27 +501,46 @@ mod tests {
     }
 
     #[test]
-    fn pill_is_centered_at_the_edge() {
+    fn expansion_springs_past_the_target_and_settles() {
+        let t0 = Instant::now();
+        let mut island = Island::collapsed();
+        island.set_target(true, t0);
+        let mut peak = 0.0f32;
+        for ms in (0..480).step_by(8) {
+            island.tick(t0 + Duration::from_millis(ms));
+            peak = peak.max(island.eased());
+        }
+        assert!(peak > 1.01 && peak < 1.08, "small overshoot: {peak}");
+        island.tick(t0 + EXPAND_DURATION);
+        assert_eq!(island.eased(), 1.0);
+    }
+
+    #[test]
+    fn pill_floats_above_the_edge() {
         let config = BarConfig::default();
-        let g = geometry(1920.0, 48.0, &config, false);
-        assert_eq!(g.pill.right - g.pill.left, config.island_width);
+        let strip = strip_height(&config, 48.0);
+        let g = geometry(1920.0, strip, 48.0, &config, false);
+        assert_eq!(
+            (g.pill.right - g.pill.left, g.pill.bottom - g.pill.top),
+            (200.0, 40.0)
+        );
         assert_eq!((g.pill.left + g.pill.right) / 2.0, 960.0);
-        assert_eq!(g.pill.bottom, 48.0 - PILL_GAP);
-        assert_eq!(g.hit.bottom, 48.0);
-        let top = geometry(1920.0, 48.0, &config, true);
-        assert_eq!(top.pill.top, PILL_GAP);
+        assert_eq!(g.pill.bottom, strip - config.island_gap, "gap to the edge");
+        assert_eq!(g.hit.bottom, strip, "window reaches the screen edge");
+        assert_eq!(g.bar.bottom, strip);
+        assert_eq!(g.bar.top, strip - 48.0);
+        let top = geometry(1920.0, strip, 48.0, &config, true);
+        assert_eq!(top.pill.top, config.island_gap);
         assert_eq!(top.hit.top, 0.0);
-        let clock = BarConfig {
-            island_show_clock: true,
-            ..BarConfig::default()
-        };
-        let g = geometry(1920.0, 48.0, &clock, false);
-        assert!(g.pill.bottom - g.pill.top >= CLOCK_PILL_HEIGHT);
+        assert_eq!(top.bar.top, 0.0);
+        // The activity pill and its hover margin always fit in the strip.
+        assert!(g.activity_hit.top >= 0.0 && strip >= 48.0);
     }
 
     #[test]
     fn activity_holds_the_pill_and_its_bounce() {
-        let g = geometry(1920.0, 48.0, &BarConfig::default(), false);
+        let config = BarConfig::default();
+        let g = geometry(1920.0, strip_height(&config, 48.0), 48.0, &config, false);
         let inside = |a: &D2D_RECT_F, b: &D2D_RECT_F| {
             a.left >= b.left && a.top >= b.top && a.right <= b.right && a.bottom <= b.bottom
         };

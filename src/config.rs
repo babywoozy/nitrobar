@@ -74,9 +74,11 @@ pub struct BarConfig {
     pub theme: ThemeMode,
     pub background: Background,
     pub mode: BarMode,
-    /// Pill size while collapsed, DIPs (clamped to 40..=600 / 4..=40).
+    /// Pill size while at rest, DIPs (clamped to 40..=600 / 4..=80), and its gap to
+    /// the screen edge (0..=60).
     pub island_width: f32,
     pub island_height: f32,
+    pub island_gap: f32,
     /// Hover time before expanding / after leaving before collapsing (ms).
     pub expand_delay_ms: u32,
     pub collapse_delay_ms: u32,
@@ -96,11 +98,12 @@ impl Default for BarConfig {
             theme: ThemeMode::Auto,
             background: Background::Clear,
             mode: BarMode::Island,
-            island_width: 120.0,
-            island_height: 8.0,
+            island_width: 200.0,
+            island_height: 40.0,
+            island_gap: 10.0,
             expand_delay_ms: 100,
             collapse_delay_ms: 600,
-            island_show_clock: false,
+            island_show_clock: true,
             window_animation: true,
         }
     }
@@ -156,8 +159,9 @@ impl Config {
         let mut config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
         config.bar.height = clamp_or(config.bar.height, 32.0, 96.0, 48.0);
         config.bar.icon_size = clamp_or(config.bar.icon_size, 16.0, 48.0, 24.0);
-        config.bar.island_width = clamp_or(config.bar.island_width, 40.0, 600.0, 120.0);
-        config.bar.island_height = clamp_or(config.bar.island_height, 4.0, 40.0, 8.0);
+        config.bar.island_width = clamp_or(config.bar.island_width, 40.0, 600.0, 200.0);
+        config.bar.island_height = clamp_or(config.bar.island_height, 4.0, 80.0, 40.0);
+        config.bar.island_gap = clamp_or(config.bar.island_gap, 0.0, 60.0, 10.0);
         config.bar.expand_delay_ms = config.bar.expand_delay_ms.min(2000);
         config.bar.collapse_delay_ms = config.bar.collapse_delay_ms.min(10_000);
         Ok(config)
@@ -191,11 +195,12 @@ background = "clear"         # "clear" (trong suốt hẳn), "blur" (mờ), "acr
 #             nhấn phím Win) thì bung ra; không chiếm chỗ, taskbar gốc được ẩn.
 #   "full":   thanh luôn hiện và giữ chỗ như taskbar thường.
 mode = "island"
-island_width = 120           # cỡ viên khi thu gọn (DIP, 40..600)
-island_height = 8            # (DIP, 4..40)
+island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
+island_height = 40           # (DIP, 4..80)
+island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
 expand_delay_ms = 100        # rê chuột vào bao lâu thì bung ra
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
-island_show_clock = false    # hiện giờ nhỏ trong viên
+island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)
 
 # Thu nhỏ cửa sổ: cửa sổ co lại, tối dần rồi "chui" vào island (viên nảy lên, hiện icon app);
 # bấm nút trên thanh để khôi phục thì cửa sổ bung ra từ đó. false = hiệu ứng của Windows.

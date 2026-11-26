@@ -47,7 +47,12 @@ const TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
     a: 0.0,
 };
 const CLOCK_FONT_SIZE: f32 = 12.0;
-const PILL_FONT_SIZE: f32 = 11.0;
+/// Island shadow: this many stacked, slightly growing translucent copies of the
+/// panel, `SHADOW_STEP` DIPs apart, shifted down by `SHADOW_DROP`.
+const SHADOW_LAYERS: u32 = 8;
+const SHADOW_STEP: f32 = 1.5;
+const SHADOW_DROP: f32 = 3.0;
+const SHADOW_ALPHA: f32 = 0.045;
 /// Offsets (DIPs) of the faint copies that form the text halo.
 const SHADOW_RING: [(f32, f32); 8] = [
     (-1.0, 0.0),
@@ -111,11 +116,21 @@ pub struct IslandView {
     pub border: D2D1_COLOR_F,
     /// Opacity of the bar content (icons fade in while expanding).
     pub content_opacity: f32,
-    /// Small clock inside the collapsed pill.
-    pub clock: Option<Vec<u16>>,
-    pub text: D2D1_COLOR_F,
+    /// Soft shadow strength under the panel, 0..1.
+    pub shadow: f32,
+    pub rest: Option<RestView>,
     /// App icon inside the pill while an app goes in / comes out.
     pub badge: Option<Badge>,
+}
+
+/// What the pill shows at rest: the active app's icon (crossfading to a new one)
+/// on the left, the time on the right.
+pub struct RestView {
+    pub opacity: f32,
+    /// Icons with their opacity and box (bar space); two while crossfading.
+    pub icons: Vec<(Icon, f32, D2D_RECT_F)>,
+    pub clock: Option<(Vec<u16>, D2D_RECT_F)>,
+    pub text: D2D1_COLOR_F,
 }
 
 pub struct Badge {
@@ -164,7 +179,6 @@ pub struct Renderer {
     clock_format: IDWriteTextFormat,
     icon_format: IDWriteTextFormat,
     percent_format: IDWriteTextFormat,
-    pill_format: IDWriteTextFormat,
     target: Option<Target>,
 }
 
@@ -242,12 +256,6 @@ impl Renderer {
                     ui_font,
                     CLOCK_FONT_SIZE,
                     DWRITE_TEXT_ALIGNMENT_LEADING,
-                )?,
-                pill_format: text_format(
-                    &dwrite,
-                    ui_font,
-                    PILL_FONT_SIZE,
-                    DWRITE_TEXT_ALIGNMENT_CENTER,
                 )?,
                 target: None,
             })
@@ -354,8 +362,9 @@ impl Renderer {
             }
         }
 
+        let mut used = Vec::new();
         let opacity = match &scene.island {
-            Some(island) => self.draw_island(&mut target, island, dpi),
+            Some(island) => self.draw_island(&mut target, island, dpi, &mut used),
             None => 1.0,
         };
         if opacity > 0.0 {
@@ -374,11 +383,12 @@ impl Renderer {
             if let Some(params) = &layer {
                 unsafe { target.rt.PushLayer(params, target.layer.as_ref()) };
             }
-            self.draw_content(&mut target, scene, dpi);
+            self.draw_content(&mut target, scene, dpi, &mut used);
             if layer.is_some() {
                 unsafe { target.rt.PopLayer() };
             }
         }
+        target.bitmaps.retain(|id, _| used.contains(id));
 
         match unsafe { target.rt.EndDraw(None, None) } {
             // Device lost: drop the target and paint again right away with a new one
@@ -399,13 +409,46 @@ impl Renderer {
 
     /// The island panel (pill, or the bar while morphing). Returns the opacity
     /// of the bar content to draw on top (0 while collapsed).
-    fn draw_island(&self, target: &mut Target, island: &IslandView, dpi: f32) -> f32 {
+    fn draw_island(
+        &self,
+        target: &mut Target,
+        island: &IslandView,
+        dpi: f32,
+        used: &mut Vec<u64>,
+    ) -> f32 {
         let rounded = D2D1_ROUNDED_RECT {
             rect: island.panel,
             radiusX: island.radius,
             radiusY: island.radius,
         };
         unsafe {
+            if island.shadow > 0.0 {
+                // Stacked copies, biggest (faintest) first: summed alpha falls off
+                // smoothly away from the panel.
+                let color = D2D1_COLOR_F {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: SHADOW_ALPHA * island.shadow,
+                };
+                target.brush.SetColor(&raw const color);
+                for i in (1..=SHADOW_LAYERS).rev() {
+                    let grow = i as f32 * SHADOW_STEP;
+                    let layer = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: island.panel.left - grow,
+                            top: island.panel.top - grow + SHADOW_DROP,
+                            right: island.panel.right + grow,
+                            bottom: island.panel.bottom + grow + SHADOW_DROP,
+                        },
+                        radiusX: island.radius + grow,
+                        radiusY: island.radius + grow,
+                    };
+                    target
+                        .rt
+                        .FillRoundedRectangle(&raw const layer, &target.brush);
+                }
+            }
             if island.fill.a > 0.0 {
                 target.brush.SetColor(&raw const island.fill);
                 target
@@ -430,38 +473,56 @@ impl Renderer {
                     .DrawRoundedRectangle(&raw const inner, &target.brush, 1.0, None);
             }
         }
+        if let Some(rest) = &island.rest
+            && rest.opacity > 0.0
+        {
+            for (icon, alpha, rect) in &rest.icons {
+                used.push(icon.id);
+                if let Some(bitmap) = Self::icon_bitmap(target, icon) {
+                    // Drawn at the icon's own pixel size, on whole pixels.
+                    let box_px = ((rect.right - rect.left) * dpi / 96.0).round();
+                    let px = box_px.min(icon.px as f32);
+                    let at = layout::pixel_square(rect, px, 0.0, dpi);
+                    unsafe {
+                        target.rt.DrawBitmap(
+                            &bitmap,
+                            Some(&raw const at),
+                            alpha * rest.opacity,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        );
+                    }
+                }
+            }
+            if let Some((text, rect)) = &rest.clock {
+                let mut color = rest.text;
+                color.a *= rest.opacity;
+                self.draw_text(target, text, &self.clock_format, *rect, &color, None);
+            }
+        }
         if let Some(badge) = &island.badge
             && badge.opacity > 0.0
-            && let Some(bitmap) = Self::icon_bitmap(target, &badge.icon)
         {
-            let px = badge.icon.px as f32;
-            let rect = layout::pixel_square(&badge.rect, px, 0.0, dpi);
-            unsafe {
-                target.rt.DrawBitmap(
-                    &bitmap,
-                    Some(&raw const rect),
-                    badge.opacity,
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    None,
-                );
+            used.push(badge.icon.id);
+            if let Some(bitmap) = Self::icon_bitmap(target, &badge.icon) {
+                let px = badge.icon.px as f32;
+                let rect = layout::pixel_square(&badge.rect, px, 0.0, dpi);
+                unsafe {
+                    target.rt.DrawBitmap(
+                        &bitmap,
+                        Some(&raw const rect),
+                        badge.opacity,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
             }
-        } else if let Some(clock) = &island.clock
-            && island.content_opacity == 0.0
-        {
-            self.draw_text(
-                target,
-                clock,
-                &self.pill_format,
-                island.panel,
-                &island.text,
-                None,
-            );
         }
         island.content_opacity
     }
 
     /// Start, app buttons, status and clock.
-    fn draw_content(&self, target: &mut Target, scene: &Scene, dpi: f32) {
+    fn draw_content(&self, target: &mut Target, scene: &Scene, dpi: f32, used: &mut Vec<u64>) {
         let palette = &scene.palette;
         Self::draw_start(
             target,
@@ -470,7 +531,6 @@ impl Renderer {
             scene.start.0,
             scene.start.1,
         );
-        let mut used = Vec::with_capacity(scene.buttons.len());
         for button in &scene.buttons {
             Self::draw_button(
                 target,
@@ -479,10 +539,9 @@ impl Renderer {
                 dpi,
                 scene.text_shadow(),
                 button,
-                &mut used,
+                used,
             );
         }
-        target.bitmaps.retain(|id, _| used.contains(id));
         self.draw_status(target, scene);
         self.draw_clock(target, scene);
     }

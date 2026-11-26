@@ -55,12 +55,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
 use crate::config::{self, Alignment, Background, BarMode, Config, Position, ThemeMode};
-use crate::icons::IconLoader;
+use crate::icons::{Icon, IconLoader};
 use crate::island::{self, EdgeSensor, Island, Pulse};
 use crate::layout::{BarLayout, Hit, Metrics};
 use crate::morph::{self, Morph};
 use crate::pins::{self, Pins};
-use crate::render::{Badge, IslandView};
+use crate::render::{Badge, IslandView, RestView};
 use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
 use crate::status::{self, Status};
 use crate::tasks::AppId;
@@ -88,13 +88,30 @@ const OWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(2)
 /// Glass opacity of the expanded island bar with `background = "clear"` (it lies
 /// over app windows; the collapsed pill uses the lighter `palette.island`).
 const ISLAND_EXPANDED_ALPHA: f32 = 0.85;
-/// The pill while an app goes in / out: black, like the blob it swallows.
-const PULSE_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
-    r: 0.03,
-    g: 0.03,
-    b: 0.035,
-    a: 0.96,
+/// The resting pill: black like the Dynamic Island, with a faint hairline.
+const REST_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.035,
+    g: 0.035,
+    b: 0.04,
+    a: 0.97,
 };
+const REST_BORDER: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.09,
+};
+const REST_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.95,
+};
+/// Space between the pill's edge and its icon / clock, and the clock's width, DIPs.
+const REST_PADDING: f32 = 14.0;
+const REST_CLOCK_WIDTH: f32 = 76.0;
+/// Crossfade when the active app (and so the pill's icon) changes.
+const REST_FADE: std::time::Duration = std::time::Duration::from_millis(240);
 /// Sent once after creation to run setup inside the window procedure.
 const WM_APP_INIT: u32 = WM_APP + 2;
 /// `HSHELL_REDRAW | HSHELL_HIGHBIT`: a window is flashing for attention.
@@ -169,10 +186,20 @@ struct App {
     origin: (f32, f32),
     /// Island: the part of the window that takes the pointer (screen pixels).
     hit_rect: RECT,
+    /// Island: icon of the active app shown at rest, and the one it replaces.
+    rest_icon: RestIcon,
     /// Minimize / restore animation overlay.
     morph: Option<Morph>,
     /// A window we are restoring ourselves (after the grow-out animation).
     own_restore: Option<(HWND, Instant)>,
+}
+
+/// The pill's icon: the active app's, crossfading from the previous one.
+#[derive(Default)]
+struct RestIcon {
+    now: Option<Icon>,
+    prev: Option<Icon>,
+    changed: Option<Instant>,
 }
 
 struct IslandState {
@@ -298,6 +325,7 @@ fn run_window(options: Options) -> Result<()> {
             bar_rect: RECT::default(),
             origin: (0.0, 0.0),
             hit_rect: RECT::default(),
+            rest_icon: RestIcon::default(),
             morph: None,
             own_restore: None,
         };
@@ -970,7 +998,12 @@ impl App {
             {
                 self.dpi = dpi_x;
             }
-            let height = scale(self.metrics.bar_height, self.dpi);
+            let bar_dip = if self.island.is_some() {
+                self.island_strip_height()
+            } else {
+                self.metrics.bar_height
+            };
+            let height = scale(bar_dip, self.dpi);
             self.monitor_rect = info.rcMonitor;
             if self.island.is_some() {
                 let m = info.rcMonitor;
@@ -1020,6 +1053,7 @@ impl App {
             taskbar::foreground_changed(island::is_shell_flyout(self.tasks.foreground));
         }
         if self.island.is_some() {
+            self.update_rest_icon();
             self.on_foreground_changed();
         }
     }
@@ -1064,12 +1098,17 @@ impl App {
     fn layout(&self) -> BarLayout {
         let view = self.status_view();
         let width = layout::status_width(view.icons.len(), view.percent.is_some());
-        BarLayout::new(
+        let layout = BarLayout::new(
             self.bar_width_dip(),
             self.items().len(),
             width,
             &self.metrics,
-        )
+        );
+        if self.island.is_some() {
+            // The bar is a band inside the taller island strip.
+            return layout.shifted(self.island_geometry().bar.top);
+        }
+        layout
     }
 
     /// Element at a client-area pixel position.
@@ -1234,9 +1273,15 @@ impl App {
         pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
     }
 
+    /// Height of the strip along the screen edge that the island lives in (DIPs).
+    fn island_strip_height(&self) -> f32 {
+        island::strip_height(&self.config.bar, self.metrics.bar_height)
+    }
+
     fn island_geometry(&self) -> island::Geometry {
         island::geometry(
             self.bar_width_dip(),
+            self.island_strip_height(),
             self.metrics.bar_height,
             &self.config.bar,
             self.metrics.at_top,
@@ -1378,6 +1423,18 @@ impl App {
                         .saturating_sub(now.saturating_duration_since(pulse.started()));
                     self.set_timer(TIMER_PULSE, hold_end.as_millis() as u32);
                 }
+            }
+        }
+
+        if self.island.is_some()
+            && let Some(at) = self.rest_icon.changed
+        {
+            repaint = true;
+            if now.saturating_duration_since(at) < REST_FADE {
+                running = true;
+            } else {
+                self.rest_icon.changed = None;
+                self.rest_icon.prev = None;
             }
         }
 
@@ -1658,20 +1715,53 @@ impl App {
         }
     }
 
+    /// Remembers the icon of the active app for the pill (crossfading from the old one).
+    fn update_rest_icon(&mut self) {
+        let icon = self
+            .tasks
+            .groups
+            .iter()
+            .find(|g| g.contains(self.tasks.foreground))
+            .and_then(|g| g.icon.clone());
+        // Windows without a button (desktop, flyouts) keep the last app's icon.
+        let Some(icon) = icon else {
+            return;
+        };
+        if self.rest_icon.now.as_ref().is_some_and(|i| i.id == icon.id) {
+            return;
+        }
+        self.rest_icon.prev = self.rest_icon.now.take();
+        self.rest_icon.now = Some(icon);
+        self.rest_icon.changed = Some(Instant::now());
+        if self.island.is_some() {
+            self.start_frames();
+            self.invalidate();
+        }
+    }
+
+    /// Opacity of the new icon while crossfading (1 when settled).
+    fn rest_fade(&self, now: Instant) -> f32 {
+        self.rest_icon.changed.map_or(1.0, |at| {
+            let t = now.saturating_duration_since(at).as_secs_f32() / REST_FADE.as_secs_f32();
+            morph::ease_in_out_cubic(t.min(1.0))
+        })
+    }
+
     /// How the island looks right now (`None` in full mode).
     fn island_view(&self, clock: &clock::ClockText) -> Option<IslandView> {
         let state = self.island.as_ref()?;
         let g = self.island_geometry();
         let t = state.anim.eased();
+        let t_clamped = t.clamp(0.0, 1.0);
         let palette = self.palette();
         let attention = self.tasks.groups.iter().any(|g| g.attention);
         let mut pill = if attention {
             palette.attention
         } else {
-            palette.island
+            REST_FILL
         };
         if attention {
-            pill.a = 0.9;
+            pill.a = 0.95;
         }
         // The expanded fill follows `[bar] background` (clear = none, solid = opaque).
         let mut full = Theme {
@@ -1685,28 +1775,58 @@ impl App {
         }
         if full.a == 0.0 {
             // The expanded island lies over app windows (it reserves no space): a
-            // fully clear bar would mix its text with theirs. Keep the pill's glass.
+            // fully clear bar would mix its text with theirs. Use dark glass.
             full = palette.island;
             full.a = ISLAND_EXPANDED_ALPHA;
         }
-        // An app going in / out: the pill grows (with spring overshoot), turns
-        // black like the blob that slid into it, and shows the app's icon.
+        // An app going in / out: the pill grows (with spring overshoot) and shows the
+        // app's icon instead of its usual content.
         let now = Instant::now();
         let pulse = state.pulse.as_ref().map_or(0.0, |p| p.value(now));
         let deep = pulse.clamp(0.0, 1.0);
         let pill_rect = island::pulsed_pill(&g, pulse);
-        pill = D2D1_COLOR_F {
-            r: island::lerp(pill.r, PULSE_FILL.r, deep),
-            g: island::lerp(pill.g, PULSE_FILL.g, deep),
-            b: island::lerp(pill.b, PULSE_FILL.b, deep),
-            a: island::lerp(pill.a, PULSE_FILL.a, deep),
-        };
         let mix = |a: f32, b: f32| island::lerp(a, b, t);
         let pill_radius = (pill_rect.bottom - pill_rect.top) / 2.0;
-        let mut border = palette.island_border;
-        border.a *= 1.0 - deep;
+        let mut border = REST_BORDER;
         // The hairline stays (fainter) on the expanded bar as its edge toward the windows.
-        border.a *= if attention { 0.0 } else { 1.0 - 0.5 * t };
+        border.a *= if attention {
+            0.0
+        } else {
+            1.0 - 0.5 * t_clamped
+        };
+
+        // Rest content: active app icon on the left, time on the right.
+        let pill_h = g.pill.bottom - g.pill.top;
+        let pill_w = g.pill.right - g.pill.left;
+        let rest_opacity = (1.0 - t_clamped / 0.45).max(0.0) * (1.0 - deep);
+        let icon_box = (pill_h - 14.0).clamp(0.0, self.metrics.icon_size);
+        let mut icons = Vec::new();
+        if icon_box >= 8.0 {
+            let rect = D2D_RECT_F {
+                left: g.pill.left + REST_PADDING,
+                top: g.pill.top,
+                right: g.pill.left + REST_PADDING + icon_box,
+                bottom: g.pill.bottom,
+            };
+            let fade = self.rest_fade(now);
+            if let Some(prev) = self.rest_icon.prev.as_ref().filter(|_| fade < 1.0) {
+                icons.push((prev.clone(), 1.0 - fade, rect));
+            }
+            if let Some(icon) = &self.rest_icon.now {
+                icons.push((icon.clone(), fade, rect));
+            }
+        }
+        let clock_text = (self.config.bar.island_show_clock && pill_w >= 100.0).then(|| {
+            (
+                clock.time.clone(),
+                D2D_RECT_F {
+                    left: g.pill.right - REST_PADDING - REST_CLOCK_WIDTH,
+                    top: g.pill.top,
+                    right: g.pill.right - REST_PADDING,
+                    bottom: g.pill.bottom,
+                },
+            )
+        });
         Some(IslandView {
             panel: island::lerp_rect(&pill_rect, &g.bar, t),
             radius: mix(pill_radius, 0.0),
@@ -1717,14 +1837,15 @@ impl App {
                 a: mix(pill.a, full.a),
             },
             border,
+            shadow: (1.0 - t_clamped).max(0.0),
             // Icons appear over the last two thirds of the expansion.
-            content_opacity: ((t - 0.35) / 0.65).clamp(0.0, 1.0),
-            clock: self
-                .config
-                .bar
-                .island_show_clock
-                .then(|| clock.time.clone()),
-            text: palette.text,
+            content_opacity: ((t_clamped - 0.35) / 0.65).clamp(0.0, 1.0),
+            rest: Some(RestView {
+                opacity: rest_opacity,
+                icons,
+                clock: clock_text,
+                text: REST_TEXT,
+            }),
             badge: state
                 .pulse
                 .as_ref()
@@ -1732,7 +1853,8 @@ impl App {
                 .map(|icon| Badge {
                     icon,
                     rect: layout::centered_square(&pill_rect, self.metrics.icon_size, 0.0),
-                    opacity: ((pulse - 0.45) / 0.45).clamp(0.0, 1.0) * (1.0 - 3.0 * t).max(0.0),
+                    opacity: ((pulse - 0.45) / 0.45).clamp(0.0, 1.0)
+                        * (1.0 - 3.0 * t_clamped).max(0.0),
                 }),
         })
     }
