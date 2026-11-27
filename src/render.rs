@@ -113,6 +113,8 @@ pub struct ButtonView<'a> {
     pub lift: f32,
     /// Island: how it rolls in / out while the island opens or closes.
     pub reveal: Reveal,
+    /// The icon is drawn elsewhere (it is in flight): only plate and indicator.
+    pub hide_icon: bool,
 }
 
 pub struct Scene<'a> {
@@ -132,6 +134,8 @@ pub struct Scene<'a> {
     pub divider: Option<D2D_RECT_F>,
     pub status_reveal: Reveal,
     pub clock_reveal: Reveal,
+    /// Island: an app icon on its way between the resting pill and its button.
+    pub flight: Option<(Icon, D2D_RECT_F)>,
     /// Island: zoom and roll-in of the Start button.
     pub start_scale: f32,
     pub start_reveal: Reveal,
@@ -168,9 +172,9 @@ pub struct RestView {
     /// 0 = mascot and clock, 1 = music.
     pub music_mix: f32,
     pub mascot: Option<MascotView>,
-    /// Small icons of the active app (two while crossfading) with their opacity,
-    /// centered in `app_rect`.
-    pub apps: Vec<(Icon, f32)>,
+    /// Small icons of the active app (two while one morphs into the next) with
+    /// how each looks, centered in `app_rect`.
+    pub apps: Vec<(Icon, Reveal)>,
     pub app_rect: D2D_RECT_F,
     pub clock: Option<(Vec<u16>, D2D_RECT_F)>,
     pub music: Option<MusicView>,
@@ -656,6 +660,20 @@ impl Renderer {
                 unsafe { target.rt.PopLayer() };
             }
         }
+        if let Some((icon, rect)) = &scene.flight {
+            used.push(icon.id | LARGE_ICON);
+            if let Some(bitmap) = Self::cached_bitmap(target, icon.id | LARGE_ICON, &icon.large) {
+                unsafe {
+                    target.rt.DrawBitmap(
+                        &bitmap,
+                        Some(rect),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
+            }
+        }
         target.bitmaps.retain(|id, _| used.contains(id));
     }
 
@@ -755,22 +773,24 @@ impl Renderer {
                 if let Some(mascot) = &rest.mascot {
                     self.draw_mascot(target, rest, mascot, origin, idle * mascot.opacity);
                 }
-                for (icon, alpha) in &rest.apps {
+                for (icon, look) in &rest.apps {
                     used.push(icon.id | SMALL_ICON);
                     let key = icon.id | SMALL_ICON;
                     if let Some(bitmap) = Self::cached_bitmap(target, key, &icon.small) {
-                        // 1:1 on whole pixels.
+                        // Settled: 1:1 on whole pixels; morphing: transformed.
+                        Self::apply_reveal(target, origin, &rest.app_rect, *look);
                         let at =
                             layout::pixel_square(&rest.app_rect, icon.small_px as f32, 0.0, dpi);
                         unsafe {
                             target.rt.DrawBitmap(
                                 &bitmap,
                                 Some(&raw const at),
-                                idle * alpha,
+                                idle * look.alpha,
                                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                                 None,
                             );
                         }
+                        Self::apply_reveal(target, origin, &rest.app_rect, Reveal::SHOWN);
                     }
                 }
                 if let Some((text, rect)) = &rest.clock {
@@ -1388,17 +1408,19 @@ impl Renderer {
                 Self::icon_bitmap(target, icon)
             }
         });
-        match bitmap {
-            Some(bitmap) => unsafe {
-                target.rt.DrawBitmap(
-                    &bitmap,
-                    Some(&raw const icon_rect),
-                    button.reveal.alpha,
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    None,
-                );
-            },
-            None => Self::fill_rounded(target, icon_rect, 4.0, &palette.placeholder),
+        if !button.hide_icon {
+            match bitmap {
+                Some(bitmap) => unsafe {
+                    target.rt.DrawBitmap(
+                        &bitmap,
+                        Some(&raw const icon_rect),
+                        button.reveal.alpha,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                },
+                None => Self::fill_rounded(target, icon_rect, 4.0, &palette.placeholder),
+            }
         }
 
         let faint = D2D1_COLOR_F {

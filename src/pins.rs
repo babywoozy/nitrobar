@@ -6,8 +6,10 @@
 //! from config.toml so saving pins never touches the user's comments).
 
 use serde::{Deserialize, Serialize};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
 use windows::core::{HSTRING, w};
 
 use crate::config;
@@ -223,16 +225,40 @@ fn shell_open(target: &str) -> bool {
 /// Starts a pinned app through its shortcut (keeps arguments / working directory),
 /// else packaged / AUMID apps through `shell:AppsFolder`, else the exe.
 pub fn launch_pin(pin: &Pinned) {
-    if let Some(link) = &pin.link
-        && shell_open(link)
-    {
-        return;
-    }
-    launch(&pin.app);
+    let (link, app) = (pin.link.clone(), pin.app.clone());
+    off_thread(move || {
+        if link.is_some_and(|link| shell_open(&link)) {
+            return;
+        }
+        open_app(&app);
+    });
 }
 
 /// Starts an app: packaged / AUMID apps through `shell:AppsFolder`, else the exe.
 pub fn launch(app: &AppId) {
+    let app = app.clone();
+    off_thread(move || open_app(&app));
+}
+
+/// Runs a shell launch on its own thread: `ShellExecute` can take hundreds of
+/// milliseconds (shell extensions, a cold Explorer), and the bar must not freeze
+/// on the click. The new process may still come to the front.
+fn off_thread(work: impl FnOnce() + Send + 'static) {
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+    let _ = std::thread::Builder::new()
+        .name("nitrobar-launch".into())
+        .spawn(move || unsafe {
+            let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+            work();
+            if com {
+                CoUninitialize();
+            }
+        });
+}
+
+fn open_app(app: &AppId) {
     if let Some(aumid) = &app.aumid
         && shell_open(&format!("shell:AppsFolder\\{aumid}"))
     {

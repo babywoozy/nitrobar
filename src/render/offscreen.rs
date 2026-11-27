@@ -256,6 +256,7 @@ fn render_island_states() {
         status_reveal: Reveal::SHOWN,
         start_reveal: Reveal::SHOWN,
         start_scale: 1.0,
+        flight: None,
         clock_reveal: Reveal::SHOWN,
         origin: (0.0, 0.0),
         island: Some(island),
@@ -333,7 +334,7 @@ fn render_island_states() {
         let mut view = collapsed(pill(200.0), false, 1.0, false);
         if let (Some(rest), Some(icon)) = (&mut view.rest, loader.load_app(&app, None, 24)) {
             rest.mascot = None;
-            rest.apps = vec![(icon, 1.0)];
+            rest.apps = vec![(icon, Reveal::SHOWN)];
         }
         shot(&renderer, &wic, &base(view), (232, 70), "rest-app");
     }
@@ -375,8 +376,10 @@ fn render_island_states() {
             scale: 1.0,
             lift: 0.0,
             reveal: Reveal::SHOWN,
+            hide_icon: false,
         })
         .collect();
+    let layout_buttons = layout.buttons.clone();
     // Real icons, loaded the way the bar loads them.
     let loader = crate::icons::IconLoader::new().unwrap();
     let apps: Vec<Option<Icon>> = [
@@ -461,6 +464,17 @@ fn render_island_states() {
                 button.reveal = *reveal;
                 button.pointer.pressed = false;
             }
+            // The third app (Chrome) is the active one: its icon flies.
+            scene.buttons[2].hide_icon = false;
+            scene.flight = apps[2].clone().filter(|_| anim.animating()).map(|icon| {
+                scene.buttons[2].hide_icon = true;
+                if let Some(rest) = scene.island.as_mut().and_then(|v| v.rest.as_mut()) {
+                    rest.mascot = None;
+                }
+                let from = island::rest_layout(&pill_rect).app;
+                let to = layout::centered_square(&layout_buttons[2], 24.0, -1.0);
+                (icon, island::lerp_rect(&from, &to, t.clamp(0.0, 1.05)))
+            });
             scene.status_pointer.hover = false;
             scene.status_reveal = reveals[reveals.len() - 2];
             scene.clock_reveal = reveals[reveals.len() - 1];

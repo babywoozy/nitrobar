@@ -116,8 +116,6 @@ const REST_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 0.95,
 };
-/// Crossfade when the resting pill changes between the mascot and an app icon.
-const REST_APP_FADE: std::time::Duration = std::time::Duration::from_millis(200);
 /// Mascot: one-shot "has the machine been idle long enough?", the floating "z".
 const TIMER_SLEEP: usize = 5;
 const TIMER_ZZZ: usize = 6;
@@ -257,11 +255,11 @@ struct RestApp {
 }
 
 impl RestApp {
-    /// Progress of the crossfade (1 when settled).
-    fn fade(&self, now: Instant) -> f32 {
+    /// Progress of the morph (1 when settled).
+    fn progress(&self, now: Instant) -> f32 {
         self.changed.map_or(1.0, |at| {
-            let t = now.saturating_duration_since(at).as_secs_f32() / REST_APP_FADE.as_secs_f32();
-            morph::ease_in_out_cubic(t.min(1.0))
+            let t = now.saturating_duration_since(at).as_secs_f32();
+            (t / island::ICON_MORPH.as_secs_f32()).min(1.0)
         })
     }
 }
@@ -1683,6 +1681,16 @@ impl App {
                 Default::default(),
             ),
         };
+        let flying = self.flying_button();
+        let flight = flying.as_ref().and_then(|(index, icon)| {
+            let state = self.island.as_ref()?;
+            let button = layout.tasks.get(*index)?;
+            let from = island::rest_layout(&self.island_geometry().pill).app;
+            let to = layout::centered_square(button, self.metrics.icon_size, -1.0);
+            let t = state.anim.eased().clamp(0.0, 1.05);
+            Some((icon.clone(), island::lerp_rect(&from, &to, t)))
+        });
+        let flying_index = flight.as_ref().and(flying.as_ref()).map(|(i, _)| *i);
         let buttons = layout
             .tasks
             .iter()
@@ -1716,6 +1724,7 @@ impl App {
                     scale,
                     lift: (scale - 1.0) * 10.0 + hop,
                     reveal: reveals.get(i).copied().unwrap_or_default(),
+                    hide_icon: flying_index == Some(i),
                 }
             })
             .collect();
@@ -1740,6 +1749,7 @@ impl App {
             status_reveal,
             clock_reveal,
             start_reveal,
+            flight,
             // The Start button's zoom follows the apps' in the list.
             start_scale: 1.0 + ZOOM_MAX * self.zoom.get(self.items().len()).copied().unwrap_or(0.0),
             origin: self.origin,
@@ -2295,7 +2305,7 @@ impl App {
         if self.island.is_some() {
             if let Some(at) = self.rest_app.changed {
                 repaint = true;
-                if now.saturating_duration_since(at) < REST_APP_FADE {
+                if now.saturating_duration_since(at) < island::ICON_MORPH {
                     running = true;
                 } else {
                     self.rest_app.changed = None;
@@ -2682,6 +2692,23 @@ impl App {
         }
     }
 
+    /// While the island opens or closes: the strip button of the app whose icon
+    /// rests on the pill, which then travels between the two places.
+    fn flying_button(&self) -> Option<(usize, Icon)> {
+        let state = self.island.as_ref()?;
+        if !state.anim.animating() || self.mascot.asleep() {
+            return None;
+        }
+        let icon = self.rest_app.now.as_ref()?;
+        let index = self.items().iter().position(|item| {
+            item.group
+                .and_then(|g| self.tasks.groups.get(g))
+                .and_then(|g| g.icon.as_ref())
+                .is_some_and(|i| i.id == icon.id)
+        })?;
+        Some((index, icon.clone()))
+    }
+
     /// How the island looks right now (`None` in full mode).
     fn island_view(&self, clock: &clock::ClockText) -> Option<IslandView> {
         let state = self.island.as_ref()?;
@@ -2729,27 +2756,46 @@ impl App {
             ..text
         };
         // Asleep (nobody at the machine) the mascot is shown whatever is open.
-        let fade = self.rest_app.fade(now);
         let asleep = self.mascot.asleep();
+        let (leaving, arriving) = island::icon_morph(self.rest_app.progress(now));
+        let settled = self.rest_app.changed.is_none();
+        // While the island moves, the active app's icon is the one flying between
+        // the pill and the strip: not drawn here too.
+        let flying = self.flying_button().is_some();
         let mut apps = Vec::new();
-        let mut covered = 0.0;
-        if !asleep && pill_h >= 20.0 {
-            if let Some(icon) = self.rest_app.prev.as_ref().filter(|_| fade < 1.0) {
-                apps.push((icon.clone(), 1.0 - fade));
-                covered += 1.0 - fade;
+        if !asleep && !flying && pill_h >= 20.0 {
+            if let Some(icon) = self.rest_app.prev.as_ref().filter(|_| !settled) {
+                apps.push((icon.clone(), leaving));
             }
             if let Some(icon) = &self.rest_app.now {
-                apps.push((icon.clone(), fade));
-                covered += fade;
+                let look = if settled {
+                    island::Reveal::SHOWN
+                } else {
+                    arriving
+                };
+                apps.push((icon.clone(), look));
             }
         }
-        let mascot = (pill_h >= 20.0 && covered < 1.0).then(|| MascotView {
-            opacity: 1.0 - covered,
-            rect: places.mascot,
-            asleep: self.mascot.asleep(),
-            scale: self.mascot.scale(now),
-            z: self.mascot.z_phase(),
-        });
+        // The mascot takes part in the same morph when it comes or goes.
+        let mascot_look = if asleep {
+            Some(island::Reveal::SHOWN)
+        } else {
+            match (&self.rest_app.now, &self.rest_app.prev) {
+                (None, _) if settled => Some(island::Reveal::SHOWN),
+                (None, _) => Some(arriving),
+                (Some(_), None) if !settled => Some(leaving),
+                _ => None,
+            }
+        };
+        let mascot = mascot_look
+            .filter(|_| pill_h >= 20.0)
+            .map(|look| MascotView {
+                opacity: look.alpha,
+                rect: places.mascot,
+                asleep,
+                scale: self.mascot.scale(now) * look.scale,
+                z: self.mascot.z_phase(),
+            });
         let clock_text = (self.config.bar.island_show_clock && pill_w >= 100.0)
             .then(|| (clock.time.clone(), places.clock));
         let music = self

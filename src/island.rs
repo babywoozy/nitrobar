@@ -716,6 +716,36 @@ pub fn is_desktop(hwnd: HWND) -> bool {
     class == "Progman" || class == "WorkerW"
 }
 
+/// How long one resting icon turns into the next.
+pub const ICON_MORPH: Duration = Duration::from_millis(360);
+
+/// The resting icon morphing, `t` 0..1: how the leaving one and the arriving one
+/// look. The old icon shrinks and turns away while the new one grows out of the
+/// same spot, turning in and overshooting a little, so one seems to become the other.
+pub fn icon_morph(t: f32) -> (Reveal, Reveal) {
+    let t = t.clamp(0.0, 1.0);
+    let out = (t / 0.5).min(1.0);
+    let old = Reveal {
+        alpha: 1.0 - out,
+        scale: 1.0 - 0.7 * out * out,
+        dx: 0.0,
+        angle: 50.0 * out * out,
+    };
+    let u = ((t - 0.18) / 0.82).max(0.0);
+    let grown = if t >= 1.0 {
+        1.0
+    } else {
+        spring(u * ICON_MORPH.as_secs_f32(), 24.0, 0.55)
+    };
+    let new = Reveal {
+        alpha: (u / 0.3).min(1.0),
+        scale: 0.3 + 0.7 * grown,
+        dx: 0.0,
+        angle: -50.0 * (1.0 - grown),
+    };
+    (old, new)
+}
+
 /// Windows' own flyouts that take the foreground: Start / search, Quick Settings,
 /// notification center. While one is open the bar stays expanded (and pressing
 /// Win, which opens Start, expands it).
@@ -1021,6 +1051,22 @@ mod tests {
         let panel = morph_panel(&pill, &strip, 0.6, 3.0);
         assert_eq!(panel.left + panel.right, 400.0);
         assert_eq!(panel.top + panel.bottom, 84.0);
+    }
+
+    #[test]
+    fn one_icon_morphs_into_the_next() {
+        let (old, new) = icon_morph(0.0);
+        assert_eq!((old.alpha, old.scale, new.alpha), (1.0, 1.0, 0.0));
+        // Half-way both are there, the old one small, the new one still growing.
+        let (old, new) = icon_morph(0.35);
+        assert!(old.alpha > 0.0 && new.alpha > 0.0 && old.scale < 0.8);
+        let peak = (0..100)
+            .map(|i| icon_morph(i as f32 / 100.0).1.scale)
+            .fold(0.0f32, f32::max);
+        assert!(peak > 1.03 && peak < 1.2, "overshoot {peak}");
+        let (old, new) = icon_morph(1.0);
+        assert_eq!(old.alpha, 0.0);
+        assert_eq!(new, Reveal::SHOWN);
     }
 
     #[test]

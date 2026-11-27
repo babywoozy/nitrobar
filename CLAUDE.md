@@ -334,11 +334,18 @@ src/
 
 - Theo yêu cầu người dùng: có app đang ở foreground => icon NHỎ của app (20 DIP, `Icon::small` =
   5/6 cỡ icon, vẽ 1:1) thay Nitro, crossfade 200 ms; desktop (Progman / WorkerW) => Nitro; flyout /
-  cửa sổ không có nút => giữ nguyên; Nitro đang ngủ => luôn hiện Nitro. Chưa làm hiệu ứng icon bay
-  từ viên vào dải.
+  cửa sổ không có nút => giữ nguyên; Nitro đang ngủ => luôn hiện Nitro. Đổi icon / Nitro bằng MORPH
+  (`island::icon_morph`, 360 ms: cũ co + xoay đi, mới nở + xoay vào cùng chỗ, nảy nhẹ; người dùng
+  không muốn kiểu mờ chuyển). Lúc bung / thu, icon app đó BAY giữa viên và nút của nó
+  (`App::flying_button`, `Scene::flight`, `ButtonView::hide_icon`).
 - `collapse_delay_ms` mặc định 60 (người dùng muốn rời chuột là thu ngay). Ngoại lệ: đang mở xem
   trước thì 500 ms (đủ đi qua khe tới panel); bị chặn (menu, Start, kéo) thì kiểm tra lại mỗi
   >= 300 ms (không chạy nhịp 60 ms).
+
+### Mở app
+
+- `pins::launch*` chạy `ShellExecute` trên thread riêng (`AllowSetForegroundWindow` trước đó): trên UI
+  thread nó làm thanh đứng hình. Khôi phục: overlay 220 ms rồi mới hiện cửa sổ thật (trước 380 ms).
 
 ### Lưới của dải (`island::strip_layout`, có test)
 

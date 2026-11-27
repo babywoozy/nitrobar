@@ -48,7 +48,7 @@ use crate::island::{ease_out_cubic, lerp};
 pub const WM_APP_FRAME: u32 = WM_APP + 8;
 
 pub const MINIMIZE_DURATION: Duration = Duration::from_millis(400);
-pub const RESTORE_DURATION: Duration = Duration::from_millis(380);
+pub const RESTORE_DURATION: Duration = Duration::from_millis(220);
 /// Minimize: fraction of the way at which the island "swallows" (starts its bounce).
 pub const SWALLOW_AT: f32 = 0.78;
 /// Restore, after asking the real window to show: the app needs ~50-150 ms to
@@ -57,7 +57,7 @@ pub const SWALLOW_AT: f32 = 0.78;
 /// flashes its black background. It fades out over `LINGER_FADE` instead (the
 /// window appears out of the dark), and stays at least until the window is no
 /// longer minimized, at most `LINGER_MAX`.
-const LINGER_FADE: Duration = Duration::from_millis(160);
+const LINGER_FADE: Duration = Duration::from_millis(110);
 const LINGER_MAX: Duration = Duration::from_millis(700);
 /// Windows 11 window corner radius, DIPs.
 const WINDOW_RADIUS: f32 = 8.0;
