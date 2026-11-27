@@ -70,6 +70,8 @@ fn cover(wic: &IWICImagingFactory, size: u32) -> Icon {
     .unwrap();
     Icon {
         id: 1,
+        small: bitmap.clone(),
+        small_px: size,
         large: bitmap.clone(),
         bitmap,
         px: size,
@@ -273,7 +275,10 @@ fn render_island_states() {
             rest: Some(RestView {
                 opacity: 1.0,
                 music_mix: if music { 1.0 } else { 0.0 },
+                apps: Vec::new(),
+                app_rect: l.app,
                 mascot: Some(MascotView {
+                    opacity: 1.0,
                     rect: l.mascot,
                     asleep,
                     scale,
@@ -317,6 +322,21 @@ fn render_island_states() {
         (320, 70),
         "music",
     );
+
+    // At rest with an app in front: its small icon in the mascot's place.
+    {
+        let loader = crate::icons::IconLoader::new().unwrap();
+        let app = crate::tasks::AppId {
+            aumid: Some("Chrome".to_string()),
+            exe: None,
+        };
+        let mut view = collapsed(pill(200.0), false, 1.0, false);
+        if let (Some(rest), Some(icon)) = (&mut view.rest, loader.load_app(&app, None, 24)) {
+            rest.mascot = None;
+            rest.apps = vec![(icon, 1.0)];
+        }
+        shot(&renderer, &wic, &base(view), (232, 70), "rest-app");
+    }
 
     // The expanded strip with five apps.
     let config = BarConfig::default();

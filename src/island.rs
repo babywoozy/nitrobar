@@ -354,6 +354,8 @@ pub fn geometry(width: f32, strip_height: f32, config: &BarConfig, at_top: bool)
 /// Equalizer bar width and the space between bars, DIPs.
 pub const BAR_WIDTH: f32 = 4.0;
 pub const BAR_GAP: f32 = 3.0;
+/// Size of the active app's icon on the resting pill, DIPs.
+pub const APP_ICON: f32 = 20.0;
 /// Empty space on each side of the flame inside its box (3 of 24 units).
 const MASCOT_SIDE: f32 = 3.0 / 24.0;
 const CLOCK_TEXT_WIDTH: f32 = 90.0;
@@ -370,6 +372,8 @@ pub fn pill_padding(height: f32) -> (f32, f32) {
 pub struct RestLayout {
     /// The mascot's box (its drawing leaves a margin inside it).
     pub mascot: D2D_RECT_F,
+    /// The active app's small icon, in the mascot's place.
+    pub app: D2D_RECT_F,
     pub clock: D2D_RECT_F,
     /// Round cover art: concentric with the pill's round end.
     pub art: D2D_RECT_F,
@@ -419,7 +423,14 @@ pub fn rest_layout(pill: &D2D_RECT_F) -> RestLayout {
     );
     let left = art.right + pad + 3.0;
     let right = (bars.left - pad - 2.0).max(left);
+    let app = rect(
+        pill.left + inset,
+        mid - APP_ICON / 2.0,
+        pill.left + inset + APP_ICON,
+        mid + APP_ICON / 2.0,
+    );
     RestLayout {
+        app,
         mascot,
         clock,
         art,
@@ -695,6 +706,14 @@ pub fn strip_layout(
         status,
         clock,
     }
+}
+
+/// Whether `hwnd` is the bare desktop.
+pub fn is_desktop(hwnd: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let len = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    let class = String::from_utf16_lossy(&class[..len]);
+    class == "Progman" || class == "WorkerW"
 }
 
 /// Windows' own flyouts that take the foreground: Start / search, Quick Settings,
@@ -1014,6 +1033,9 @@ mod tests {
         };
         let l = rest_layout(&pill);
         let (content, pad) = pill_padding(44.0);
+        assert_eq!(l.app.left - pill.left, 22.0);
+        assert_eq!(l.app.right - l.app.left, APP_ICON);
+        assert_eq!(l.app.top - pill.top, pill.bottom - l.app.bottom);
         // Nothing in the curved ends, and the same inset on both sides.
         assert_eq!(l.art.left - pill.left, 22.0);
         assert_eq!(pill.right - l.bars.right, 22.0);

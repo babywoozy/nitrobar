@@ -330,6 +330,16 @@ src/
 - KHI THỬ: kiểm tra người dùng có đang xem video / toàn màn hình không (không chỉ idle: xem video thì
   không có input). Đã một lần phát âm thanh thử đè lên video của người dùng.
 
+### Bên trái viên lúc nghỉ, độ trễ thu
+
+- Theo yêu cầu người dùng: có app đang ở foreground => icon NHỎ của app (20 DIP, `Icon::small` =
+  5/6 cỡ icon, vẽ 1:1) thay Nitro, crossfade 200 ms; desktop (Progman / WorkerW) => Nitro; flyout /
+  cửa sổ không có nút => giữ nguyên; Nitro đang ngủ => luôn hiện Nitro. Chưa làm hiệu ứng icon bay
+  từ viên vào dải.
+- `collapse_delay_ms` mặc định 60 (người dùng muốn rời chuột là thu ngay). Ngoại lệ: đang mở xem
+  trước thì 500 ms (đủ đi qua khe tới panel); bị chặn (menu, Start, kéo) thì kiểm tra lại mỗi
+  >= 300 ms (không chạy nhịp 60 ms).
+
 ### Lưới của dải (`island::strip_layout`, có test)
 
 - Thứ tự: Start, icon app, vạch, trạng thái, giờ. `GRID_GAP` 16 DIP giữa các mép NHÌN THẤY; hai đầu cách

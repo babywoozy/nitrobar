@@ -60,6 +60,8 @@ const TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
 };
 const CLOCK_FONT_SIZE: f32 = 12.0;
 const TIME_FONT_SIZE: f32 = 15.0;
+/// Cache key bit of an icon's smaller copy.
+const SMALL_ICON: u64 = 1 << 62;
 /// Cache key bit of an icon's larger copy.
 const LARGE_ICON: u64 = 1 << 63;
 /// Height of Segoe UI's digits relative to the font size.
@@ -166,6 +168,10 @@ pub struct RestView {
     /// 0 = mascot and clock, 1 = music.
     pub music_mix: f32,
     pub mascot: Option<MascotView>,
+    /// Small icons of the active app (two while crossfading) with their opacity,
+    /// centered in `app_rect`.
+    pub apps: Vec<(Icon, f32)>,
+    pub app_rect: D2D_RECT_F,
     pub clock: Option<(Vec<u16>, D2D_RECT_F)>,
     pub music: Option<MusicView>,
     pub text: D2D1_COLOR_F,
@@ -174,6 +180,8 @@ pub struct RestView {
 }
 
 pub struct MascotView {
+    /// Less than 1 while it gives way to an app icon.
+    pub opacity: f32,
     /// Square box (bar space) the flame fills.
     pub rect: D2D_RECT_F,
     pub asleep: bool,
@@ -745,7 +753,25 @@ impl Renderer {
             let music = rest.opacity * rest.music_mix;
             if idle > 0.01 {
                 if let Some(mascot) = &rest.mascot {
-                    self.draw_mascot(target, rest, mascot, origin, idle);
+                    self.draw_mascot(target, rest, mascot, origin, idle * mascot.opacity);
+                }
+                for (icon, alpha) in &rest.apps {
+                    used.push(icon.id | SMALL_ICON);
+                    let key = icon.id | SMALL_ICON;
+                    if let Some(bitmap) = Self::cached_bitmap(target, key, &icon.small) {
+                        // 1:1 on whole pixels.
+                        let at =
+                            layout::pixel_square(&rest.app_rect, icon.small_px as f32, 0.0, dpi);
+                        unsafe {
+                            target.rt.DrawBitmap(
+                                &bitmap,
+                                Some(&raw const at),
+                                idle * alpha,
+                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                None,
+                            );
+                        }
+                    }
                 }
                 if let Some((text, rect)) = &rest.clock {
                     let mut color = rest.text;

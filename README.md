@@ -8,7 +8,8 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
 - **Chế độ island (mặc định)**: một viên đen bo tròn nổi ở giữa mép dưới màn hình (200×44 DIP, cách
   mép 10 DIP). `island_style = "black"` (mặc định) hoặc `"glass"` (kính mờ blur phần phía sau). Chỉ có
   đen / trắng / xám và một màu nhấn (lấy từ ảnh bìa bài đang phát, nếu không thì theo `island_color`).
-  - Lúc nghỉ: bên trái là linh vật **Nitro** (tia lửa có mắt), bên phải là giờ. Máy rảnh quá
+  - Lúc nghỉ: bên trái là linh vật **Nitro** (tia lửa có mắt), bên phải là giờ. Đang dùng app nào thì icon nhỏ của app đó thay chỗ Nitro (ra desktop thì Nitro
+    trở lại; máy ngủ thì cũng là Nitro). Máy rảnh quá
     `island_sleep_seconds` thì Nitro ngủ (chữ "z" bay lên); rê chuột tới thì nó bật dậy.
   - Đang phát nhạc / video (theo bảng media của Windows): viên nới rộng, ảnh bìa tròn + tên bài và
     nghệ sĩ bên trái, bốn cột sóng nhảy theo độ to của âm thanh bên phải.
@@ -21,7 +22,7 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
     icon các app (app ghim + đang chạy, gom theo app), vẫn là một khối bo tròn nổi, rộng vừa đủ. Vạch
     ngắn dưới app đang mở, vạch dài màu nhấn dưới app đang active, chấm mờ dưới app đã thu nhỏ hết
     cửa sổ, nền cam khi app cần chú ý. Chỉ icon đang có chuột phóng to nhẹ (1,2 lần), các icon khác giữ nguyên. Wifi / âm lượng
-    / pin / đồng hồ nằm cuối dải, ngăn cách bằng một vạch mờ. Rời chuột ~600 ms thì thu về viên.
+    / pin / đồng hồ nằm cuối dải, ngăn cách bằng một vạch mờ. Rời chuột ra là thu về viên ngay.
   - Bấm icon trên dải: app đang thu nhỏ thì cửa sổ tỏa ra từ đúng icon đó (khối tròn đen cỡ icon lớn
     dần, sáng dần thành cửa sổ thật) rồi dải thu lại; app đang active thì cửa sổ co ngược vào đúng
     icon và viên nảy lên với icon app; app đang mở nhưng ở sau thì được đưa lên trước và icon nảy
@@ -98,7 +99,7 @@ island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
 island_height = 44           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
 expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay lập tức)
-collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
+collapse_delay_ms = 60       # rời chuột bao lâu thì thu lại (0 = ngay lập tức)
 island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là linh vật Nitro)
 island_sleep_seconds = 60    # máy rảnh bao lâu thì linh vật ngủ (giây, 0 = không ngủ)
 island_squash = true         # viên hơi dẹt lại khi giãn / co nhanh rồi phồng về

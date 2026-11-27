@@ -50,10 +50,13 @@ pub struct Icon {
     pub px: u32,
     /// The same picture at up to twice that size, for drawing it magnified.
     pub large: IWICBitmap,
+    /// And at 5/6 of it (20 px for 24), for the resting island, with its size.
+    pub small: IWICBitmap,
+    pub small_px: u32,
 }
 
-/// A decoded icon at the size asked for, and a larger copy.
-type Pair = (IWICBitmap, IWICBitmap);
+/// A decoded icon at the size asked for, a larger and a smaller copy.
+type Pair = (IWICBitmap, IWICBitmap, IWICBitmap);
 
 /// Size the shell is asked for: icons are always reduced from a bigger image (a
 /// 24 px frame straight from the shell has ragged edges, e.g. Explorer, Claude).
@@ -98,9 +101,11 @@ impl IconLoader {
         })
     }
 
-    fn finish(&self, (bitmap, large): Pair) -> Option<Icon> {
+    fn finish(&self, (bitmap, large, small): Pair) -> Option<Icon> {
         let (mut w, mut h) = (0, 0);
         unsafe { bitmap.GetSize(&raw mut w, &raw mut h) }.ok()?;
+        let (mut small_w, mut small_h) = (0, 0);
+        unsafe { small.GetSize(&raw mut small_w, &raw mut small_h) }.ok()?;
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         Some(Icon {
@@ -108,6 +113,8 @@ impl IconLoader {
             bitmap,
             px: w.max(h),
             large,
+            small,
+            small_px: small_w.max(small_h),
         })
     }
 
@@ -126,7 +133,7 @@ impl IconLoader {
             )
         }
         .ok()?;
-        self.finish((bitmap.clone(), bitmap))
+        self.finish((bitmap.clone(), bitmap.clone(), bitmap))
     }
 
     /// Icon for a running window of `app`.
@@ -252,9 +259,13 @@ impl IconLoader {
         self.pair(&wic.cast().ok()?, px)
     }
 
-    /// `source` reduced to `px` and to `2 px`.
+    /// `source` reduced to `px`, to `2 px` and to `5/6 px`.
     fn pair(&self, source: &IWICBitmapSource, px: u32) -> Option<Pair> {
-        Some((self.normalize(source, px)?, self.normalize(source, px * 2)?))
+        Some((
+            self.normalize(source, px)?,
+            self.normalize(source, px * 2)?,
+            self.normalize(source, (px * 5 + 3) / 6)?,
+        ))
     }
 
     /// Converts to premultiplied BGRA, scales *down* to `px` with an area-averaging

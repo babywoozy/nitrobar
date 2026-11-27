@@ -126,7 +126,7 @@ impl Default for BarConfig {
             island_height: 44.0,
             island_gap: 10.0,
             expand_delay_ms: 30,
-            collapse_delay_ms: 600,
+            collapse_delay_ms: 60,
             island_show_clock: true,
             island_squash: true,
             island_sleep_seconds: 60,
@@ -247,7 +247,7 @@ island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)
 island_height = 44           # (DIP, 4..80)
 island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
 expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay lập tức)
-collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
+collapse_delay_ms = 60       # rời chuột bao lâu thì thu lại (0 = ngay lập tức)
 island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là linh vật Nitro)
 island_sleep_seconds = 60    # máy rảnh bao lâu thì linh vật ngủ (giây, 0 = không ngủ)
 island_squash = true         # viên hơi dẹt lại khi giãn / co nhanh rồi phồng về
@@ -280,7 +280,7 @@ pub fn path() -> Option<PathBuf> {
 }
 
 /// The island lines the first island version wrote (a 120x8 pill, 100 ms delay...).
-const LEGACY_ISLAND: [(&str, &str); 6] = [
+const LEGACY_ISLAND: [(&str, &str); 7] = [
     (
         "island_width = 120           # cỡ viên khi thu gọn (DIP, 40..600)",
         "island_width = 200           # cỡ viên lúc nghỉ (DIP, 40..600)",
@@ -297,6 +297,10 @@ island_gap = 10              # khoảng cách tới mép màn hình (DIP, 0..60)
     (
         "island_show_clock = false    # hiện giờ nhỏ trong viên",
         "island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là icon app đang active)",
+    ),
+    (
+        "collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại",
+        "collapse_delay_ms = 60       # rời chuột bao lâu thì thu lại (0 = ngay lập tức)",
     ),
     // Applied after the lines above, so the first version's file ends up current too.
     (

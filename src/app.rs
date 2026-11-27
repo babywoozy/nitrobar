@@ -116,12 +116,18 @@ const REST_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 0.95,
 };
+/// Crossfade when the resting pill changes between the mascot and an app icon.
+const REST_APP_FADE: std::time::Duration = std::time::Duration::from_millis(200);
 /// Mascot: one-shot "has the machine been idle long enough?", the floating "z".
 const TIMER_SLEEP: usize = 5;
 const TIMER_ZZZ: usize = 6;
 /// Equalizer frames, only while music plays and the pill is on screen.
 const TIMER_BARS: usize = 7;
 const BARS_FRAME_MS: u32 = 33;
+/// Collapse delay while window previews are open, and how often a blocked
+/// collapse (menu, Start, drag) is checked again.
+const PREVIEW_GRACE_MS: u32 = 500;
+const BLOCKED_RECHECK_MS: u32 = 300;
 /// Hover delay when the mascot is asleep, so that its wake-up hop is seen first.
 const WAKE_EXPAND_DELAY_MS: u32 = 320;
 /// Pill width while music shows, DIPs, and how long it takes to grow / shrink.
@@ -204,6 +210,7 @@ struct App {
     /// Island: the mascot, and the foreground window that last woke it.
     mascot: Mascot,
     mascot_fg: HWND,
+    rest_app: RestApp,
     /// Island: the media watcher, what it reported last, its cover as an icon, and
     /// the equalizer (meter and timer only while bars are on screen).
     media: Option<Media>,
@@ -238,6 +245,25 @@ struct App {
     morph: Option<Morph>,
     /// A window we are restoring ourselves (after the grow-out animation).
     own_restore: Option<(HWND, Instant)>,
+}
+
+/// The resting pill's left side: the active app's small icon (`None`: the
+/// mascot), crossfading from what it showed before.
+#[derive(Default)]
+struct RestApp {
+    now: Option<Icon>,
+    prev: Option<Icon>,
+    changed: Option<Instant>,
+}
+
+impl RestApp {
+    /// Progress of the crossfade (1 when settled).
+    fn fade(&self, now: Instant) -> f32 {
+        self.changed.map_or(1.0, |at| {
+            let t = now.saturating_duration_since(at).as_secs_f32() / REST_APP_FADE.as_secs_f32();
+            morph::ease_in_out_cubic(t.min(1.0))
+        })
+    }
 }
 
 /// How much of the pill shows music (0 = mascot and clock, 1 = music), easing
@@ -403,6 +429,7 @@ fn run_window(options: Options) -> Result<()> {
             hit_rect: RECT::default(),
             mascot: Mascot::default(),
             mascot_fg: HWND::default(),
+            rest_app: RestApp::default(),
             media: None,
             track: None,
             art: None,
@@ -991,6 +1018,26 @@ impl App {
 
     // ----- mascot and music -----
 
+    /// The active app takes the mascot's place on the resting pill; on the bare
+    /// desktop the mascot is back. Windows without a button (flyouts, dialogs of
+    /// the shell) keep what was there.
+    fn update_rest_app(&mut self) {
+        let foreground = self.tasks.foreground;
+        let group = self.tasks.groups.iter().find(|g| g.contains(foreground));
+        let icon = match group {
+            Some(group) => group.icon.clone(),
+            None if island::is_desktop(foreground) => None,
+            None => return,
+        };
+        if self.rest_app.now.as_ref().map(|i| i.id) == icon.as_ref().map(|i| i.id) {
+            return;
+        }
+        self.rest_app.prev = std::mem::replace(&mut self.rest_app.now, icon);
+        self.rest_app.changed = Some(Instant::now());
+        self.start_frames();
+        self.invalidate();
+    }
+
     /// Starts over the countdown to the mascot's nap.
     fn arm_sleep(&mut self) {
         let seconds = self.config.bar.island_sleep_seconds;
@@ -1501,6 +1548,7 @@ impl App {
                     self.arm_sleep();
                 }
             }
+            self.update_rest_app();
             self.on_foreground_changed();
         }
     }
@@ -1943,7 +1991,12 @@ impl App {
         } else {
             self.kill_timer(TIMER_EXPAND);
             if expanded {
-                self.set_timer(TIMER_COLLAPSE, self.config.bar.collapse_delay_ms);
+                let mut delay = self.config.bar.collapse_delay_ms;
+                if self.preview.is_some() {
+                    // Time to cross the gap from the icon to the window previews.
+                    delay = delay.max(PREVIEW_GRACE_MS);
+                }
+                self.set_timer(TIMER_COLLAPSE, delay);
             }
         }
     }
@@ -1969,8 +2022,9 @@ impl App {
             self.cursor_inside()
         );
         if self.collapse_blocked() {
-            // Check again later (only while expanded and blocked).
-            self.set_timer(TIMER_COLLAPSE, self.config.bar.collapse_delay_ms);
+            // Check again later (only while expanded and blocked; not in a hurry).
+            let again = self.config.bar.collapse_delay_ms.max(BLOCKED_RECHECK_MS);
+            self.set_timer(TIMER_COLLAPSE, again);
         } else if self.cursor_inside() {
             // Pointer is back (no WM_MOUSEMOVE yet): wait for it to leave again.
             self.track_mouse();
@@ -2239,6 +2293,15 @@ impl App {
         }
 
         if self.island.is_some() {
+            if let Some(at) = self.rest_app.changed {
+                repaint = true;
+                if now.saturating_duration_since(at) < REST_APP_FADE {
+                    running = true;
+                } else {
+                    self.rest_app.changed = None;
+                    self.rest_app.prev = None;
+                }
+            }
             if self.mascot.waking(now) {
                 running = true;
                 repaint = true;
@@ -2665,7 +2728,23 @@ impl App {
             a: text.a * 0.6,
             ..text
         };
-        let mascot = (pill_h >= 20.0).then(|| MascotView {
+        // Asleep (nobody at the machine) the mascot is shown whatever is open.
+        let fade = self.rest_app.fade(now);
+        let asleep = self.mascot.asleep();
+        let mut apps = Vec::new();
+        let mut covered = 0.0;
+        if !asleep && pill_h >= 20.0 {
+            if let Some(icon) = self.rest_app.prev.as_ref().filter(|_| fade < 1.0) {
+                apps.push((icon.clone(), 1.0 - fade));
+                covered += 1.0 - fade;
+            }
+            if let Some(icon) = &self.rest_app.now {
+                apps.push((icon.clone(), fade));
+                covered += fade;
+            }
+        }
+        let mascot = (pill_h >= 20.0 && covered < 1.0).then(|| MascotView {
+            opacity: 1.0 - covered,
             rect: places.mascot,
             asleep: self.mascot.asleep(),
             scale: self.mascot.scale(now),
@@ -2703,6 +2782,8 @@ impl App {
                 opacity: rest_opacity,
                 music_mix,
                 mascot,
+                apps,
+                app_rect: places.app,
                 clock: clock_text,
                 music,
                 text,
