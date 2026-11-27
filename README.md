@@ -29,7 +29,7 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
     tiêu đề của từng cửa sổ phía trên dải để chọn, bấm lại icon để đóng.
   - Nhấn phím Win (mở Start) cũng làm thanh bung ra. Không thu lại khi đang mở menu chuột phải, Start,
     Quick Settings, trung tâm thông báo hay đang kéo thả. Đang chơi game / xem video toàn màn hình thì
-    viên ẩn đi và chạm mép không làm thanh bung ra. Dải island không có nút Start (dùng phím Win).
+    viên ẩn đi và chạm mép không làm thanh bung ra. Đầu dải có nút Start (bấm trái mở Start, bấm phải mở menu Win+X).
 - **Chế độ full**: thanh luôn hiện ở đáy (hoặc đỉnh), đăng ký AppBar: cửa sổ phóng to không đè lên thanh.
 - Nút Start (mở Start menu của Windows), app đang chạy gom nhóm theo ứng dụng với icon thật.
   Vạch ngắn = đang chạy, vạch dài màu nhấn = đang mở, nền cam = app cần chú ý.

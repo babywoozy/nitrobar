@@ -219,8 +219,9 @@ struct App {
     /// Dominant color of the current wallpaper (island_color = "wallpaper"), found
     /// on a thread; `None` until it is ready.
     wallpaper_color: Option<D2D1_COLOR_F>,
-    /// Island strip: pointer x in bar space (DIPs), whether it is over the strip,
-    /// and the eased zoom amount (0..1) of the icons under it.
+    /// Measured widths of the strip's battery percentage and clock.
+    strip_text: (f32, f32),
+    /// Island strip: eased zoom amount (0..1) of each app button, then Start.
     zoom: Vec<f32>,
     last_frame: Option<Instant>,
     /// Island: window previews of an app with several windows, whether the
@@ -410,6 +411,7 @@ fn run_window(options: Options) -> Result<()> {
             bars: Bars::default(),
             glass: None,
             wallpaper_color: None,
+            strip_text: (28.0, 70.0),
             zoom: Vec::new(),
             last_frame: None,
             preview: None,
@@ -606,6 +608,11 @@ fn show_context_menu(hwnd: HWND, lparam: LPARAM) {
     unsafe {
         let _ = ScreenToClient(hwnd, &raw mut client);
         let _ = GetWindowRect(hwnd, &raw mut bar);
+    }
+    // Right click on Start: Windows' own power-user menu (Win+X).
+    if with_app(hwnd, |app| app.hit_at(client.x, client.y)) == Some(Some(Hit::Start)) {
+        shell::open_power_menu();
+        return;
     }
     // The right-clicked app button, plus the menu description. Lists may change
     // while the menu is open, so the command re-finds the app by identity.
@@ -1552,7 +1559,7 @@ impl App {
     /// The island strip in the shape drawing and hit-testing use (no Start button).
     fn strip_as_layout(strip: &island::StripLayout) -> BarLayout {
         BarLayout {
-            start: D2D_RECT_F::default(),
+            start: strip.start,
             tasks: strip.buttons.clone(),
             status: strip.status,
             clock: strip.clock,
@@ -1594,10 +1601,11 @@ impl App {
         };
         let foreground = self.tasks.foreground;
         // Island: each button, the status area and the clock roll in / out on their own.
-        let (reveals, status_reveal, clock_reveal) = match (&self.island, &strip) {
+        let (reveals, status_reveal, clock_reveal, start_reveal) = match (&self.island, &strip) {
             (Some(state), Some(strip)) => {
                 let middle = |r: &D2D_RECT_F| (r.left + r.right) / 2.0;
-                let mut centers: Vec<f32> = layout.tasks.iter().map(middle).collect();
+                let mut centers: Vec<f32> = vec![middle(&strip.start)];
+                centers.extend(layout.tasks.iter().map(middle));
                 centers.push(middle(&strip.status));
                 centers.push(middle(&strip.clock));
                 let mut all = island::reveals(
@@ -1617,9 +1625,15 @@ impl App {
                 };
                 let clock = calm(all.pop());
                 let status = calm(all.pop());
-                (all, status, clock)
+                let start = all.remove(0);
+                (all, status, clock, start)
             }
-            _ => (Vec::new(), Default::default(), Default::default()),
+            _ => (
+                Vec::new(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ),
         };
         let buttons = layout
             .tasks
@@ -1674,9 +1688,12 @@ impl App {
             clock_pointer: self.pointer(Hit::Clock),
             island: self.island_view(&clock),
             clock,
-            divider: strip.and_then(|s| s.divider),
+            divider: strip.map(|s| s.divider),
             status_reveal,
             clock_reveal,
+            start_reveal,
+            // The Start button's zoom follows the apps' in the list.
+            start_scale: 1.0 + ZOOM_MAX * self.zoom.get(self.items().len()).copied().unwrap_or(0.0),
             origin: self.origin,
         }
     }
@@ -1715,6 +1732,7 @@ impl App {
     }
 
     fn paint(&mut self) {
+        self.measure_strip_text();
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(self.hwnd, &raw mut ps);
@@ -1825,16 +1843,44 @@ impl App {
         island::strip_height(&self.config.bar, self.metrics.icon_size)
     }
 
+    /// The clock as shown (the date line only if wanted).
+    fn clock_text(&self) -> clock::ClockText {
+        let mut clock = clock::now(self.config.clock.hour_format);
+        if !self.config.clock.show_date {
+            clock.date.clear();
+        }
+        clock
+    }
+
+    /// Measures the texts the strip layout depends on (not while painting: the
+    /// renderer is moved out then, and the previous measure is still right).
+    fn measure_strip_text(&mut self) {
+        if self.island.is_none() {
+            return;
+        }
+        let clock = self.clock_text();
+        let status = self.status_view();
+        if let Some(renderer) = &self.renderer {
+            self.strip_text = renderer.strip_text(status.percent.as_deref(), &clock);
+        }
+    }
+
     /// The expanded island: panel, icon buttons and the status area.
     fn strip(&self) -> island::StripLayout {
         let view = self.status_view();
+        let (percent, clock) = self.strip_text;
         island::strip_layout(
             self.bar_width_dip(),
             self.island_strip_height(),
             &self.island_config(self.music.target),
             self.metrics.icon_size,
+            self.metrics.start_logo_size(),
             self.items().len(),
-            layout::status_width(view.icons.len(), view.percent.is_some()),
+            island::Tail {
+                glyphs: view.icons.len(),
+                percent: if view.percent.is_some() { percent } else { 0.0 },
+                clock,
+            },
             self.metrics.at_top,
         )
     }
@@ -2109,8 +2155,9 @@ impl App {
         // Only the icon under the pointer zooms; each one eases in and out on its own.
         if self.island.is_some() {
             let open = self.island.as_ref().is_some_and(|s| !s.small_window);
+            // One per app button, then one for Start.
             let count = self.items().len();
-            self.zoom.resize(count, 0.0);
+            self.zoom.resize(count + 1, 0.0);
             let dt = self
                 .last_frame
                 .map_or(0.016, |at| now.saturating_duration_since(at).as_secs_f32())
@@ -2118,7 +2165,8 @@ impl App {
             let k = 1.0 - (-dt / ZOOM_EASE).exp();
             let hovered = self.hover;
             for (i, z) in self.zoom.iter_mut().enumerate() {
-                let target = if open && hovered == Some(Hit::Task(i)) {
+                let this = if i == count { Hit::Start } else { Hit::Task(i) };
+                let target = if open && hovered == Some(this) {
                     1.0
                 } else {
                     0.0
@@ -2364,6 +2412,7 @@ impl App {
     /// the full strip otherwise; hidden over fullscreen apps. Paints at once so a
     /// resized window never shows a stale or black frame.
     fn place_island(&mut self) {
+        self.measure_strip_text();
         let Some(state) = &self.island else {
             return;
         };

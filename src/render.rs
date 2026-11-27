@@ -30,7 +30,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_SEMI_LIGHT, DWRITE_LINE_METRICS, DWRITE_MEASURING_MODE_NATURAL,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
     IDWriteTypography,
 };
@@ -130,6 +130,9 @@ pub struct Scene<'a> {
     pub divider: Option<D2D_RECT_F>,
     pub status_reveal: Reveal,
     pub clock_reveal: Reveal,
+    /// Island: zoom and roll-in of the Start button.
+    pub start_scale: f32,
+    pub start_reveal: Reveal,
     /// DIP offset of the window inside bar space (island: the collapsed window is
     /// only the pill area).
     pub origin: (f32, f32),
@@ -830,6 +833,36 @@ impl Renderer {
         }
     }
 
+    /// Width of one line of text, DIPs, rounded up.
+    fn text_width(&self, text: &[u16], format: &IDWriteTextFormat) -> f32 {
+        unsafe {
+            let Ok(layout) = self.dwrite.CreateTextLayout(text, format, 1000.0, 100.0) else {
+                return 0.0;
+            };
+            let all = DWRITE_TEXT_RANGE {
+                startPosition: 0,
+                length: text.len() as u32,
+            };
+            let _ = layout.SetTypography(&self.tabular, all);
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            if layout.GetMetrics(&raw mut metrics).is_err() {
+                return 0.0;
+            }
+            metrics.width.ceil()
+        }
+    }
+
+    /// Widths the island strip is laid out with: the battery percentage and the
+    /// wider of the clock's lines.
+    pub fn strip_text(&self, percent: Option<&[u16]>, clock: &ClockText) -> (f32, f32) {
+        let percent = percent.map_or(0.0, |p| self.text_width(p, &self.percent_format));
+        let mut width = self.text_width(&clock.time, &self.strip_time_format);
+        if !clock.date.is_empty() {
+            width = width.max(self.text_width(&clock.date, &self.strip_date_format));
+        }
+        (percent, width)
+    }
+
     /// Text laid out with tabular figures.
     fn draw_time(
         &self,
@@ -1063,15 +1096,28 @@ impl Renderer {
     /// Start, app buttons, status and clock.
     fn draw_content(&self, target: &mut Target, scene: &Scene, dpi: f32, used: &mut Vec<u64>) {
         let palette = &scene.palette;
-        // The island has no Start button (the Win key opens Start).
-        if scene.start.0.right > scene.start.0.left {
-            Self::draw_start(
-                target,
-                palette,
-                &scene.metrics,
-                scene.start.0,
-                scene.start.1,
-            );
+        let (start, pointer) = scene.start;
+        if scene.island.is_some() {
+            // Monochrome like the rest of the island: it turns dark on light glass.
+            if scene.start_reveal.alpha > 0.0 {
+                Self::apply_reveal(target, scene.origin, &start, scene.start_reveal);
+                let faded = palette.faded(scene.start_reveal.alpha);
+                Self::draw_button_background(
+                    target,
+                    &faded,
+                    start,
+                    (start.bottom - start.top) / 2.0,
+                    false,
+                    pointer,
+                );
+                let mut size = scene.metrics.start_logo_size() * scene.start_scale;
+                if pointer.pressed {
+                    size *= 0.85;
+                }
+                Self::draw_logo(target, start, size, &faded.text, &faded.text);
+            }
+        } else if start.right > start.left {
+            Self::draw_start(target, palette, &scene.metrics, start, pointer);
         }
         for button in &scene.buttons {
             if button.reveal.alpha > 0.0 {
@@ -1190,32 +1236,44 @@ impl Renderer {
         } else {
             metrics.start_logo_size()
         };
-        let logo = layout::centered_square(&rect, size, 0.0);
-        let gap = size * 0.06;
-        let pane = (size - gap) / 2.0;
-        let top_color = D2D1_COLOR_F {
+        let top = D2D1_COLOR_F {
             r: 0.30,
             g: 0.78,
             b: 1.0,
             a: 1.0,
         };
-        let bottom_color = D2D1_COLOR_F {
+        let bottom = D2D1_COLOR_F {
             r: 0.0,
             g: 0.56,
             b: 0.94,
             a: 1.0,
         };
+        Self::draw_logo(target, rect, size, &top, &bottom);
+    }
+
+    /// Four panes, `size` square, centered in `rect`.
+    fn draw_logo(
+        target: &Target,
+        rect: D2D_RECT_F,
+        size: f32,
+        top: &D2D1_COLOR_F,
+        bottom: &D2D1_COLOR_F,
+    ) {
+        let logo = layout::centered_square(&rect, size, 0.0);
+        // Whole-DIP panes and gap keep the edges crisp at 100 %.
+        let gap = (size * 0.08).round().max(1.0);
+        let pane = (size - gap) / 2.0;
         for row in 0..2 {
             for col in 0..2 {
                 let left = logo.left + col as f32 * (pane + gap);
-                let top = logo.top + row as f32 * (pane + gap);
+                let top_edge = logo.top + row as f32 * (pane + gap);
                 let pane_rect = D2D_RECT_F {
                     left,
-                    top,
+                    top: top_edge,
                     right: left + pane,
-                    bottom: top + pane,
+                    bottom: top_edge + pane,
                 };
-                let color = if row == 0 { &top_color } else { &bottom_color };
+                let color = if row == 0 { top } else { bottom };
                 Self::fill_rounded(target, pane_rect, size * 0.04, color);
             }
         }
@@ -1257,9 +1315,11 @@ impl Renderer {
         if button.state == ButtonState::Attention && !button.pointer.pressed {
             Self::fill_plate(target, rect, radius, &palette.attention_bg);
         } else if flat {
-            // Dock style: the zoom is the hover feedback; only a press shows a plate.
+            // A faint round plate under the zoomed icon.
             if button.pointer.pressed {
                 Self::fill_plate(target, rect, radius, &palette.pressed);
+            } else if button.pointer.hover {
+                Self::fill_plate(target, rect, radius, &palette.hover);
             }
         } else {
             Self::draw_button_background(
@@ -1432,7 +1492,8 @@ impl Renderer {
         }
         if let Some(percent) = &scene.status.percent {
             let cell = D2D_RECT_F {
-                left: left + 2.0,
+                // The island's layout measures the text: no extra space there.
+                left: left + if scene.island.is_some() { 0.0 } else { 2.0 },
                 top: rect.top,
                 right: rect.right,
                 bottom: rect.bottom,

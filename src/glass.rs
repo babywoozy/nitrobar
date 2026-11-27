@@ -86,6 +86,7 @@ impl Glass {
                 None,
             )
             .ok()?;
+            crate::theme::no_border(hwnd);
             match Self::compose(hwnd) {
                 Some(glass) => Some(glass),
                 None => {

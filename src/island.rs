@@ -30,7 +30,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::config::BarConfig;
 use crate::icons::Icon;
-use crate::layout::{CLOCK_WIDTH, STATUS_GAP};
+use crate::layout::{STATUS_CELL, STATUS_PADDING};
 use crate::media::BARS;
 use crate::morph::spring;
 use crate::tasks;
@@ -553,56 +553,81 @@ pub fn reveals(centers: &[f32], middle: f32, step: f32, anim: &Island) -> Vec<Re
         .collect()
 }
 
-/// Space between buttons and around the divider.
-const STRIP_GAP: f32 = 2.0;
-const DIVIDER_SPACE: f32 = 8.0;
+/// The grid: this much empty space between the visible things in the strip
+/// (Start logo, app icons, divider, status glyphs, clock).
+pub const GRID_GAP: f32 = 16.0;
+/// A button extends this far beyond its visible icon on each side; so does a
+/// hover plate around the clock.
+const PLATE: f32 = 8.0;
+/// Empty space around a 16 DIP status glyph inside its cell.
+const GLYPH_SIDE: f32 = 4.0;
 /// Height of the divider line between the apps and the status area.
-const DIVIDER_HEIGHT: f32 = 22.0;
+const DIVIDER_HEIGHT: f32 = 20.0;
 
-/// The pill expanded into the strip of app icons (bar space, DIPs). Buttons are
-/// laid out at their final positions; the panel grows from the pill to `panel`.
+/// What follows the apps: status glyphs, the measured widths of the battery
+/// percentage and of the clock's wider line.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tail {
+    pub glyphs: usize,
+    pub percent: f32,
+    pub clock: f32,
+}
+
+/// The pill expanded into the strip: Start, app icons, divider, status, clock
+/// (bar space, DIPs). Everything is laid out at its final position.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StripLayout {
     pub panel: D2D_RECT_F,
     /// Window rect that holds the panel, its shadow and the spring overshoot.
     pub window: D2D_RECT_F,
+    pub start: D2D_RECT_F,
     pub buttons: Vec<D2D_RECT_F>,
-    pub divider: Option<D2D_RECT_F>,
+    pub divider: D2D_RECT_F,
     /// Zero width when there is nothing to show.
     pub status: D2D_RECT_F,
     pub clock: D2D_RECT_F,
 }
 
-/// Lays out `items` app buttons, then a divider, then `status_width` and the clock,
-/// in one rounded panel centered on the screen. Buttons that don't fit are dropped.
+/// Lays the strip out on the grid in one panel centered on the screen. The
+/// visible content starts and ends half a panel height from the panel's ends,
+/// clear of the curves. App buttons that don't fit are dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn strip_layout(
     width: f32,
     strip_height: f32,
     config: &BarConfig,
     icon_size: f32,
+    start_size: f32,
     items: usize,
-    status_width: f32,
+    tail: Tail,
     at_top: bool,
 ) -> StripLayout {
-    let button = icon_size + 16.0;
+    let button = icon_size + 2.0 * PLATE;
     let panel_h = (button + 12.0).max(config.island_height);
-    // The first icon and the clock's text start half a panel height from the ends,
-    // clear of the curves (a button is 8 wider than its icon on each side).
-    let pad = panel_h / 2.0 - (button - icon_size) / 2.0;
-    let status_gap = if status_width > 0.0 { STATUS_GAP } else { 0.0 };
-    let tail = status_width + status_gap + CLOCK_WIDTH;
-    let divider_w = |apps: bool| {
-        if apps { DIVIDER_SPACE * 2.0 + 1.0 } else { 0.0 }
-    };
-    let fixed = pad * 2.0 + tail + divider_w(items > 0);
-    let room = (width - 32.0 - fixed + STRIP_GAP) / (button + STRIP_GAP);
-    let n = items.min(room.floor().max(0.0) as usize);
-    let apps_w = if n > 0 {
-        n as f32 * button + (n - 1) as f32 * STRIP_GAP
-    } else {
+    let inset = (panel_h / 2.0).round();
+    // Everything after the last app icon's right edge, up to the last visible pixel.
+    let status_w = if tail.glyphs == 0 {
         0.0
+    } else {
+        let cells = tail.glyphs as f32 * STATUS_CELL;
+        // Visible width: without the empty side of the first (and last) glyph cell.
+        if tail.percent > 0.0 {
+            cells - GLYPH_SIDE + tail.percent
+        } else {
+            cells - 2.0 * GLYPH_SIDE
+        }
     };
-    let natural = pad * 2.0 + apps_w + divider_w(n > 0) + tail;
+    let after = GRID_GAP
+        + 1.0
+        + GRID_GAP
+        + status_w
+        + if status_w > 0.0 { GRID_GAP } else { 0.0 }
+        + tail.clock;
+    let fixed = inset * 2.0 + start_size + after;
+    let step = icon_size + GRID_GAP;
+    let room = (width - 32.0 - fixed) / step;
+    let n = items.min(room.floor().max(0.0) as usize);
+    let natural = fixed + n as f32 * step;
     // Never narrower than the pill; any extra is split between the two ends.
     let panel_w = natural.max(config.island_width).min(width);
     let left = ((width - panel_w) / 2.0).round();
@@ -617,29 +642,41 @@ pub fn strip_layout(
     };
     // Content row, vertically centered in the panel.
     let row_top = top + (panel_h - button) / 2.0;
-    let row = |l: f32, w: f32| D2D_RECT_F {
-        left: l,
+    let row = |from: f32, to: f32| D2D_RECT_F {
+        left: from,
         top: row_top,
-        right: l + w,
+        right: to,
         bottom: row_top + button,
     };
-    let first = left + pad + ((panel_w - natural) / 2.0).max(0.0);
+    let first = left + inset + ((panel_w - natural) / 2.0).max(0.0).floor();
+    let start = row(first - PLATE, first + start_size + PLATE);
+    // `x`: right edge of the last visible thing placed.
+    let mut x = first + start_size;
     let buttons: Vec<D2D_RECT_F> = (0..n)
-        .map(|i| row(first + i as f32 * (button + STRIP_GAP), button))
+        .map(|_| {
+            let icon = x + GRID_GAP;
+            x = icon + icon_size;
+            row(icon - PLATE, x + PLATE)
+        })
         .collect();
-    let mut x = first + apps_w;
-    let divider = (n > 0).then(|| {
-        let line = D2D_RECT_F {
-            left: x + DIVIDER_SPACE,
-            top: (top + bottom) / 2.0 - DIVIDER_HEIGHT / 2.0,
-            right: x + DIVIDER_SPACE + 1.0,
-            bottom: (top + bottom) / 2.0 + DIVIDER_HEIGHT / 2.0,
-        };
-        x += divider_w(true);
-        line
-    });
-    let status = row(x, status_width);
-    let clock = row(x + status_width + status_gap, CLOCK_WIDTH);
+    let middle = (top + bottom) / 2.0;
+    let divider = D2D_RECT_F {
+        left: x + GRID_GAP,
+        top: middle - DIVIDER_HEIGHT / 2.0,
+        right: x + GRID_GAP + 1.0,
+        bottom: middle + DIVIDER_HEIGHT / 2.0,
+    };
+    x = divider.right;
+    let status = if status_w > 0.0 {
+        let visible = x + GRID_GAP;
+        x = visible + status_w;
+        // The renderer starts the first glyph cell `STATUS_PADDING` inside the rect.
+        row(visible - GLYPH_SIDE - STATUS_PADDING, x + PLATE)
+    } else {
+        row(x, x)
+    };
+    let text = x + GRID_GAP;
+    let clock = row(text - PLATE, text + tail.clock + PLATE);
     let overshoot = (panel_w - config.island_width).max(0.0) * 0.06;
     let window = edge_window(
         &panel,
@@ -652,6 +689,7 @@ pub fn strip_layout(
     StripLayout {
         panel,
         window,
+        start,
         buttons,
         divider,
         status,
@@ -772,6 +810,7 @@ impl EdgeSensor {
             )
             .ok()?;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, bar.0 as isize);
+            crate::theme::no_border(hwnd);
             // Alpha 1/255: invisible, but still hit-tested (alpha 0 is not).
             let _ = SetLayeredWindowAttributes(hwnd, Default::default(), 1, LWA_ALPHA);
             Some(Self { hwnd })
@@ -989,54 +1028,67 @@ mod tests {
         assert!(((l.title.top + l.artist.bottom) / 2.0 - 42.0).abs() <= 1.0);
     }
 
+    const TAIL: Tail = Tail {
+        glyphs: 3,
+        percent: 28.0,
+        clock: 62.0,
+    };
+
     #[test]
-    fn strip_holds_buttons_divider_status_and_clock() {
+    fn strip_sits_on_a_grid_with_equal_ends() {
         let config = BarConfig::default();
         let strip = strip_height(&config, 24.0);
-        let l = strip_layout(1920.0, strip, &config, 24.0, 5, 100.0, false);
+        let l = strip_layout(1920.0, strip, &config, 24.0, 20.0, 5, TAIL, false);
         assert_eq!(l.buttons.len(), 5);
-        let inside = |r: &D2D_RECT_F| {
-            r.left >= l.panel.left
-                && r.right <= l.panel.right
-                && r.top >= l.panel.top
-                && r.bottom <= l.panel.bottom
-        };
-        assert!(l.buttons.iter().all(inside));
-        assert!(inside(&l.status) && inside(&l.clock));
-        let divider = l.divider.unwrap();
-        assert!(divider.left > l.buttons[4].right && divider.right < l.status.left);
-        assert!(l.clock.left >= l.status.right && l.clock.right < l.panel.right);
-        // Centered on the screen, bottom edge on the pill's baseline, window holds it.
+        // Visible edges: the logo and the clock text are equally far from the ends.
+        let logo_left = l.start.left + PLATE;
+        let clock_right = l.clock.right - PLATE;
+        assert_eq!(logo_left - l.panel.left, l.panel.right - clock_right);
+        assert_eq!(logo_left - l.panel.left, 26.0);
+        // 16 between logo and first icon, between icons, around the divider,
+        // before the first status glyph and before the clock.
+        let icon = |r: &D2D_RECT_F| (r.left + PLATE, r.right - PLATE);
+        assert_eq!(icon(&l.buttons[0]).0 - (l.start.right - PLATE), GRID_GAP);
+        for pair in l.buttons.windows(2) {
+            assert_eq!(icon(&pair[1]).0 - icon(&pair[0]).1, GRID_GAP);
+        }
+        assert_eq!(l.divider.left - icon(&l.buttons[4]).1, GRID_GAP);
+        let glyph_left = l.status.left + STATUS_PADDING + GLYPH_SIDE;
+        assert_eq!(glyph_left - l.divider.right, GRID_GAP);
+        let percent_right = l.status.right - PLATE;
+        assert_eq!((l.clock.left + PLATE) - percent_right, GRID_GAP);
+        assert_eq!(
+            percent_right,
+            l.status.left + STATUS_PADDING + 3.0 * STATUS_CELL + 28.0
+        );
+        // Centered on the screen and on the pill; the window holds it.
         assert!(((l.panel.left + l.panel.right) / 2.0 - 960.0).abs() <= 1.0);
         let pill = geometry(1920.0, strip, &config, false).pill;
-        assert_eq!(
-            l.panel.top + l.panel.bottom,
-            pill.top + pill.bottom,
-            "same center"
-        );
+        assert_eq!(l.panel.top + l.panel.bottom, pill.top + pill.bottom);
         assert!(l.window.left < l.panel.left && l.window.right > l.panel.right);
         assert_eq!(l.window.bottom, strip);
         assert!(l.window.top >= 0.0);
-        // Wider than the pill, and never narrower.
-        assert!(l.panel.right - l.panel.left > config.island_width);
-        let few = strip_layout(1920.0, strip, &config, 24.0, 0, 0.0, false);
-        assert!(few.buttons.is_empty() && few.divider.is_none());
-        assert!(few.panel.right - few.panel.left >= config.island_width);
     }
 
     #[test]
-    fn strip_drops_buttons_that_do_not_fit() {
+    fn strip_handles_few_and_too_many_items() {
         let config = BarConfig::default();
         let strip = strip_height(&config, 24.0);
-        let l = strip_layout(600.0, strip, &config, 24.0, 40, 100.0, false);
+        let l = strip_layout(600.0, strip, &config, 24.0, 20.0, 40, TAIL, false);
         assert!(l.buttons.len() < 40 && !l.buttons.is_empty());
         assert!(l.panel.left >= 0.0 && l.panel.right <= 600.0);
-        let top = strip_layout(1920.0, strip, &config, 24.0, 3, 0.0, true);
+        let none = strip_layout(1920.0, strip, &config, 24.0, 20.0, 0, Tail::default(), true);
+        assert!(none.buttons.is_empty() && none.status.right == none.status.left);
+        assert!(none.panel.right - none.panel.left >= config.island_width);
+        // Padded to the pill's width: the extra is split between the ends.
+        let left = none.start.left + PLATE - none.panel.left;
+        let right = none.panel.right - (none.clock.right - PLATE);
+        assert!((left - right).abs() <= 1.0, "{left} {right}");
         assert_eq!(
-            top.panel.top,
+            none.panel.top,
             config.island_gap + (config.island_height - 52.0) / 2.0
         );
-        assert_eq!(top.window.top, 0.0);
+        assert_eq!(none.window.top, 0.0);
     }
 
     #[test]

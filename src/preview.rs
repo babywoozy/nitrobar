@@ -306,6 +306,7 @@ impl Preview {
                 None,
             )
             .ok()?;
+            crate::theme::no_border(hwnd);
             let mut face = [0u16; 32];
             for (dst, src) in face.iter_mut().zip("Segoe UI".encode_utf16()) {
                 *dst = src;

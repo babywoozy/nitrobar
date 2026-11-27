@@ -5,9 +5,9 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Dwm::{
-    DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_NONE, DWMWA_BORDER_COLOR,
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows::Win32::System::LibraryLoader::{
     GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -244,6 +244,21 @@ fn set_accent(hwnd: HWND, state: u32, tint: &D2D1_COLOR_F) -> bool {
 /// `DWMWA_SYSTEMBACKDROP_TYPE` backdrops, accents do not depend on the window
 /// being active, so the bar needs no "fake active" trick and never falls back to
 /// an opaque fill when a shell flyout takes the foreground.
+/// No 1 px window border / outline from DWM around one of our windows (every
+/// window of ours is shapeless or draws its own edge).
+pub fn no_border(hwnd: HWND) {
+    // DWMWA_COLOR_NONE
+    let none: u32 = 0xFFFF_FFFE;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const none).cast::<c_void>(),
+            size_of::<u32>() as u32,
+        );
+    }
+}
+
 pub fn apply_backdrop(
     hwnd: HWND,
     light: bool,
@@ -258,6 +273,7 @@ pub fn apply_backdrop(
             (&raw const dark).cast::<c_void>(),
             size_of::<BOOL>() as u32,
         );
+        no_border(hwnd);
         let corners: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,

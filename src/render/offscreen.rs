@@ -184,6 +184,37 @@ fn measure(
     }
 }
 
+/// Distance in pixels from the panel's left / right end to the first / last
+/// drawn pixel of the content (anything clearly brighter than the black panel).
+fn end_margins(
+    renderer: &Renderer,
+    wic: &IWICImagingFactory,
+    scene: &Scene,
+    size: (u32, u32),
+    panel: &D2D_RECT_F,
+) -> (u32, u32) {
+    let (bitmap, mut target) = offscreen_target(renderer, wic, size);
+    renderer.render(&mut target, scene, DPI);
+    let (w, h) = size;
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    unsafe {
+        target.rt.EndDraw(None, None).unwrap();
+        bitmap
+            .CopyPixels(std::ptr::null(), w * 4, &mut pixels)
+            .unwrap();
+    }
+    let lit = |x: u32| {
+        (panel.top as u32 + 4..panel.bottom as u32 - 4).any(|y| {
+            let p = &pixels[((y * w + x) * 4) as usize..][..4];
+            p[..3].iter().any(|&c| c > 60)
+        })
+    };
+    let columns = panel.left as u32..panel.right as u32;
+    let first = columns.clone().find(|&x| lit(x)).unwrap();
+    let last = columns.clone().rev().find(|&x| lit(x)).unwrap();
+    (first - panel.left as u32, panel.right as u32 - 1 - last)
+}
+
 #[test]
 #[ignore = "writes design screenshots to NB_SHOTS"]
 fn render_island_states() {
@@ -221,6 +252,8 @@ fn render_island_states() {
         },
         divider: None,
         status_reveal: Reveal::SHOWN,
+        start_reveal: Reveal::SHOWN,
+        start_scale: 1.0,
         clock_reveal: Reveal::SHOWN,
         origin: (0.0, 0.0),
         island: Some(island),
@@ -288,7 +321,14 @@ fn render_island_states() {
     // The expanded strip with five apps.
     let config = BarConfig::default();
     let height = island::strip_height(&config, 24.0);
-    let layout = island::strip_layout(560.0, height, &config, 24.0, 5, 122.0, false);
+    let percent = wide("100%");
+    let (percent_w, clock_w) = renderer.strip_text(Some(&percent), &clock);
+    let tail = island::Tail {
+        glyphs: 3,
+        percent: percent_w,
+        clock: clock_w,
+    };
+    let layout = island::strip_layout(560.0, height, &config, 24.0, 20.0, 5, tail, false);
     let states = [
         ButtonState::Pinned,
         ButtonState::Running,
@@ -304,14 +344,13 @@ fn render_island_states() {
         .buttons
         .iter()
         .zip(states)
-        .enumerate()
-        .map(|(i, (rect, state))| ButtonView {
+        .map(|(rect, state)| ButtonView {
             rect: *rect,
             icon: None,
             state,
             pointer: Pointer {
                 hover: false,
-                pressed: i == 1,
+                pressed: false,
             },
             scale: 1.0,
             lift: 0.0,
@@ -339,8 +378,8 @@ fn render_island_states() {
     for (button, icon) in scene.buttons.iter_mut().zip(&apps) {
         button.icon = icon.as_ref();
     }
+    scene.start = (layout.start, Pointer::default());
     scene.status_rect = layout.status;
-    scene.status_pointer.hover = true;
     scene.status = StatusView {
         icons: [0xE701u16, 0xE995, 0xEBAA]
             .into_iter()
@@ -349,14 +388,31 @@ fn render_island_states() {
         percent: Some(wide("100%")),
     };
     scene.clock_rect = layout.clock;
-    scene.divider = layout.divider;
-    shot(&renderer, &wic, &scene, (560, height as u32), "strip");
+    scene.divider = Some(layout.divider);
+    for button in &mut scene.buttons {
+        button.pointer = Pointer::default();
+    }
+    let size = (560, height as u32);
+    shot(&renderer, &wic, &scene, size, "strip");
+    // The two end margins, measured on the pixels of the drawn strip.
+    let (left, right) = end_margins(&renderer, &wic, &scene, size, &layout.panel);
+    println!("margins: left {left} px, right {right} px");
+    assert!((left as i32 - right as i32).abs() <= 1, "{left} vs {right}");
+    // Hover plates, for the eye.
+    scene.start.1.hover = true;
+    scene.buttons[1].pointer.hover = true;
+    scene.buttons[1].scale = 1.2;
+    shot(&renderer, &wic, &scene, size, "strip-hover");
+    scene.start.1.hover = false;
+    scene.buttons[1].pointer.hover = false;
+    scene.buttons[1].scale = 1.0;
 
     // Frames of the opening and the closing movement, with the time it takes to
     // draw each one.
     let pill_rect = island::geometry(560.0, height, &config, false).pill;
     let middle = |r: &D2D_RECT_F| (r.left + r.right) / 2.0;
-    let mut centers: Vec<f32> = layout.buttons.iter().map(middle).collect();
+    let mut centers: Vec<f32> = vec![middle(&layout.start)];
+    centers.extend(layout.buttons.iter().map(middle));
     centers.push(middle(&layout.status));
     centers.push(middle(&layout.clock));
     let start = std::time::Instant::now();
@@ -380,7 +436,8 @@ fn render_island_states() {
             view.content = !anim.is_collapsed();
             view.clip = anim.animating();
             scene.island = Some(view);
-            for (button, reveal) in scene.buttons.iter_mut().zip(&reveals) {
+            scene.start_reveal = reveals[0];
+            for (button, reveal) in scene.buttons.iter_mut().zip(&reveals[1..]) {
                 button.reveal = *reveal;
                 button.pointer.pressed = false;
             }

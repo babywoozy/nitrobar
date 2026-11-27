@@ -362,6 +362,7 @@ impl Morph {
                 None,
             )
             .ok()?;
+            crate::theme::no_border(hwnd);
             Some(Self { hwnd, run: None })
         }
     }

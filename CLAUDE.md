@@ -330,6 +330,17 @@ src/
 - KHI THỬ: kiểm tra người dùng có đang xem video / toàn màn hình không (không chỉ idle: xem video thì
   không có input). Đã một lần phát âm thanh thử đè lên video của người dùng.
 
+### Lưới của dải (`island::strip_layout`, có test)
+
+- Thứ tự: Start, icon app, vạch, trạng thái, giờ. `GRID_GAP` 16 DIP giữa các mép NHÌN THẤY; hai đầu cách
+  panel đúng nửa chiều cao (đo trên màn hình: 26 / 26 px). Bề rộng phần trăm pin và giờ được ĐO bằng
+  DirectWrite (`Renderer::strip_text`, lưu ở `App::strip_text`, đo ngoài lúc paint vì renderer bị lấy
+  ra); đừng quay lại cột cố định (từng để dư ~24 DIP trước giờ).
+- Start trong dải: đơn sắc theo màu chữ (tối trên kính sáng), zoom + plate như icon; bấm trái = phím
+  Win, bấm phải = Win+X (`shell::open_power_menu`), không hiện menu của nitrobar.
+- Mọi cửa sổ của mình đặt `DWMWA_BORDER_COLOR = NONE` (`theme::no_border`). Quét đường kẻ trên màn
+  hình thật (nền phẳng, mọi trạng thái) không thấy dòng nào do nitrobar vẽ.
+
 ### Chuyển động bung / thu (island.rs, thuần hình học, có test)
 
 - Viên nghỉ và dải CÙNG TÂM (`strip_layout` đặt tâm dải = tâm viên) => `morph_panel` giãn đối xứng.
