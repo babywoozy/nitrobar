@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow,
@@ -19,12 +19,13 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GWLP_USERDATA, GetClassNameW,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IDC_ARROW,
-    IsZoomed, LWA_ALPHA, LoadCursorW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WM_APP, WM_MOUSEMOVE, WNDCLASSEXW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GA_ROOT, GWL_STYLE, GWLP_USERDATA,
+    GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowLongW, GetWindowRect, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, IsZoomed, LWA_ALPHA,
+    LoadCursorW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_MOUSEMOVE,
+    WNDCLASSEXW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WindowFromPoint,
 };
 use windows::core::{PCWSTR, w};
 
@@ -594,6 +595,8 @@ pub struct StripLayout {
     pub start: D2D_RECT_F,
     pub buttons: Vec<D2D_RECT_F>,
     pub divider: D2D_RECT_F,
+    /// The "^" button (tray icons), between the divider and the status icons.
+    pub tray: D2D_RECT_F,
     /// Zero width when there is nothing to show.
     pub status: D2D_RECT_F,
     pub clock: D2D_RECT_F,
@@ -628,12 +631,13 @@ pub fn strip_layout(
             cells - 2.0 * GLYPH_SIDE
         }
     };
-    let after = GRID_GAP
-        + 1.0
-        + GRID_GAP
-        + status_w
-        + if status_w > 0.0 { GRID_GAP } else { 0.0 }
-        + tail.clock;
+    // The "^" is one more glyph in front of the status icons (alone without them).
+    let tray_w = if status_w > 0.0 {
+        STATUS_CELL
+    } else {
+        STATUS_CELL - 2.0 * GLYPH_SIDE
+    };
+    let after = GRID_GAP + 1.0 + GRID_GAP + tray_w + status_w + GRID_GAP + tail.clock;
     let fixed = inset * 2.0 + start_size + after;
     let step = icon_size + GRID_GAP;
     let room = (width - 32.0 - fixed) / step;
@@ -678,8 +682,12 @@ pub fn strip_layout(
         bottom: middle + DIVIDER_HEIGHT / 2.0,
     };
     x = divider.right;
+    let visible = x + GRID_GAP;
+    let tray = row(visible - GLYPH_SIDE, visible - GLYPH_SIDE + STATUS_CELL);
+    x = visible + tray_w;
     let status = if status_w > 0.0 {
-        let visible = x + GRID_GAP;
+        // `x`: where the first status glyph becomes visible.
+        let visible = x;
         x = visible + status_w;
         // The renderer starts the first glyph cell `STATUS_PADDING` inside the rect.
         row(visible - GLYPH_SIDE - STATUS_PADDING, x + PLATE)
@@ -703,9 +711,41 @@ pub fn strip_layout(
         start,
         buttons,
         divider,
+        tray,
         status,
         clock,
     }
+}
+
+/// Whether the native taskbar, brought up for its tray icons, is still in use:
+/// the pointer is on it or on its overflow panel, one of them or a Windows flyout
+/// has the focus, or a menu is open.
+pub fn tray_in_use() -> bool {
+    unsafe {
+        let mut at = POINT::default();
+        if GetCursorPos(&raw mut at).is_ok()
+            && is_tray_window(GetAncestor(WindowFromPoint(at), GA_ROOT))
+        {
+            return true;
+        }
+        let foreground = GetForegroundWindow();
+        if is_tray_window(foreground) || is_shell_flyout(foreground) {
+            return true;
+        }
+        FindWindowW(w!("#32768"), PCWSTR::null()).is_ok_and(|menu| IsWindowVisible(menu).as_bool())
+    }
+}
+
+fn is_tray_window(hwnd: HWND) -> bool {
+    let mut class = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    let class = String::from_utf16_lossy(&class[..len]);
+    [
+        "Shell_TrayWnd",
+        "TopLevelWindowForOverflowXamlIsland",
+        "NotifyIconOverflowWindow",
+    ]
+    .contains(&class.as_str())
 }
 
 /// Whether `hwnd` is the bare desktop.
@@ -1121,8 +1161,10 @@ mod tests {
             assert_eq!(icon(&pair[1]).0 - icon(&pair[0]).1, GRID_GAP);
         }
         assert_eq!(l.divider.left - icon(&l.buttons[4]).1, GRID_GAP);
-        let glyph_left = l.status.left + STATUS_PADDING + GLYPH_SIDE;
-        assert_eq!(glyph_left - l.divider.right, GRID_GAP);
+        let chevron_left = l.tray.left + GLYPH_SIDE;
+        assert_eq!(chevron_left - l.divider.right, GRID_GAP);
+        // The status icons follow the "^" like one more glyph.
+        assert_eq!(l.status.left + STATUS_PADDING, l.tray.right);
         let percent_right = l.status.right - PLATE;
         assert_eq!((l.clock.left + PLATE) - percent_right, GRID_GAP);
         assert_eq!(

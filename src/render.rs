@@ -126,6 +126,8 @@ pub struct Scene<'a> {
     pub buttons: Vec<ButtonView<'a>>,
     pub status_rect: D2D_RECT_F,
     pub status_pointer: Pointer,
+    /// Island: the "^" button for the native tray icons.
+    pub tray: Option<(D2D_RECT_F, Pointer)>,
     pub status: StatusView,
     pub clock_rect: D2D_RECT_F,
     pub clock_pointer: Pointer,
@@ -1186,6 +1188,12 @@ impl Renderer {
             );
             self.draw_status(target, scene);
         }
+        if let Some((rect, pointer)) = scene.tray
+            && scene.status_reveal.alpha > 0.0
+        {
+            Self::apply_reveal(target, scene.origin, &rect, scene.status_reveal);
+            self.draw_tray(target, scene, rect, pointer);
+        }
         if scene.clock_reveal.alpha > 0.0 {
             Self::apply_reveal(target, scene.origin, &scene.clock_rect, scene.clock_reveal);
             self.draw_clock(target, scene);
@@ -1492,16 +1500,46 @@ impl Renderer {
         draw(0.0, 0.0);
     }
 
-    fn draw_status(&self, target: &Target, scene: &Scene) {
-        let rect = scene.status_rect;
-        if rect.right <= rect.left {
-            return;
-        }
+    /// The "^" (pointing away from the screen edge) that brings up the tray icons.
+    fn draw_tray(&self, target: &Target, scene: &Scene, rect: D2D_RECT_F, pointer: Pointer) {
         Self::draw_button_background(
             target,
             &scene.palette,
             rect,
             scene.plate_radius(rect),
+            false,
+            pointer,
+        );
+        let mut color = scene.palette.text;
+        color.a *= scene.status_reveal.alpha;
+        let glyph: u16 = if scene.metrics.at_top { 0xE70D } else { 0xE70E };
+        self.draw_text(
+            target,
+            &[glyph],
+            &self.icon_format,
+            rect,
+            &color,
+            scene.text_shadow(),
+        );
+    }
+
+    fn draw_status(&self, target: &Target, scene: &Scene) {
+        let rect = scene.status_rect;
+        if rect.right <= rect.left {
+            return;
+        }
+        // The padding reaches under the "^": its plate does not.
+        let plate = D2D_RECT_F {
+            left: scene
+                .tray
+                .map_or(rect.left, |(t, _)| rect.left.max(t.right)),
+            ..rect
+        };
+        Self::draw_button_background(
+            target,
+            &scene.palette,
+            plate,
+            scene.plate_radius(plate),
             false,
             scene.status_pointer,
         );

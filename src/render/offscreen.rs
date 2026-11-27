@@ -245,6 +245,7 @@ fn render_island_states() {
         buttons: Vec::new(),
         status_rect: D2D_RECT_F::default(),
         status_pointer: Pointer::default(),
+        tray: None,
         status: StatusView::default(),
         clock_rect: D2D_RECT_F::default(),
         clock_pointer: Pointer::default(),
@@ -402,6 +403,7 @@ fn render_island_states() {
         button.icon = icon.as_ref();
     }
     scene.start = (layout.start, Pointer::default());
+    scene.tray = Some((layout.tray, Pointer::default()));
     scene.status_rect = layout.status;
     scene.status = StatusView {
         icons: [0xE701u16, 0xE995, 0xEBAA]

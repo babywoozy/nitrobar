@@ -122,6 +122,13 @@ const TIMER_ZZZ: usize = 6;
 /// Equalizer frames, only while music plays and the pill is on screen.
 const TIMER_BARS: usize = 7;
 const BARS_FRAME_MS: u32 = 33;
+/// While the native taskbar is up for its tray icons: how often to see whether it
+/// is still in use (nothing reports the pointer leaving another process's window),
+/// how long it stays at least, and how long after the last use it goes.
+const TIMER_TRAY: usize = 8;
+const TRAY_CHECK_MS: u32 = 300;
+const TRAY_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+const TRAY_LEAVE: std::time::Duration = std::time::Duration::from_millis(900);
 /// Collapse delay while window previews are open, and how often a blocked
 /// collapse (menu, Start, drag) is checked again.
 const PREVIEW_GRACE_MS: u32 = 500;
@@ -198,6 +205,7 @@ struct App {
     /// The foreground window is a fullscreen app on our monitor (backup for
     /// ABN_FULLSCREENAPP, which island mode may not get without reserved space).
     foreground_fullscreen: bool,
+    tray_peek: Option<TrayPeek>,
     /// Primary monitor and the full bar strip on it, in screen pixels.
     monitor_rect: RECT,
     bar_rect: RECT,
@@ -243,6 +251,12 @@ struct App {
     morph: Option<Morph>,
     /// A window we are restoring ourselves (after the grow-out animation).
     own_restore: Option<(HWND, Instant)>,
+}
+
+/// The native taskbar shown for its tray icons; the island is hidden meanwhile.
+struct TrayPeek {
+    opened: Instant,
+    used: Instant,
 }
 
 /// The resting pill's left side: the active app's small icon (`None`: the
@@ -421,6 +435,7 @@ fn run_window(options: Options) -> Result<()> {
             menu_open: false,
             flyout_open: false,
             foreground_fullscreen: false,
+            tray_peek: None,
             monitor_rect: RECT::default(),
             bar_rect: RECT::default(),
             origin: (0.0, 0.0),
@@ -796,6 +811,7 @@ impl App {
                 self.invalidate();
             }
             WM_TIMER if wparam.0 == TIMER_BARS => self.on_bars_timer(),
+            WM_TIMER if wparam.0 == TIMER_TRAY => self.on_tray_timer(),
             wallpaper::WM_APP_WALLPAPER => {
                 let c = lparam.0 as u32;
                 self.wallpaper_color = Some(D2D1_COLOR_F {
@@ -1120,7 +1136,7 @@ impl App {
     fn bars_wanted(&self) -> bool {
         self.music_showing()
             && self.island.as_ref().is_some_and(|s| s.small_window)
-            && !(self.fullscreen_app || self.foreground_fullscreen)
+            && !self.island_hidden()
     }
 
     fn update_bars_timer(&mut self) {
@@ -1197,6 +1213,9 @@ impl App {
 
     fn apply_native_taskbar(&mut self) {
         let wanted = self.wants_native_hidden();
+        if !wanted || self.island.is_none() {
+            self.close_tray();
+        }
         if wanted && !self.native_hidden {
             taskbar::hide();
         } else if !wanted && self.native_hidden {
@@ -1400,12 +1419,14 @@ impl App {
                 _ => {}
             },
             Some(Hit::Status) => shell::open_quick_settings(),
+            Some(Hit::Tray) => self.open_tray(),
             Some(Hit::Clock) => shell::open_notification_center(),
             None => {}
         }
     }
 
     fn on_explorer_restarted(&mut self) {
+        self.close_tray();
         // Explorer forgets appbars when it restarts.
         appbar::unregister(self.hwnd);
         appbar::register(self.hwnd);
@@ -1609,6 +1630,7 @@ impl App {
             tasks: strip.buttons.clone(),
             status: strip.status,
             clock: strip.clock,
+            tray: strip.tray,
         }
     }
 
@@ -1740,12 +1762,13 @@ impl App {
             buttons,
             status_rect: layout.status,
             status_pointer: self.pointer(Hit::Status),
+            tray: strip.as_ref().map(|s| (s.tray, self.pointer(Hit::Tray))),
             status: self.status_view(),
             clock_rect: layout.clock,
             clock_pointer: self.pointer(Hit::Clock),
             island: self.island_view(&clock),
             clock,
-            divider: strip.map(|s| s.divider),
+            divider: strip.as_ref().map(|s| s.divider),
             status_reveal,
             clock_reveal,
             start_reveal,
@@ -2050,7 +2073,7 @@ impl App {
             self.foreground_fullscreen,
             self.flyout_open
         );
-        if self.fullscreen() && !self.flyout_open {
+        if self.tray_peek.is_some() || (self.fullscreen() && !self.flyout_open) {
             return;
         }
         let Some(state) = &mut self.island else {
@@ -2491,7 +2514,7 @@ impl App {
         };
         let small = state.small_window;
         let pulsing = state.pulse.is_some();
-        let hidden = self.fullscreen_app || self.foreground_fullscreen;
+        let hidden = self.island_hidden();
         let geometry = self.island_geometry();
         let bar = self.bar_rect;
         let to_px = |dip: f32| scale(dip, self.dpi);
@@ -2602,22 +2625,83 @@ impl App {
             let y = self.bar_rect.top + scale((rect.top + rect.bottom) / 2.0, self.dpi);
             debug_log!("BTN {} {x} {y}", self.item_app(item).0);
         }
+        let x = self.bar_rect.left + scale((strip.tray.left + strip.tray.right) / 2.0, self.dpi);
+        let y = self.bar_rect.top + scale((strip.tray.top + strip.tray.bottom) / 2.0, self.dpi);
+        debug_log!("BTN tray {x} {y}");
     }
 
     fn on_fullscreen_changed(&mut self) {
         if self.fullscreen_app || self.foreground_fullscreen {
-            for timer in [TIMER_EXPAND, TIMER_COLLAPSE, TIMER_PULSE] {
-                self.kill_timer(timer);
-            }
-            if let Some(state) = &mut self.island {
-                state.anim = Island::collapsed();
-                state.small_window = true;
-                state.pulse = None;
-            }
-            if let Some(morph) = &mut self.morph {
-                morph.finish();
-            }
+            self.reset_island();
         }
+        self.place_island();
+    }
+
+    /// Back to the resting pill at once, with nothing pending.
+    fn reset_island(&mut self) {
+        for timer in [TIMER_EXPAND, TIMER_COLLAPSE, TIMER_PULSE] {
+            self.kill_timer(timer);
+        }
+        if let Some(state) = &mut self.island {
+            state.anim = Island::collapsed();
+            state.small_window = true;
+            state.pulse = None;
+        }
+        if let Some(morph) = &mut self.morph {
+            morph.finish();
+        }
+    }
+
+    /// Over fullscreen apps, and while the native taskbar is up.
+    fn island_hidden(&self) -> bool {
+        self.fullscreen_app || self.foreground_fullscreen || self.tray_peek.is_some()
+    }
+
+    // ----- the native tray -----
+
+    /// Shows the native taskbar so its tray icons can be used.
+    fn open_tray(&mut self) {
+        if self.island.is_none() || !self.native_hidden {
+            return;
+        }
+        self.close_preview();
+        let now = Instant::now();
+        self.tray_peek = Some(TrayPeek {
+            opened: now,
+            used: now,
+        });
+        self.hover = None;
+        self.pressed = None;
+        self.reset_island();
+        // The island would sit on top of the taskbar: out of the way.
+        self.place_island();
+        taskbar::peek();
+        shell::focus_tray();
+        self.set_timer(TIMER_TRAY, TRAY_CHECK_MS);
+    }
+
+    fn on_tray_timer(&mut self) {
+        let now = Instant::now();
+        let Some(peek) = &mut self.tray_peek else {
+            self.kill_timer(TIMER_TRAY);
+            return;
+        };
+        if island::tray_in_use() {
+            peek.used = now;
+        } else if now.duration_since(peek.opened) >= TRAY_GRACE
+            && now.duration_since(peek.used) >= TRAY_LEAVE
+        {
+            self.close_tray();
+        }
+    }
+
+    /// Hides the native taskbar again and brings the island back.
+    fn close_tray(&mut self) {
+        if self.tray_peek.take().is_none() {
+            return;
+        }
+        self.kill_timer(TIMER_TRAY);
+        taskbar::end_peek();
         self.place_island();
     }
 

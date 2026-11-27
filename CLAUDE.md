@@ -342,6 +342,18 @@ src/
   trước thì 500 ms (đủ đi qua khe tới panel); bị chặn (menu, Start, kéo) thì kiểm tra lại mỗi
   >= 300 ms (không chạy nhịp 60 ms).
 
+### Icon khay hệ thống: nút "^" trong dải
+
+- Island ẩn taskbar gốc nên icon khay biến mất theo. Người dùng chọn cách: nút "^" (`Hit::Tray`, sau
+  vạch ngăn, như một glyph trạng thái) => `App::open_tray`: ẩn island (`island_hidden`),
+  `taskbar::peek` (hiện taskbar chính, vẫn auto-hide nên không cửa sổ nào bị đổi cỡ; hook ẩn lại tạm
+  ngưng) rồi `shell::focus_tray` (Win+B, thanh auto-hide trượt lên).
+- Đóng: `TIMER_TRAY` 300 ms (CHỈ khi đang mở; Windows không báo con trỏ rời cửa sổ process khác).
+  Còn dùng (`island::tray_in_use`: con trỏ trên taskbar / bảng overflow, một trong hai hoặc flyout
+  đang focus, hoặc menu mở) thì giữ; ít nhất 3 s, rời 900 ms thì ẩn lại. Sau Win+B taskbar giữ focus
+  nên nó ở lại tới khi người dùng bấm chỗ khác. Đã thử trên màn hình: bấm -> taskbar hiện, con trỏ đi
+  xa vẫn ở, đổi focus -> ẩn, island trở lại.
+
 ### Mở app
 
 - `pins::launch*` chạy `ShellExecute` trên thread riêng (`AllowSetForegroundWindow` trước đó): trên UI

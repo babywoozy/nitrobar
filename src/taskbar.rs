@@ -19,8 +19,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_SHOW, FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow,
-    GetWindowThreadProcessId, IsWindowVisible, OBJID_WINDOW, SW_HIDE, SW_SHOW, ShowWindow,
-    WINEVENT_OUTOFCONTEXT,
+    GetWindowThreadProcessId, IsWindowVisible, OBJID_WINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    ShowWindow, WINEVENT_OUTOFCONTEXT,
 };
 use windows::core::{PCWSTR, w};
 
@@ -28,6 +28,8 @@ const PRIMARY_CLASS: PCWSTR = w!("Shell_TrayWnd");
 const SECONDARY_CLASS: PCWSTR = w!("Shell_SecondaryTrayWnd");
 
 static HIDDEN: AtomicBool = AtomicBool::new(false);
+/// The hidden taskbar is shown for a moment (its tray icons were asked for).
+static PEEKING: AtomicBool = AtomicBool::new(false);
 static ORIGINAL_STATE: AtomicU32 = AtomicU32::new(ABS_ALWAYSONTOP);
 static SHOW_HOOK: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
@@ -116,8 +118,32 @@ pub fn rehide() {
     }
 }
 
+/// Shows the hidden primary taskbar until `end_peek`. It stays auto-hide, so no
+/// window is resized.
+pub fn peek() {
+    if HIDDEN.load(Ordering::SeqCst) {
+        PEEKING.store(true, Ordering::SeqCst);
+        if let Some(primary) = primary_taskbar() {
+            unsafe {
+                let _ = ShowWindow(primary, SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+}
+
+pub fn end_peek() {
+    if PEEKING.swap(false, Ordering::SeqCst) && HIDDEN.load(Ordering::SeqCst) {
+        set_visible(false);
+    }
+}
+
+fn keep_hidden() -> bool {
+    HIDDEN.load(Ordering::SeqCst) && !PEEKING.load(Ordering::SeqCst)
+}
+
 /// Brings the native taskbar back if we hid it. Idempotent, any thread.
 pub fn restore() {
+    PEEKING.store(false, Ordering::SeqCst);
     if HIDDEN.swap(false, Ordering::SeqCst) {
         remove_show_hook();
         set_autohide_state(ORIGINAL_STATE.load(Ordering::SeqCst));
@@ -199,7 +225,7 @@ unsafe extern "system" fn on_object_show(
     _thread: u32,
     _time: u32,
 ) {
-    if id_object == OBJID_WINDOW.0 && HIDDEN.load(Ordering::SeqCst) && is_taskbar_window(hwnd) {
+    if id_object == OBJID_WINDOW.0 && keep_hidden() && is_taskbar_window(hwnd) {
         // Start / search / Quick Settings are anchored to the taskbar: hiding it
         // while one is open closes it instantly. Wait until it closes
         // (`foreground_changed`).
@@ -215,7 +241,7 @@ unsafe extern "system" fn on_object_show(
 /// Called on every foreground change: once no Windows flyout is open any more,
 /// hide the taskbar again if Explorer showed it meanwhile.
 pub fn foreground_changed(flyout_open: bool) {
-    if HIDDEN.load(Ordering::SeqCst) && !flyout_open {
+    if keep_hidden() && !flyout_open {
         for_each_taskbar(|hwnd| unsafe {
             if IsWindowVisible(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_HIDE);

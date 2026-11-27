@@ -23,6 +23,8 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
     ngắn dưới app đang mở, vạch dài màu nhấn dưới app đang active, chấm mờ dưới app đã thu nhỏ hết
     cửa sổ, nền cam khi app cần chú ý. Chỉ icon đang có chuột phóng to nhẹ (1,2 lần), các icon khác giữ nguyên. Wifi / âm lượng
     / pin / đồng hồ nằm cuối dải, ngăn cách bằng một vạch mờ. Rời chuột ra là thu về viên ngay.
+    Nút `^` trong dải: hiện tạm taskbar gốc để dùng icon khay hệ thống (bộ gõ, định vị, app chạy nền).
+    Bấm ra chỗ khác là nó ẩn lại.
   - Bấm icon trên dải: app đang thu nhỏ thì cửa sổ tỏa ra từ đúng icon đó (khối tròn đen cỡ icon lớn
     dần, sáng dần thành cửa sổ thật) rồi dải thu lại; app đang active thì cửa sổ co ngược vào đúng
     icon và viên nảy lên với icon app; app đang mở nhưng ở sau thì được đưa lên trước và icon nảy

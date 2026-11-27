@@ -79,6 +79,8 @@ pub enum Hit {
     Task(usize),
     Status,
     Clock,
+    /// Island: the "^" button that brings up the native taskbar's tray icons.
+    Tray,
 }
 
 pub struct BarLayout {
@@ -87,6 +89,8 @@ pub struct BarLayout {
     /// Network / volume / battery button, left of the clock (zero width if empty).
     pub status: D2D_RECT_F,
     pub clock: D2D_RECT_F,
+    /// Zero outside the island strip.
+    pub tray: D2D_RECT_F,
 }
 
 impl BarLayout {
@@ -139,6 +143,7 @@ impl BarLayout {
             tasks: rects.collect(),
             status,
             clock,
+            tray: D2D_RECT_F::default(),
         }
     }
 
@@ -148,6 +153,10 @@ impl BarLayout {
         }
         if let Some(i) = self.tasks.iter().position(|r| contains(r, x, y)) {
             return Some(Hit::Task(i));
+        }
+        // Before the status area, whose padding reaches under it.
+        if contains(&self.tray, x, y) {
+            return Some(Hit::Tray);
         }
         if self.status.right > self.status.left && contains(&self.status, x, y) {
             return Some(Hit::Status);
