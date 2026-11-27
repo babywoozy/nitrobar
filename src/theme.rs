@@ -46,6 +46,28 @@ pub struct Palette {
     pub placeholder: D2D1_COLOR_F,
 }
 
+impl Palette {
+    /// Every color at `alpha` times its opacity.
+    pub fn faded(&self, alpha: f32) -> Self {
+        let mut p = *self;
+        for color in [
+            &mut p.text,
+            &mut p.hover,
+            &mut p.pressed,
+            &mut p.active,
+            &mut p.active_hover,
+            &mut p.indicator,
+            &mut p.accent,
+            &mut p.attention,
+            &mut p.attention_bg,
+            &mut p.placeholder,
+        ] {
+            color.a *= alpha;
+        }
+        p
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub light: bool,

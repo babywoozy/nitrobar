@@ -13,6 +13,9 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
   - Đang phát nhạc / video (theo bảng media của Windows): viên nới rộng, ảnh bìa tròn + tên bài và
     nghệ sĩ bên trái, bốn cột sóng nhảy theo độ to của âm thanh bên phải.
   - Thanh không chiếm chỗ (cửa sổ phóng to tràn xuống tận đáy; taskbar gốc được ẩn).
+  - Bung / thu kiểu Dynamic Island: giãn đối xứng quanh tâm bằng lò xo, hơi dẹt khi đang giãn nhanh;
+    nội dung đứng yên ở chỗ của nó, mép viên trượt ra để lộ dần, icon lăn vào so le từ giữa ra; thu
+    lại thì ngoài cùng biến mất trước.
   - Rê chuột vào viên hoặc chạm mép dưới ở đoạn giữa (rộng bằng viên + 40 DIP mỗi bên; phần còn lại
     của mép, ví dụ ô chat của app khác, không làm gì) thì sau ~30 ms viên giãn ngang (~200 ms, lò xo nhẹ) thành dải
     icon các app (app ghim + đang chạy, gom theo app), vẫn là một khối bo tròn nổi, rộng vừa đủ. Vạch
@@ -98,6 +101,7 @@ expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay 
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
 island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là linh vật Nitro)
 island_sleep_seconds = 60    # máy rảnh bao lâu thì linh vật ngủ (giây, 0 = không ngủ)
+island_squash = true         # viên hơi dẹt lại khi giãn / co nhanh rồi phồng về
 window_animation = true      # thu nhỏ cửa sổ "chui" vào island; false = hiệu ứng của Windows
 
 [colors]                     # để trống = theo theme Windows; "#RRGGBB" hoặc "#RRGGBBAA"

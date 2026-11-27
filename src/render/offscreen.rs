@@ -4,7 +4,7 @@
 //! `NB_SHOTS=<folder> cargo test --release render_island_states -- --ignored`
 
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory,
     WICBitmapCacheOnLoad,
 };
 use windows::Win32::System::Com::{
@@ -104,15 +104,11 @@ fn write_bmp(path: &std::path::Path, pixels: &[u8], w: usize, h: usize) {
     std::fs::write(path, out).unwrap();
 }
 
-fn shot(
+fn offscreen_target(
     renderer: &Renderer,
     wic: &IWICImagingFactory,
-    scene: &Scene,
-    size: (u32, u32),
-    name: &str,
-) {
-    let dir = std::path::PathBuf::from(std::env::var("NB_SHOTS").expect("NB_SHOTS"));
-    let (w, h) = size;
+    (w, h): (u32, u32),
+) -> (IWICBitmap, Target) {
     unsafe {
         let bitmap = wic
             .CreateBitmap(w, h, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)
@@ -132,7 +128,7 @@ fn shot(
             .CreateWicBitmapRenderTarget(&bitmap, &raw const props)
             .unwrap();
         let brush = rt.CreateSolidColorBrush(&TRANSPARENT, None).unwrap();
-        let mut target = Target {
+        let target = Target {
             layer: rt.CreateLayer(None).ok(),
             window: None,
             rt,
@@ -143,6 +139,21 @@ fn shot(
             brush,
             bitmaps: HashMap::new(),
         };
+        (bitmap, target)
+    }
+}
+
+fn shot(
+    renderer: &Renderer,
+    wic: &IWICImagingFactory,
+    scene: &Scene,
+    size: (u32, u32),
+    name: &str,
+) {
+    let dir = std::path::PathBuf::from(std::env::var("NB_SHOTS").expect("NB_SHOTS"));
+    let (w, h) = size;
+    unsafe {
+        let (bitmap, mut target) = offscreen_target(renderer, wic, size);
         renderer.render(&mut target, scene, DPI);
         target.rt.EndDraw(None, None).unwrap();
         let mut pixels = vec![0u8; (w * h * 4) as usize];
@@ -155,6 +166,21 @@ fn shot(
             w as usize,
             h as usize,
         );
+    }
+}
+
+/// Draws `scene` `rounds` times into one target (what an animation frame costs).
+fn measure(
+    renderer: &Renderer,
+    wic: &IWICImagingFactory,
+    scene: &Scene,
+    size: (u32, u32),
+    rounds: u32,
+) {
+    let mut target = offscreen_target(renderer, wic, size).1;
+    for _ in 0..rounds {
+        renderer.render(&mut target, scene, DPI);
+        unsafe { target.rt.EndDraw(None, None) }.unwrap();
     }
 }
 
@@ -194,6 +220,8 @@ fn render_island_states() {
             date: clock.date.clone(),
         },
         divider: None,
+        status_reveal: Reveal::SHOWN,
+        clock_reveal: Reveal::SHOWN,
         origin: (0.0, 0.0),
         island: Some(island),
     };
@@ -204,7 +232,8 @@ fn render_island_states() {
             radius: (panel.bottom - panel.top) / 2.0,
             fill: color(0.027, 0.027, 0.031, 1.0),
             border: D2D1_COLOR_F::default(),
-            content_opacity: 0.0,
+            content: false,
+            clip: false,
             squircle: true,
             shadow: 1.0,
             badge: None,
@@ -269,7 +298,7 @@ fn render_island_states() {
     ];
     let mut view = collapsed(layout.panel, false, 1.0, false);
     view.rest = None;
-    view.content_opacity = 1.0;
+    view.content = true;
     let mut scene = base(view);
     scene.buttons = layout
         .buttons
@@ -286,6 +315,7 @@ fn render_island_states() {
             },
             scale: 1.0,
             lift: 0.0,
+            reveal: Reveal::SHOWN,
         })
         .collect();
     // Real icons, loaded the way the bar loads them.
@@ -321,4 +351,59 @@ fn render_island_states() {
     scene.clock_rect = layout.clock;
     scene.divider = layout.divider;
     shot(&renderer, &wic, &scene, (560, height as u32), "strip");
+
+    // Frames of the opening and the closing movement, with the time it takes to
+    // draw each one.
+    let pill_rect = island::geometry(560.0, height, &config, false).pill;
+    let middle = |r: &D2D_RECT_F| (r.left + r.right) / 2.0;
+    let mut centers: Vec<f32> = layout.buttons.iter().map(middle).collect();
+    centers.push(middle(&layout.status));
+    centers.push(middle(&layout.clock));
+    let start = std::time::Instant::now();
+    let mut anim = island::Island::collapsed();
+    let mut times = Vec::new();
+    for (opening, name, begin, length) in [(true, "open", 0u64, 520u64), (false, "close", 600, 380)]
+    {
+        let from = start + std::time::Duration::from_millis(begin);
+        anim.set_target(opening, from);
+        for ms in (0..=length).step_by(20) {
+            anim.tick(from + std::time::Duration::from_millis(ms));
+            let t = anim.eased();
+            let panel = island::morph_panel(&pill_rect, &layout.panel, t, anim.squash());
+            let reveals = island::reveals(&centers, middle(&layout.panel), 42.0, &anim);
+            let mut view = collapsed(pill_rect, false, 1.0, false);
+            view.panel = panel;
+            view.radius = (panel.bottom - panel.top) / 2.0;
+            if let Some(rest) = &mut view.rest {
+                rest.opacity = island::rest_opacity(&anim);
+            }
+            view.content = !anim.is_collapsed();
+            view.clip = anim.animating();
+            scene.island = Some(view);
+            for (button, reveal) in scene.buttons.iter_mut().zip(&reveals) {
+                button.reveal = *reveal;
+                button.pointer.pressed = false;
+            }
+            scene.status_pointer.hover = false;
+            scene.status_reveal = reveals[reveals.len() - 2];
+            scene.clock_reveal = reveals[reveals.len() - 1];
+            let drawn = std::time::Instant::now();
+            shot(
+                &renderer,
+                &wic,
+                &scene,
+                (560, height as u32),
+                &format!("{name}-{ms:03}"),
+            );
+            times.push(drawn.elapsed());
+        }
+    }
+    // Includes creating the target and writing the file: an upper bound.
+    let timed = std::time::Instant::now();
+    let rounds = 60;
+    measure(&renderer, &wic, &scene, (560, height as u32), rounds);
+    println!(
+        "draw: {:.2} ms per frame",
+        timed.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds)
+    );
 }

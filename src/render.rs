@@ -7,6 +7,7 @@
 //! unknown wallpaper, a soft shadow.
 
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -36,7 +37,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-use windows::core::{BOOL, PCWSTR, Result, w};
+use windows::core::{BOOL, Interface, PCWSTR, Result, w};
 use windows_numerics::{Matrix3x2, Vector2};
 
 use windows::Win32::Graphics::Imaging::IWICBitmap;
@@ -44,7 +45,7 @@ use windows::Win32::Graphics::Imaging::IWICBitmap;
 use crate::clock::ClockText;
 use crate::config::Background;
 use crate::icons::Icon;
-use crate::island::{BAR_GAP, BAR_WIDTH};
+use crate::island::{BAR_GAP, BAR_WIDTH, Reveal};
 use crate::layout::{self, Metrics};
 use crate::media::BARS;
 use crate::shape;
@@ -108,6 +109,8 @@ pub struct ButtonView<'a> {
     /// (island: the dock-like zoom under the pointer).
     pub scale: f32,
     pub lift: f32,
+    /// Island: how it rolls in / out while the island opens or closes.
+    pub reveal: Reveal,
 }
 
 pub struct Scene<'a> {
@@ -125,6 +128,8 @@ pub struct Scene<'a> {
     pub clock: ClockText,
     /// Island: line between the app buttons and the status area.
     pub divider: Option<D2D_RECT_F>,
+    pub status_reveal: Reveal,
+    pub clock_reveal: Reveal,
     /// DIP offset of the window inside bar space (island: the collapsed window is
     /// only the pill area).
     pub origin: (f32, f32),
@@ -138,8 +143,10 @@ pub struct IslandView {
     pub radius: f32,
     pub fill: D2D1_COLOR_F,
     pub border: D2D1_COLOR_F,
-    /// Opacity of the bar content (icons fade in while expanding).
-    pub content_opacity: f32,
+    /// Whether the strip content is drawn (the island is open or moving), and
+    /// whether the panel's outline clips it (while moving).
+    pub content: bool,
+    pub clip: bool,
     /// Continuous (superellipse) corners instead of circular ones.
     pub squircle: bool,
     /// Soft shadow strength under the panel, 0..1.
@@ -602,28 +609,39 @@ impl Renderer {
         }
 
         let mut used = Vec::new();
-        let opacity = match &scene.island {
+        let content = match &scene.island {
             Some(island) => self.draw_island(target, island, dpi, scene.origin, &mut used),
-            None => 1.0,
+            None => true,
         };
-        if opacity > 0.0 {
-            // While the island morphs, the bar content fades in, clipped to the panel.
-            let layer = scene
+        if content {
+            // While the island moves, its outline is a mask: the content stays put
+            // and the edge uncovers or swallows it.
+            let mask = scene
                 .island
                 .as_ref()
-                .filter(|_| opacity < 1.0)
-                .map(|island| D2D1_LAYER_PARAMETERS {
-                    contentBounds: island.panel,
+                .filter(|island| island.clip)
+                .and_then(|island| {
+                    let points = shape::pill(&island.panel);
+                    polygon(&self.d2d, &points).ok().map(|g| (island.panel, g))
+                });
+            if let Some((bounds, geometry)) = &mask {
+                let mut params = D2D1_LAYER_PARAMETERS {
+                    contentBounds: *bounds,
                     maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                     maskTransform: Matrix3x2::identity(),
-                    opacity,
+                    opacity: 1.0,
                     ..Default::default()
-                });
-            if let Some(params) = &layer {
-                unsafe { target.rt.PushLayer(params, target.layer.as_ref()) };
+                };
+                params.geometricMask = ManuallyDrop::new(geometry.cast().ok());
+                unsafe {
+                    target
+                        .rt
+                        .PushLayer(&raw const params, target.layer.as_ref())
+                };
+                drop(ManuallyDrop::into_inner(params.geometricMask));
             }
             self.draw_content(target, scene, dpi, &mut used);
-            if layer.is_some() {
+            if mask.is_some() {
                 unsafe { target.rt.PopLayer() };
             }
         }
@@ -639,7 +657,7 @@ impl Renderer {
         dpi: f32,
         origin: (f32, f32),
         used: &mut Vec<u64>,
-    ) -> f32 {
+    ) -> bool {
         let rounded = D2D1_ROUNDED_RECT {
             rect: island.panel,
             radiusX: island.radius,
@@ -763,7 +781,7 @@ impl Renderer {
                 }
             }
         }
-        island.content_opacity
+        island.content
     }
 
     /// Like `draw_time`, with the digits (not the line box) centered vertically.
@@ -1056,15 +1074,53 @@ impl Renderer {
             );
         }
         for button in &scene.buttons {
-            Self::draw_button(target, scene, dpi, button, used);
+            if button.reveal.alpha > 0.0 {
+                Self::apply_reveal(target, scene.origin, &button.rect, button.reveal);
+                Self::draw_button(target, scene, dpi, button, used);
+            }
         }
         if let Some(line) = &scene.divider {
+            Self::apply_reveal(target, scene.origin, line, scene.status_reveal);
             let mut color = scene.palette.text;
-            color.a = 0.18;
+            color.a = 0.18 * scene.status_reveal.alpha;
             Self::fill_rounded(target, *line, 0.5, &color);
         }
-        self.draw_status(target, scene);
-        self.draw_clock(target, scene);
+        if scene.status_reveal.alpha > 0.0 {
+            Self::apply_reveal(
+                target,
+                scene.origin,
+                &scene.status_rect,
+                scene.status_reveal,
+            );
+            self.draw_status(target, scene);
+        }
+        if scene.clock_reveal.alpha > 0.0 {
+            Self::apply_reveal(target, scene.origin, &scene.clock_rect, scene.clock_reveal);
+            self.draw_clock(target, scene);
+        }
+        Self::apply_reveal(target, scene.origin, &D2D_RECT_F::default(), Reveal::SHOWN);
+    }
+
+    /// Transform for one piece of content: rolled around its center, on top of the
+    /// bar-space origin.
+    fn apply_reveal(target: &Target, origin: (f32, f32), rect: &D2D_RECT_F, reveal: Reveal) {
+        let (x, y) = (
+            (rect.left + rect.right) / 2.0,
+            (rect.top + rect.bottom) / 2.0,
+        );
+        let (sin, cos) = reveal.angle.to_radians().sin_cos();
+        let k = reveal.scale;
+        let transform = Matrix3x2::translation(-x, -y)
+            * Matrix3x2 {
+                M11: k * cos,
+                M12: k * sin,
+                M21: -k * sin,
+                M22: k * cos,
+                M31: 0.0,
+                M32: 0.0,
+            }
+            * Matrix3x2::translation(x + reveal.dx - origin.0, y - origin.1);
+        unsafe { target.rt.SetTransform(&raw const transform) };
     }
 
     fn fill_rounded(target: &Target, rect: D2D_RECT_F, radius: f32, color: &D2D1_COLOR_F) {
@@ -1185,7 +1241,8 @@ impl Renderer {
         button: &ButtonView,
         used: &mut Vec<u64>,
     ) {
-        let palette = &scene.palette;
+        let faded = scene.palette.faded(button.reveal.alpha);
+        let palette = &faded;
         let metrics = &scene.metrics;
         let shadow = scene.text_shadow();
         let flat = scene.island.is_some();
@@ -1250,7 +1307,7 @@ impl Renderer {
                 target.rt.DrawBitmap(
                     &bitmap,
                     Some(&raw const icon_rect),
-                    1.0,
+                    button.reveal.alpha,
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                     None,
                 );
@@ -1341,7 +1398,8 @@ impl Renderer {
             scene.status_pointer,
         );
         let shadow = scene.text_shadow();
-        let text = scene.palette.text;
+        let mut text = scene.palette.text;
+        text.a *= scene.status_reveal.alpha;
         let mut track_color = text;
         track_color.a *= 0.35;
         let mut left = rect.left + layout::STATUS_PADDING;
@@ -1400,7 +1458,8 @@ impl Renderer {
             right,
             bottom,
         };
-        let main = scene.palette.text;
+        let mut main = scene.palette.text;
+        main.a *= scene.clock_reveal.alpha;
         let mut grey = main;
         grey.a *= 0.6;
         if scene.clock.date.is_empty() {

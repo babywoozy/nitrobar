@@ -330,6 +330,21 @@ src/
 - KHI THỬ: kiểm tra người dùng có đang xem video / toàn màn hình không (không chỉ idle: xem video thì
   không có input). Đã một lần phát âm thanh thử đè lên video của người dùng.
 
+### Chuyển động bung / thu (island.rs, thuần hình học, có test)
+
+- Viên nghỉ và dải CÙNG TÂM (`strip_layout` đặt tâm dải = tâm viên) => `morph_panel` giãn đối xứng.
+  `Island::eased` là lò xo cả hai chiều (mở 520 ms, (24, 0.70); đóng 380 ms, (24, 0.86));
+  `Island::squash` dẹt tối đa 4 DIP theo tốc độ (`island_squash`).
+- Nội dung KHÔNG scale theo viên: đứng ở vị trí cuối, outline viên làm `geometricMask` của layer
+  (chỉ khi đang chuyển động). `reveals`: mở = so le 25 ms mỗi bậc cách tâm, lăn từ phía tâm 8 DIP,
+  xoay 15°→0, scale 0.6→1 + nảy; đóng = ngoài cùng trước. `rest_opacity`: nội dung nghỉ rời ngay khi mở,
+  về khi dải gần hết (không chồng nhau, có test). Chữ (trạng thái, giờ) không xoay.
+- Chụp chuỗi khung: bộ chụp offscreen ghi `open-*.bmp` / `close-*.bmp` mỗi 20 ms và in ms vẽ một khung
+  (0.8-1.5 ms, ngân sách 16.6 ms). Chỉnh lò xo thì xem chuỗi này trước.
+- CHƯA chạy trên compositor (Composition animation + surface vẽ sẵn). Đã đo: tạo D3D11 WARP + D2D
+  device +1.3 MB private (chưa tính surface / lần vẽ đầu); device phần cứng +46 MB (vượt ngân sách).
+  Nếu làm thì phải dùng WARP.
+
 ### Hiệu ứng thu nhỏ / khôi phục cửa sổ
 
 - `HSHELL_GETMINRECT` (shell hook, wParam 5, lParam -> `SHELLHOOKINFO {hwnd, rc}`): Windows hỏi

@@ -100,6 +100,8 @@ pub struct BarConfig {
     pub expand_delay_ms: u32,
     pub collapse_delay_ms: u32,
     pub island_show_clock: bool,
+    /// The island flattens a little while it grows / shrinks fast.
+    pub island_squash: bool,
     /// Seconds without input before the island's mascot falls asleep (0 = never).
     pub island_sleep_seconds: u32,
     /// Minimizing a window pours it into the island; restoring grows it back out.
@@ -126,6 +128,7 @@ impl Default for BarConfig {
             expand_delay_ms: 30,
             collapse_delay_ms: 600,
             island_show_clock: true,
+            island_squash: true,
             island_sleep_seconds: 60,
             window_animation: true,
         }
@@ -247,6 +250,7 @@ expand_delay_ms = 30         # rê chuột vào bao lâu thì bung ra (0 = ngay 
 collapse_delay_ms = 600      # rời chuột bao lâu thì thu lại
 island_show_clock = true     # hiện giờ ở bên phải viên (bên trái là linh vật Nitro)
 island_sleep_seconds = 60    # máy rảnh bao lâu thì linh vật ngủ (giây, 0 = không ngủ)
+island_squash = true         # viên hơi dẹt lại khi giãn / co nhanh rồi phồng về
 
 # Thu nhỏ cửa sổ: cửa sổ co lại, tối dần rồi "chui" vào island (viên nảy lên, hiện icon app);
 # bấm nút trên thanh để khôi phục thì cửa sổ bung ra từ đó. false = hiệu ứng của Windows.

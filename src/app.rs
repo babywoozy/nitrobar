@@ -1593,6 +1593,34 @@ impl App {
             self.palette()
         };
         let foreground = self.tasks.foreground;
+        // Island: each button, the status area and the clock roll in / out on their own.
+        let (reveals, status_reveal, clock_reveal) = match (&self.island, &strip) {
+            (Some(state), Some(strip)) => {
+                let middle = |r: &D2D_RECT_F| (r.left + r.right) / 2.0;
+                let mut centers: Vec<f32> = layout.tasks.iter().map(middle).collect();
+                centers.push(middle(&strip.status));
+                centers.push(middle(&strip.clock));
+                let mut all = island::reveals(
+                    &centers,
+                    middle(&strip.panel),
+                    self.metrics.icon_size + 18.0,
+                    &state.anim,
+                );
+                // Text only fades and slides: turning it would look broken.
+                let calm = |r: Option<island::Reveal>| {
+                    let r = r.unwrap_or_default();
+                    island::Reveal {
+                        angle: 0.0,
+                        scale: 0.85 + 0.15 * r.scale,
+                        ..r
+                    }
+                };
+                let clock = calm(all.pop());
+                let status = calm(all.pop());
+                (all, status, clock)
+            }
+            _ => (Vec::new(), Default::default(), Default::default()),
+        };
         let buttons = layout
             .tasks
             .iter()
@@ -1625,6 +1653,7 @@ impl App {
                     pointer: self.pointer(Hit::Task(i)),
                     scale,
                     lift: (scale - 1.0) * 10.0 + hop,
+                    reveal: reveals.get(i).copied().unwrap_or_default(),
                 }
             })
             .collect();
@@ -1646,6 +1675,8 @@ impl App {
             island: self.island_view(&clock),
             clock,
             divider: strip.and_then(|s| s.divider),
+            status_reveal,
+            clock_reveal,
             origin: self.origin,
         }
     }
@@ -2556,7 +2587,12 @@ impl App {
         let pulse = state.pulse.as_ref().map_or(0.0, |p| p.value(now));
         let deep = pulse.clamp(0.0, 1.0);
         let pill_rect = island::pulsed_pill(&g, pulse);
-        let panel = island::lerp_rect(&pill_rect, &strip, t);
+        let squash = if self.config.bar.island_squash {
+            state.anim.squash()
+        } else {
+            0.0
+        };
+        let panel = island::morph_panel(&pill_rect, &strip, t, squash);
         // No hairline on the black pill (an anti-aliased 1 DIP line along a curve
         // looks uneven); the glass keeps a faint one.
         let mut border = if glass {
@@ -2573,7 +2609,7 @@ impl App {
         let pill_h = g.pill.bottom - g.pill.top;
         let pill_w = g.pill.right - g.pill.left;
         let places = island::rest_layout(&g.pill);
-        let rest_opacity = (1.0 - t_clamped / 0.45).max(0.0) * (1.0 - deep);
+        let rest_opacity = island::rest_opacity(&state.anim) * (1.0 - deep);
         let music_mix = self.music.value(now).clamp(0.0, 1.0);
         let text = self.rest_text();
         let secondary = D2D1_COLOR_F {
@@ -2612,8 +2648,8 @@ impl App {
             squircle: !glass,
             // The glass is see-through: a shadow under it would darken the blur.
             shadow: if glass { 0.0 } else { 1.0 },
-            // Icons appear over the last two thirds of the expansion.
-            content_opacity: ((t_clamped - 0.35) / 0.65).clamp(0.0, 1.0),
+            content: !state.anim.is_collapsed(),
+            clip: state.anim.animating(),
             rest: Some(RestView {
                 opacity: rest_opacity,
                 music_mix,

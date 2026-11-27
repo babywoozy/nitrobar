@@ -40,10 +40,16 @@ pub const WM_APP_EDGE: u32 = WM_APP + 7;
 /// Sent after `TrackMouseEvent(TME_LEAVE)` when the pointer leaves the window.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-pub const EXPAND_DURATION: Duration = Duration::from_millis(220);
-pub const COLLAPSE_DURATION: Duration = Duration::from_millis(200);
+pub const EXPAND_DURATION: Duration = Duration::from_millis(520);
+pub const COLLAPSE_DURATION: Duration = Duration::from_millis(380);
 /// Spring (rad/s, damping ratio) of the expansion: a small overshoot.
-const EXPAND_SPRING: (f32, f32) = (40.0, 0.72);
+const EXPAND_SPRING: (f32, f32) = (24.0, 0.70);
+/// Closing barely overshoots.
+const COLLAPSE_SPRING: (f32, f32) = (24.0, 0.86);
+/// Squash and stretch: how much flatter (DIPs) the island gets at full speed, and
+/// the speed (progress per second) that counts as full.
+const SQUASH: f32 = 4.0;
+const SQUASH_FULL_SPEED: f32 = 9.0;
 /// The part of the screen edge that expands the island: the pill's width plus this
 /// much on each side, DIPs. The rest of the edge (a chat box of another app...) does nothing.
 pub const EDGE_ZONE_MARGIN: f32 = 40.0;
@@ -124,21 +130,42 @@ impl Island {
         self.position != self.target
     }
 
-    /// Panel progress: 0 = pill, 1 = full. Expanding follows a spring and may
-    /// overshoot 1 a little; collapsing is a plain smooth ease.
+    /// Panel progress: 0 = pill, 1 = full. A spring both ways: it may pass 1 when
+    /// opening and dip just under 0 when closing.
     pub fn eased(&self) -> f32 {
-        if self.position >= 1.0 {
-            return 1.0;
+        if !self.animating() {
+            return self.target;
         }
-        if self.target == 1.0 {
-            spring(
-                self.position * EXPAND_DURATION.as_secs_f32(),
-                EXPAND_SPRING.0,
-                EXPAND_SPRING.1,
-            )
+        self.curve(self.phase())
+    }
+
+    /// Seconds into the movement in the current direction (a movement reversed
+    /// half-way starts part-way in).
+    pub fn phase(&self) -> f32 {
+        if self.expanded() {
+            self.position * EXPAND_DURATION.as_secs_f32()
         } else {
-            crate::morph::ease_in_out_cubic(self.position)
+            (1.0 - self.position) * COLLAPSE_DURATION.as_secs_f32()
         }
+    }
+
+    fn curve(&self, secs: f32) -> f32 {
+        if self.expanded() {
+            spring(secs, EXPAND_SPRING.0, EXPAND_SPRING.1)
+        } else {
+            1.0 - spring(secs, COLLAPSE_SPRING.0, COLLAPSE_SPRING.1)
+        }
+    }
+
+    /// How much the island is flattened right now (DIPs): grows with its speed and
+    /// vanishes as it comes to rest, like a drop of liquid.
+    pub fn squash(&self) -> f32 {
+        if !self.animating() {
+            return 0.0;
+        }
+        let t = self.phase();
+        let speed = (self.curve(t) - self.curve((t - 0.016).max(0.0))).abs() / 0.016;
+        SQUASH * (speed / SQUASH_FULL_SPEED).min(1.0)
     }
 
     /// Starts moving toward expanded (`true`) or collapsed. Returns false if
@@ -402,6 +429,130 @@ pub fn rest_layout(pill: &D2D_RECT_F) -> RestLayout {
     }
 }
 
+/// The morphing panel between the resting pill and the strip: both share a center,
+/// so it grows and shrinks symmetrically; `squash` flattens it around that center.
+pub fn morph_panel(
+    pill: &D2D_RECT_F,
+    strip: &D2D_RECT_F,
+    progress: f32,
+    squash: f32,
+) -> D2D_RECT_F {
+    let mut panel = lerp_rect(pill, strip, progress);
+    panel.top += squash / 2.0;
+    panel.bottom -= squash / 2.0;
+    panel
+}
+
+/// How one piece of the strip's content looks during the movement. The content
+/// never scales with the panel: it sits at its final place, the panel's edge
+/// uncovers it, and each piece rolls in on its own.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Reveal {
+    pub alpha: f32,
+    pub scale: f32,
+    /// Horizontal offset from the final place, DIPs.
+    pub dx: f32,
+    /// Degrees.
+    pub angle: f32,
+}
+
+impl Reveal {
+    pub const SHOWN: Self = Self {
+        alpha: 1.0,
+        scale: 1.0,
+        dx: 0.0,
+        angle: 0.0,
+    };
+}
+
+impl Default for Reveal {
+    fn default() -> Self {
+        Self::SHOWN
+    }
+}
+
+/// Delay of the first piece, and per step of distance from the center (seconds).
+const REVEAL_START: f32 = 0.015;
+const REVEAL_STAGGER: f32 = 0.025;
+const HIDE_STAGGER: f32 = 0.012;
+const HIDE_TIME: f32 = 0.09;
+/// The resting content leaves right away when opening, and when closing comes back
+/// only once the strip is nearly gone (so the two never overlap).
+const REST_LEAVE: f32 = 0.075;
+const REST_RETURN: (f32, f32) = (0.14, 0.10);
+/// Roll-in: travel from the center side (DIPs), turn (degrees), starting size.
+const ROLL: f32 = 8.0;
+const TURN: f32 = 15.0;
+const SMALL: f32 = 0.6;
+
+/// One piece `distance` steps from the center (of `farthest`), on the left
+/// (`side` -1), the right (1) or in the middle (0), `secs` into the movement.
+/// Opening staggers from the center outward and ends in a small bounce; closing
+/// takes the outermost pieces first, back toward the center.
+pub fn reveal(distance: f32, farthest: f32, side: f32, opening: bool, secs: f32) -> Reveal {
+    let (shown, alpha) = if opening {
+        let u = secs - REVEAL_START - REVEAL_STAGGER * distance;
+        if u <= 0.0 {
+            (0.0, 0.0)
+        } else {
+            (spring(u, 28.0, 0.55), (u / 0.09).min(1.0))
+        }
+    } else {
+        let u = secs - HIDE_STAGGER * (farthest - distance);
+        let gone = (u / HIDE_TIME).clamp(0.0, 1.0);
+        let gone = gone * gone;
+        (1.0 - gone, 1.0 - gone)
+    };
+    let away = 1.0 - shown;
+    Reveal {
+        alpha,
+        scale: SMALL + (1.0 - SMALL) * shown,
+        dx: -side * ROLL * away,
+        angle: -side * TURN * away,
+    }
+}
+
+/// Opacity of the resting content (mascot, clock, music) during the movement.
+pub fn rest_opacity(anim: &Island) -> f32 {
+    if !anim.animating() {
+        return if anim.expanded() { 0.0 } else { 1.0 };
+    }
+    let secs = anim.phase();
+    if anim.expanded() {
+        (1.0 - secs / REST_LEAVE).clamp(0.0, 1.0)
+    } else {
+        ((secs - REST_RETURN.0) / REST_RETURN.1).clamp(0.0, 1.0)
+    }
+}
+
+/// `reveal` for pieces centered at `centers` in a strip centered at `middle`.
+pub fn reveals(centers: &[f32], middle: f32, step: f32, anim: &Island) -> Vec<Reveal> {
+    if !anim.animating() {
+        let shown = if anim.expanded() {
+            Reveal::SHOWN
+        } else {
+            Reveal {
+                alpha: 0.0,
+                ..Reveal::SHOWN
+            }
+        };
+        return vec![shown; centers.len()];
+    }
+    let distance = |x: f32| (x - middle).abs() / step.max(1.0);
+    let farthest = centers.iter().map(|&x| distance(x)).fold(0.0, f32::max);
+    centers
+        .iter()
+        .map(|&x| {
+            let side = if (x - middle).abs() < step / 2.0 {
+                0.0
+            } else {
+                (x - middle).signum()
+            };
+            reveal(distance(x), farthest, side, anim.expanded(), anim.phase())
+        })
+        .collect()
+}
+
 /// Space between buttons and around the divider.
 const STRIP_GAP: f32 = 2.0;
 const DIVIDER_SPACE: f32 = 8.0;
@@ -455,7 +606,9 @@ pub fn strip_layout(
     // Never narrower than the pill; any extra is split between the two ends.
     let panel_w = natural.max(config.island_width).min(width);
     let left = ((width - panel_w) / 2.0).round();
-    let (top, bottom) = band_y(at_top, strip_height, config.island_gap, panel_h);
+    // Same center as the resting pill, so the island grows symmetrically.
+    let gap = (config.island_gap + (config.island_height - panel_h) / 2.0).max(0.0);
+    let (top, bottom) = band_y(at_top, strip_height, gap, panel_h);
     let panel = D2D_RECT_F {
         left,
         top,
@@ -707,7 +860,7 @@ mod tests {
         let mut island = Island::collapsed();
         island.set_target(true, t0);
         let mut peak = 0.0f32;
-        for ms in (0..220).step_by(4) {
+        for ms in (0..520).step_by(4) {
             island.tick(t0 + Duration::from_millis(ms));
             peak = peak.max(island.eased());
         }
@@ -732,6 +885,84 @@ mod tests {
         assert_eq!(top.pill.top, config.island_gap);
         assert_eq!(top.hit.top, 0.0);
         assert!(g.activity_hit.top >= 0.0);
+    }
+
+    #[test]
+    fn content_reveals_from_the_center_and_leaves_from_the_edges() {
+        let centers = [-84.0, -42.0, 0.0, 42.0, 84.0];
+        let mut anim = Island::collapsed();
+        let t0 = Instant::now();
+        anim.set_target(true, t0);
+        anim.tick(t0 + Duration::from_millis(100));
+        let r = reveals(&centers, 0.0, 42.0, &anim);
+        assert!(r[2].alpha > r[1].alpha && r[1].alpha > r[0].alpha, "{r:?}");
+        assert_eq!(r[1].alpha, r[3].alpha, "symmetric");
+        // Pieces start toward the center and turned, mirrored on the two sides.
+        assert!(r[0].dx > 0.0 && r[4].dx < 0.0 && r[2].dx == 0.0);
+        assert!(r[4].angle < 0.0 && r[0].angle > 0.0);
+        anim.tick(t0 + EXPAND_DURATION);
+        assert!(
+            reveals(&centers, 0.0, 42.0, &anim)
+                .iter()
+                .all(|&r| r == Reveal::SHOWN)
+        );
+        // Closing: the outermost go first.
+        let t1 = t0 + EXPAND_DURATION;
+        anim.set_target(false, t1);
+        anim.tick(t1 + Duration::from_millis(70));
+        let r = reveals(&centers, 0.0, 42.0, &anim);
+        assert!(r[0].alpha < r[1].alpha && r[1].alpha < r[2].alpha, "{r:?}");
+    }
+
+    #[test]
+    fn resting_content_and_strip_never_overlap_much() {
+        let centers = [-168.0, -126.0, -84.0, -42.0, 0.0, 42.0, 84.0, 168.0];
+        let t0 = Instant::now();
+        let mut anim = Island::collapsed();
+        anim.set_target(true, t0);
+        anim.tick(t0 + EXPAND_DURATION);
+        let t1 = t0 + EXPAND_DURATION;
+        anim.set_target(false, t1);
+        for ms in (0..380).step_by(10) {
+            anim.tick(t1 + Duration::from_millis(ms));
+            let strip = reveals(&centers, 0.0, 42.0, &anim)
+                .iter()
+                .fold(0.0f32, |m, r| m.max(r.alpha));
+            assert!(
+                strip.min(rest_opacity(&anim)) < 0.35,
+                "{ms} ms: {strip} and {}",
+                rest_opacity(&anim)
+            );
+        }
+        assert_eq!(rest_opacity(&Island::collapsed()), 1.0);
+    }
+
+    #[test]
+    fn the_island_squashes_while_moving_only() {
+        let mut anim = Island::collapsed();
+        assert_eq!(anim.squash(), 0.0);
+        let t0 = Instant::now();
+        anim.set_target(true, t0);
+        anim.tick(t0 + Duration::from_millis(60));
+        assert!(anim.squash() > 2.0 && anim.squash() <= SQUASH);
+        anim.tick(t0 + Duration::from_millis(500));
+        assert!(anim.squash() < 0.3);
+        // Symmetric around the shared center.
+        let pill = D2D_RECT_F {
+            left: 100.0,
+            top: 20.0,
+            right: 300.0,
+            bottom: 64.0,
+        };
+        let strip = D2D_RECT_F {
+            left: 0.0,
+            top: 16.0,
+            right: 400.0,
+            bottom: 68.0,
+        };
+        let panel = morph_panel(&pill, &strip, 0.6, 3.0);
+        assert_eq!(panel.left + panel.right, 400.0);
+        assert_eq!(panel.top + panel.bottom, 84.0);
     }
 
     #[test]
@@ -777,7 +1008,12 @@ mod tests {
         assert!(l.clock.left >= l.status.right && l.clock.right < l.panel.right);
         // Centered on the screen, bottom edge on the pill's baseline, window holds it.
         assert!(((l.panel.left + l.panel.right) / 2.0 - 960.0).abs() <= 1.0);
-        assert_eq!(l.panel.bottom, strip - config.island_gap);
+        let pill = geometry(1920.0, strip, &config, false).pill;
+        assert_eq!(
+            l.panel.top + l.panel.bottom,
+            pill.top + pill.bottom,
+            "same center"
+        );
         assert!(l.window.left < l.panel.left && l.window.right > l.panel.right);
         assert_eq!(l.window.bottom, strip);
         assert!(l.window.top >= 0.0);
@@ -796,7 +1032,10 @@ mod tests {
         assert!(l.buttons.len() < 40 && !l.buttons.is_empty());
         assert!(l.panel.left >= 0.0 && l.panel.right <= 600.0);
         let top = strip_layout(1920.0, strip, &config, 24.0, 3, 0.0, true);
-        assert_eq!(top.panel.top, config.island_gap);
+        assert_eq!(
+            top.panel.top,
+            config.island_gap + (config.island_height - 52.0) / 2.0
+        );
         assert_eq!(top.window.top, 0.0);
     }
 
