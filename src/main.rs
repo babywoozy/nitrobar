@@ -39,6 +39,8 @@ mod status;
 mod taskbar;
 mod tasks;
 mod theme;
+mod tray;
+mod tray_panel;
 mod wallpaper;
 mod winpins;
 

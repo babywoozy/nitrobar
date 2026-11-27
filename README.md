@@ -23,8 +23,10 @@ Nhẹ (~9 MB RAM riêng, file exe ~0,5 MB), chạy hoàn toàn theo sự kiện 
     ngắn dưới app đang mở, vạch dài màu nhấn dưới app đang active, chấm mờ dưới app đã thu nhỏ hết
     cửa sổ, nền cam khi app cần chú ý. Chỉ icon đang có chuột phóng to nhẹ (1,2 lần), các icon khác giữ nguyên. Wifi / âm lượng
     / pin / đồng hồ nằm cuối dải, ngăn cách bằng một vạch mờ. Rời chuột ra là thu về viên ngay.
-    Nút `^` trong dải: hiện tạm taskbar gốc để dùng icon khay hệ thống (bộ gõ, định vị, app chạy nền).
-    Bấm ra chỗ khác là nó ẩn lại.
+    Nút `^` trong dải: mở bảng nhỏ chứa icon khay của các app chạy nền (bộ gõ, Windows Security…),
+    rê chuột để xem tên, bấm trái / bấm phải như trên taskbar; taskbar gốc không hiện lên. Không có
+    chỉ báo riêng của Windows (định vị, mic) và app chạy quyền admin; app nào không hiện icon thì
+    khởi động lại app đó.
   - Bấm icon trên dải: app đang thu nhỏ thì cửa sổ tỏa ra từ đúng icon đó (khối tròn đen cỡ icon lớn
     dần, sáng dần thành cửa sổ thật) rồi dải thu lại; app đang active thì cửa sổ co ngược vào đúng
     icon và viên nảy lên với icon app; app đang mở nhưng ở sau thì được đưa lên trước và icon nảy
@@ -143,7 +145,7 @@ ghim thêm trong nitrobar. nitrobar không sửa danh sách ghim của Windows; 
 - [x] Thiết kế island kiểu Dynamic Island: viên nghỉ (icon app + giờ), dải icon khi hover (zoom kiểu
   dock), bấm icon (tỏa ra / co vào icon, nhảy icon, xem trước nhiều cửa sổ)
 
-Chưa có: khay hệ thống (icon app chạy nền), nhiều màn hình (thanh chỉ ở màn hình chính). Ở chế độ
+Chưa có: khay hệ thống ở chế độ full, nhiều màn hình (thanh chỉ ở màn hình chính). Ở chế độ
 island, `background` và `[colors]` không áp dụng (dùng `island_style`); chúng chỉ dùng cho chế độ `full`. Hiệu ứng
 thu nhỏ: góc bo của ảnh cửa sổ hơi răng cưa (DWM không cho bo góc thumbnail, phải cắt bằng region),
 cửa sổ biến mất ~1-2 khung hình trước khi hiệu ứng bắt đầu, và khi khôi phục có thể thấy một khung

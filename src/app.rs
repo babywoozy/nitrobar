@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use windows::Win32::Foundation::{
-    GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
+    GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Gdi::{
@@ -74,6 +74,8 @@ use crate::tasks::AppId;
 use crate::tasks::{self, TaskList};
 use crate::theme::Palette;
 use crate::theme::{self, Theme};
+use crate::tray;
+use crate::tray_panel::{self, TrayPanel};
 use crate::wallpaper;
 use crate::{appbar, clock, layout, menu, safety, shell, taskbar, winpins};
 
@@ -122,13 +124,6 @@ const TIMER_ZZZ: usize = 6;
 /// Equalizer frames, only while music plays and the pill is on screen.
 const TIMER_BARS: usize = 7;
 const BARS_FRAME_MS: u32 = 33;
-/// While the native taskbar is up for its tray icons: how often to see whether it
-/// is still in use (nothing reports the pointer leaving another process's window),
-/// how long it stays at least, and how long after the last use it goes.
-const TIMER_TRAY: usize = 8;
-const TRAY_CHECK_MS: u32 = 300;
-const TRAY_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
-const TRAY_LEAVE: std::time::Duration = std::time::Duration::from_millis(900);
 /// Collapse delay while window previews are open, and how often a blocked
 /// collapse (menu, Start, drag) is checked again.
 const PREVIEW_GRACE_MS: u32 = 500;
@@ -205,7 +200,8 @@ struct App {
     /// The foreground window is a fullscreen app on our monitor (backup for
     /// ABN_FULLSCREENAPP, which island mode may not get without reserved space).
     foreground_fullscreen: bool,
-    tray_peek: Option<TrayPeek>,
+    tray_view: Option<TrayView>,
+    tray_hover: bool,
     /// Primary monitor and the full bar strip on it, in screen pixels.
     monitor_rect: RECT,
     bar_rect: RECT,
@@ -253,10 +249,11 @@ struct App {
     own_restore: Option<(HWND, Instant)>,
 }
 
-/// The native taskbar shown for its tray icons; the island is hidden meanwhile.
-struct TrayPeek {
-    opened: Instant,
-    used: Instant,
+/// The open tray panel: the icons it shows and the one under the pointer.
+struct TrayView {
+    panel: TrayPanel,
+    icons: Vec<tray::TrayIcon>,
+    hover: Option<usize>,
 }
 
 /// The resting pill's left side: the active app's small icon (`None`: the
@@ -435,7 +432,8 @@ fn run_window(options: Options) -> Result<()> {
             menu_open: false,
             flyout_open: false,
             foreground_fullscreen: false,
-            tray_peek: None,
+            tray_view: None,
+            tray_hover: false,
             monitor_rect: RECT::default(),
             bar_rect: RECT::default(),
             origin: (0.0, 0.0),
@@ -582,6 +580,8 @@ fn on_busy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         || msg == WM_APP_CONFIG
         || msg == WM_APP_PINS
         || msg == preview::WM_APP_PREVIEW
+        || msg == tray_panel::WM_APP_PANEL
+        || msg == tray::WM_APP_TRAY
         || msg == island::WM_APP_EDGE
         || msg == tasks::WM_APP_REFRESH
         || msg == status::WM_APP_STATUS
@@ -811,7 +811,8 @@ impl App {
                 self.invalidate();
             }
             WM_TIMER if wparam.0 == TIMER_BARS => self.on_bars_timer(),
-            WM_TIMER if wparam.0 == TIMER_TRAY => self.on_tray_timer(),
+            tray::WM_APP_TRAY => self.refresh_tray(),
+            tray_panel::WM_APP_PANEL => self.on_tray_panel(wparam.0, lparam.0),
             wallpaper::WM_APP_WALLPAPER => {
                 let c = lparam.0 as u32;
                 self.wallpaper_color = Some(D2D1_COLOR_F {
@@ -1213,8 +1214,12 @@ impl App {
 
     fn apply_native_taskbar(&mut self) {
         let wanted = self.wants_native_hidden();
-        if !wanted || self.island.is_none() {
-            self.close_tray();
+        // The icons are collected while the island stands in for the taskbar.
+        if wanted && self.island.is_some() {
+            tray::start(self.hwnd);
+        } else {
+            self.close_preview();
+            tray::stop();
         }
         if wanted && !self.native_hidden {
             taskbar::hide();
@@ -1419,14 +1424,14 @@ impl App {
                 _ => {}
             },
             Some(Hit::Status) => shell::open_quick_settings(),
-            Some(Hit::Tray) => self.open_tray(),
+            Some(Hit::Tray) => self.toggle_tray(),
             Some(Hit::Clock) => shell::open_notification_center(),
             None => {}
         }
     }
 
     fn on_explorer_restarted(&mut self) {
-        self.close_tray();
+        tray::refresh();
         // Explorer forgets appbars when it restarts.
         appbar::unregister(self.hwnd);
         appbar::register(self.hwnd);
@@ -2025,7 +2030,7 @@ impl App {
             self.kill_timer(TIMER_EXPAND);
             if expanded {
                 let mut delay = self.config.bar.collapse_delay_ms;
-                if self.preview.is_some() {
+                if self.preview.is_some() || self.tray_view.is_some() {
                     // Time to cross the gap from the icon to the window previews.
                     delay = delay.max(PREVIEW_GRACE_MS);
                 }
@@ -2042,6 +2047,7 @@ impl App {
             || self.flyout_open
             || self.pressed.is_some()
             || self.preview_hover
+            || self.tray_hover
             || dragging
     }
 
@@ -2073,7 +2079,7 @@ impl App {
             self.foreground_fullscreen,
             self.flyout_open
         );
-        if self.tray_peek.is_some() || (self.fullscreen() && !self.flyout_open) {
+        if self.fullscreen() && !self.flyout_open {
             return;
         }
         let Some(state) = &mut self.island else {
@@ -2177,6 +2183,8 @@ impl App {
     fn close_preview(&mut self) {
         self.preview = None;
         self.preview_hover = false;
+        self.tray_view = None;
+        self.tray_hover = false;
     }
 
     /// Shows (or hides) the window previews of the app at strip button `index`.
@@ -2652,57 +2660,127 @@ impl App {
         }
     }
 
-    /// Over fullscreen apps, and while the native taskbar is up.
+    /// Over fullscreen apps.
     fn island_hidden(&self) -> bool {
-        self.fullscreen_app || self.foreground_fullscreen || self.tray_peek.is_some()
+        self.fullscreen_app || self.foreground_fullscreen
     }
 
-    // ----- the native tray -----
+    // ----- the tray panel -----
 
-    /// Shows the native taskbar so its tray icons can be used.
-    fn open_tray(&mut self) {
-        if self.island.is_none() || !self.native_hidden {
+    /// Opens (or closes) the panel with the apps' tray icons above the "^".
+    fn toggle_tray(&mut self) {
+        let open = self.tray_view.is_some();
+        self.close_preview();
+        if open {
             return;
         }
-        self.close_preview();
-        let now = Instant::now();
-        self.tray_peek = Some(TrayPeek {
-            opened: now,
-            used: now,
-        });
-        self.hover = None;
-        self.pressed = None;
-        self.reset_island();
-        // The island would sit on top of the taskbar: out of the way.
-        self.place_island();
-        taskbar::peek();
-        shell::focus_tray();
-        self.set_timer(TIMER_TRAY, TRAY_CHECK_MS);
-    }
-
-    fn on_tray_timer(&mut self) {
-        let now = Instant::now();
-        let Some(peek) = &mut self.tray_peek else {
-            self.kill_timer(TIMER_TRAY);
+        let Some(panel) = TrayPanel::new(self.hwnd) else {
             return;
         };
-        if island::tray_in_use() {
-            peek.used = now;
-        } else if now.duration_since(peek.opened) >= TRAY_GRACE
-            && now.duration_since(peek.used) >= TRAY_LEAVE
-        {
-            self.close_tray();
+        self.tray_view = Some(TrayView {
+            panel,
+            icons: tray::icons(),
+            hover: None,
+        });
+        self.draw_tray_panel();
+    }
+
+    fn refresh_tray(&mut self) {
+        // Reading also re-arms the change notification.
+        let icons = tray::icons();
+        if let Some(view) = &mut self.tray_view {
+            view.icons = icons;
+            self.draw_tray_panel();
         }
     }
 
-    /// Hides the native taskbar again and brings the island back.
-    fn close_tray(&mut self) {
-        if self.tray_peek.take().is_none() {
+    /// Draws the panel and places it above (or below) the strip, centered on "^".
+    fn draw_tray_panel(&mut self) {
+        let strip = self.strip();
+        let scale = self.dpi as f32 / 96.0;
+        let (Some(view), Some(renderer)) = (&mut self.tray_view, &self.renderer) else {
             return;
+        };
+        let layout = tray_panel::layout(view.icons.len());
+        let Some((width, height, pixels)) =
+            renderer.tray_panel(&layout, &view.icons, view.hover, REST_FILL, scale)
+        else {
+            return;
+        };
+        let (bar, monitor) = (self.bar_rect, self.monitor_rect);
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let anchor = bar.left + px((strip.tray.left + strip.tray.right) / 2.0);
+        let shadow = px(tray_panel::SHADOW);
+        let gap = px(8.0);
+        let x = (anchor - width as i32 / 2)
+            .min(monitor.right - width as i32)
+            .max(monitor.left);
+        let y = if self.metrics.at_top {
+            bar.top + px(strip.panel.bottom) + gap - shadow
+        } else {
+            bar.top + px(strip.panel.top) - gap - height as i32 + shadow
+        };
+        let cells = layout
+            .cells
+            .iter()
+            .map(|c| RECT {
+                left: px(c.left),
+                top: px(c.top),
+                right: px(c.right),
+                bottom: px(c.bottom),
+            })
+            .collect();
+        let size = SIZE {
+            cx: width as i32,
+            cy: height as i32,
+        };
+        view.panel.present(POINT { x, y }, size, &pixels, cells);
+    }
+
+    fn on_tray_panel(&mut self, what: usize, value: isize) {
+        let index = usize::try_from(value).ok();
+        match what {
+            tray_panel::ENTER => {
+                self.tray_hover = true;
+                self.kill_timer(TIMER_COLLAPSE);
+            }
+            tray_panel::LEAVE => {
+                self.tray_hover = false;
+                if self.tray_view.is_some() && !self.cursor_inside() {
+                    self.island_pointer(false);
+                }
+            }
+            tray_panel::HOVER => {
+                if let Some(view) = &mut self.tray_view {
+                    view.hover = index;
+                    self.draw_tray_panel();
+                }
+            }
+            tray_panel::LEFT | tray_panel::DOUBLE | tray_panel::RIGHT => {
+                let click = match what {
+                    tray_panel::LEFT => tray::Click::Left,
+                    tray_panel::RIGHT => tray::Click::Right,
+                    _ => tray::Click::Double,
+                };
+                let icon = self
+                    .tray_view
+                    .as_ref()
+                    .zip(index)
+                    .and_then(|(view, i)| view.icons.get(i).cloned());
+                if let Some(icon) = icon {
+                    let mut at = POINT::default();
+                    unsafe {
+                        let _ = GetCursorPos(&raw mut at);
+                    }
+                    tray::click(&icon, click, at);
+                    if click == tray::Click::Right {
+                        // The app's menu takes over; the panel and strip leave.
+                        self.collapse_after_click();
+                    }
+                }
+            }
+            _ => {}
         }
-        self.kill_timer(TIMER_TRAY);
-        taskbar::end_peek();
-        self.place_island();
     }
 
     /// Foreground changed: Windows flyouts keep the bar open (Win opens Start, so

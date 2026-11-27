@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow,
@@ -19,13 +19,12 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GA_ROOT, GWL_STYLE, GWLP_USERDATA,
-    GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowLongW, GetWindowRect, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, IsZoomed, LWA_ALPHA,
-    LoadCursorW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_MOUSEMOVE,
-    WNDCLASSEXW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WindowFromPoint,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GWLP_USERDATA, GetClassNameW,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IDC_ARROW,
+    IsZoomed, LWA_ALPHA, LoadCursorW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WM_APP, WM_MOUSEMOVE, WNDCLASSEXW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -715,37 +714,6 @@ pub fn strip_layout(
         status,
         clock,
     }
-}
-
-/// Whether the native taskbar, brought up for its tray icons, is still in use:
-/// the pointer is on it or on its overflow panel, one of them or a Windows flyout
-/// has the focus, or a menu is open.
-pub fn tray_in_use() -> bool {
-    unsafe {
-        let mut at = POINT::default();
-        if GetCursorPos(&raw mut at).is_ok()
-            && is_tray_window(GetAncestor(WindowFromPoint(at), GA_ROOT))
-        {
-            return true;
-        }
-        let foreground = GetForegroundWindow();
-        if is_tray_window(foreground) || is_shell_flyout(foreground) {
-            return true;
-        }
-        FindWindowW(w!("#32768"), PCWSTR::null()).is_ok_and(|menu| IsWindowVisible(menu).as_bool())
-    }
-}
-
-fn is_tray_window(hwnd: HWND) -> bool {
-    let mut class = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
-    let class = String::from_utf16_lossy(&class[..len]);
-    [
-        "Shell_TrayWnd",
-        "TopLevelWindowForOverflowXamlIsland",
-        "NotifyIconOverflowWindow",
-    ]
-    .contains(&class.as_str())
 }
 
 /// Whether `hwnd` is the bare desktop.

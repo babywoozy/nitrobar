@@ -79,9 +79,9 @@ fn cover(wic: &IWICImagingFactory, size: u32) -> Icon {
 }
 
 /// Writes premultiplied BGRA composed over a flat background, magnified.
-fn write_bmp(path: &std::path::Path, pixels: &[u8], w: usize, h: usize) {
+fn write_bmp(path: &std::path::Path, pixels: &[u8], w: usize, h: usize, zoom: usize) {
     let background = [232.0f32, 190.0, 160.0]; // BGR
-    let (zw, zh) = (w * ZOOM, h * ZOOM);
+    let (zw, zh) = (w * zoom, h * zoom);
     let mut out = Vec::with_capacity(54 + zw * zh * 4);
     out.extend(b"BM");
     out.extend(((54 + zw * zh * 4) as u32).to_le_bytes());
@@ -95,7 +95,7 @@ fn write_bmp(path: &std::path::Path, pixels: &[u8], w: usize, h: usize) {
     out.extend([0u8; 24]);
     for y in 0..zh {
         for x in 0..zw {
-            let p = &pixels[((y / ZOOM) * w + x / ZOOM) * 4..][..4];
+            let p = &pixels[((y / zoom) * w + x / zoom) * 4..][..4];
             let keep = 1.0 - f32::from(p[3]) / 255.0;
             for c in 0..3 {
                 out.push((f32::from(p[c]) + background[c] * keep).min(255.0) as u8);
@@ -167,6 +167,7 @@ fn shot(
             &pixels,
             w as usize,
             h as usize,
+            ZOOM,
         );
     }
 }
@@ -338,6 +339,52 @@ fn render_island_states() {
             rest.apps = vec![(icon, Reveal::SHOWN)];
         }
         shot(&renderer, &wic, &base(view), (232, 70), "rest-app");
+    }
+
+    // The tray panel, with app icons standing in for tray icons.
+    {
+        let loader = crate::icons::IconLoader::new().unwrap();
+        let icons: Vec<_> = [
+            "Chrome",
+            "Microsoft.Windows.Explorer",
+            "Claude_pzs8sxrjxfjjc!Claude",
+        ]
+        .iter()
+        .filter_map(|aumid| {
+            let app = crate::tasks::AppId {
+                aumid: Some((*aumid).to_string()),
+                exe: None,
+            };
+            let icon = loader.load_app(&app, None, 16)?;
+            let (mut w, mut h) = (0, 0);
+            unsafe { icon.small.GetSize(&mut w, &mut h) }.ok()?;
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            unsafe { icon.small.CopyPixels(std::ptr::null(), w * 4, &mut pixels) }.ok()?;
+            Some(crate::tray::TrayIcon::sample(w, h, pixels, aumid))
+        })
+        .collect();
+        let layout = crate::tray_panel::layout(icons.len());
+        let (w, h, pixels) = renderer
+            .tray_panel(
+                &layout,
+                &icons,
+                Some(1),
+                D2D1_COLOR_F {
+                    r: 0.027,
+                    g: 0.027,
+                    b: 0.031,
+                    a: 1.0,
+                },
+                5.0,
+            )
+            .unwrap();
+        write_bmp(
+            &std::path::PathBuf::from(std::env::var("NB_SHOTS").unwrap()).join("tray.bmp"),
+            &pixels,
+            w as usize,
+            h as usize,
+            1,
+        );
     }
 
     // The expanded strip with five apps.

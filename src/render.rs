@@ -1670,3 +1670,4 @@ impl Renderer {
 
 #[cfg(test)]
 mod offscreen;
+mod tray;

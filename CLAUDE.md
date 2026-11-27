@@ -62,6 +62,8 @@ src/
               flyout, fullscreen
   morph.rs    hiệu ứng thu nhỏ / khôi phục: overlay + DWM thumbnail, đồng hồ khung hình (DwmFlush)
   preview.rs  xem trước các cửa sổ của một app (popup GDI + DWM thumbnail)
+  tray.rs     nhận icon khay (cửa sổ Shell_TrayWnd đứng trước Explorer), bấm icon
+  tray_panel.rs  bảng icon khay (cửa sổ layered); render/tray.rs vẽ nó
   glass.rs    blur phía sau viên (Windows.UI.Composition)
   wallpaper.rs  màu chủ đạo của hình nền (luồng nền)
   media.rs    bài đang phát (SMTC, luồng riêng), ảnh bìa tròn, độ to âm thanh, cột sóng
@@ -342,17 +344,28 @@ src/
   trước thì 500 ms (đủ đi qua khe tới panel); bị chặn (menu, Start, kéo) thì kiểm tra lại mỗi
   >= 300 ms (không chạy nhịp 60 ms).
 
-### Icon khay hệ thống: nút "^" trong dải
+### Icon khay hệ thống (tray.rs, tray_panel.rs, render/tray.rs)
 
-- Island ẩn taskbar gốc nên icon khay biến mất theo. Người dùng chọn cách: nút "^" (`Hit::Tray`, sau
-  vạch ngăn, như một glyph trạng thái) => `App::open_tray`: ẩn island (`island_hidden`),
-  `taskbar::peek` (hiện taskbar chính, vẫn auto-hide nên không cửa sổ nào bị đổi cỡ; hook ẩn lại tạm
-  ngưng) rồi `shell::focus_tray` (Win+B, thanh auto-hide trượt lên).
-- Đóng: `TIMER_TRAY` 300 ms (CHỈ khi đang mở; Windows không báo con trỏ rời cửa sổ process khác).
-  Còn dùng (`island::tray_in_use`: con trỏ trên taskbar / bảng overflow, một trong hai hoặc flyout
-  đang focus, hoặc menu mở) thì giữ; ít nhất 3 s, rời 900 ms thì ẩn lại. Sau Win+B taskbar giữ focus
-  nên nó ở lại tới khi người dùng bấm chỗ khác. Đã thử trên màn hình: bấm -> taskbar hiện, con trỏ đi
-  xa vẫn ở, đổi focus -> ẩn, island trở lại.
+- Người dùng KHÔNG muốn taskbar gốc hiện lên (bản đầu cho nút "^" hiện taskbar: đã bỏ) => nitrobar tự
+  vẽ icon khay.
+- `tray.rs`: thread `nitrobar-tray` giữ một cửa sổ class `Shell_TrayWnd` (không bao giờ hiện) đứng
+  TRƯỚC cửa sổ của Explorer => `Shell_NotifyIcon` gửi `WM_COPYDATA` (dwData 1) vào đó. Đọc rồi CHUYỂN
+  TIẾP NGUYÊN VẸN mọi `WM_COPYDATA` (cả appbar), `WM_COMMAND`, `WM_USER..WM_APP` cho taskbar thật,
+  trả đúng kết quả => Explorer vẫn biết đủ, thoát / crash không mất gì. Struct trên dây dùng handle
+  32 bit. Sau khi tạo cửa sổ thì post `TaskbarCreated` cho cửa sổ của process khác (không tự nhận).
+  Giữ vị trí đầu bằng hook foreground + show/reorder của process Explorer (không polling).
+- MỌI chỗ cần taskbar THẬT phải dùng `tray::real_taskbar()` (cửa sổ có con `TrayNotifyWnd`), không
+  dùng `FindWindowW("Shell_TrayWnd")` (sẽ ra cửa sổ giả, kể cả của instance khác khi
+  `--restore-taskbar`). Script test cũng vậy. Đã đo: ẩn / trả taskbar vẫn đúng khi tray chạy.
+- Chỉ chạy khi island đứng thay taskbar (`apply_native_taskbar`). Lọc icon loa / mạng / pin của
+  Windows (GUID `7820AE7x-...`). Không lấy được: chỉ báo riêng của Windows (định vị, mic), app chạy
+  quyền admin (UIPI chặn broadcast), app không nghe `TaskbarCreated` (cần khởi động lại app).
+- Bấm: post callback cho app theo version (>=3 thêm `NIN_SELECT` / `WM_CONTEXTMENU`; >3 gói toạ độ +
+  id), kèm `AllowSetForegroundWindow`. Chuột phải thì đóng bảng + thu dải; trái thì giữ bảng (còn
+  double click). CHƯA thử bấm icon thật để mở menu.
+- Bảng: cửa sổ layered (`UpdateLayeredWindow`), ảnh do `Renderer::tray_panel` vẽ vào bitmap WIC; chuột
+  báo về thanh qua `WM_APP_PANEL`; giữ dải mở qua `tray_hover`; `close_preview` đóng cả bảng.
+- Đo (release): nghỉ 15.1-15.5 MB, sau khi mở bảng / dải 18.7-20.1 MB (CHẠM ngân sách 20 MB, cần giảm).
 
 ### Mở app
 
