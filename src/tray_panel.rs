@@ -35,13 +35,15 @@ pub const RIGHT: usize = 5;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const CLASS: PCWSTR = w!("NitrobarTrayPanel");
 
-// Sizes in DIPs.
-pub const CELL: f32 = 36.0;
-const PAD: f32 = 10.0;
-/// Room around the panel for its shadow.
+// Sizes in DIPs, as compact as Windows' own overflow panel.
+pub const CELL: f32 = 40.0;
+const PAD: f32 = 4.0;
+/// Room around the boxes for their shadows.
 pub const SHADOW: f32 = 12.0;
-const CAPTION: f32 = 20.0;
-const MIN_WIDTH: f32 = 168.0;
+const TIP_HEIGHT: f32 = 30.0;
+const TIP_GAP: f32 = 6.0;
+const TIP_PADDING: f32 = 10.0;
+const TIP_MAX: f32 = 360.0;
 const MAX_COLUMNS: usize = 5;
 
 /// Where everything is, in DIPs from the window's top left.
@@ -50,46 +52,68 @@ pub struct PanelLayout {
     pub size: (f32, f32),
     pub panel: D2D_RECT_F,
     pub cells: Vec<D2D_RECT_F>,
-    /// The line naming the icon under the pointer.
-    pub caption: D2D_RECT_F,
+    /// The small box naming the icon under the pointer, beyond the panel (away
+    /// from the strip).
+    pub tip: Option<D2D_RECT_F>,
 }
 
-pub fn layout(icons: usize) -> PanelLayout {
+/// A panel for `icons` icons. `tip`: the cell a name belongs to and the width of
+/// its text. `below`: the name goes under the panel (bar at the top).
+pub fn layout(icons: usize, tip: Option<(usize, f32)>, below: bool) -> PanelLayout {
     let columns = icons.clamp(1, MAX_COLUMNS);
     let rows = icons.max(1).div_ceil(columns);
-    let width = (columns as f32 * CELL + 2.0 * PAD).max(MIN_WIDTH);
-    let height = rows as f32 * CELL + CAPTION + 2.0 * PAD - 4.0;
+    let width = columns as f32 * CELL + 2.0 * PAD;
+    let height = rows as f32 * CELL + 2.0 * PAD;
+    // The room for the name is always there, so the panel never moves up or down.
+    let top = SHADOW + if below { 0.0 } else { TIP_HEIGHT + TIP_GAP };
+    // Horizontally, relative to the panel's left edge first.
+    let named = tip.map(|(cell, text)| {
+        let w = (text + 2.0 * TIP_PADDING).min(TIP_MAX).ceil();
+        let middle = PAD + ((cell % columns) as f32 + 0.5) * CELL;
+        ((middle - w / 2.0).round(), w)
+    });
+    let leftmost = named.map_or(0.0, |(x, _)| x.min(0.0));
+    let rightmost = named.map_or(width, |(x, w)| (x + w).max(width));
+    let left = SHADOW - leftmost;
     let panel = D2D_RECT_F {
-        left: SHADOW,
-        top: SHADOW,
-        right: SHADOW + width,
-        bottom: SHADOW + height,
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
     };
-    // The grid is centered in the panel.
-    let first = panel.left + (width - columns as f32 * CELL) / 2.0;
     let cells = (0..icons)
         .map(|i| {
-            let left = first + (i % columns) as f32 * CELL;
-            let top = panel.top + PAD + (i / columns) as f32 * CELL;
+            let x = panel.left + PAD + (i % columns) as f32 * CELL;
+            let y = panel.top + PAD + (i / columns) as f32 * CELL;
             D2D_RECT_F {
-                left,
-                top,
-                right: left + CELL,
-                bottom: top + CELL,
+                left: x,
+                top: y,
+                right: x + CELL,
+                bottom: y + CELL,
             }
         })
         .collect();
-    let top = panel.top + PAD + rows as f32 * CELL;
+    let tip = named.map(|(x, w)| {
+        let y = if below {
+            panel.bottom + TIP_GAP
+        } else {
+            panel.top - TIP_GAP - TIP_HEIGHT
+        };
+        D2D_RECT_F {
+            left: left + x,
+            top: y,
+            right: left + x + w,
+            bottom: y + TIP_HEIGHT,
+        }
+    });
     PanelLayout {
-        size: (width + 2.0 * SHADOW, height + 2.0 * SHADOW),
+        size: (
+            rightmost - leftmost + 2.0 * SHADOW,
+            height + TIP_HEIGHT + TIP_GAP + 2.0 * SHADOW,
+        ),
         panel,
         cells,
-        caption: D2D_RECT_F {
-            left: panel.left + PAD,
-            top,
-            right: panel.right - PAD,
-            bottom: top + CAPTION - 4.0,
-        },
+        tip,
     }
 }
 
@@ -283,19 +307,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icons_form_a_centered_grid() {
-        let one = layout(1);
-        let mid = |r: &D2D_RECT_F| (r.left + r.right) / 2.0;
-        assert_eq!(mid(&one.cells[0]), mid(&one.panel));
-        let many = layout(7);
-        assert_eq!(many.cells.len(), 7);
+    fn compact_grid_with_the_name_above() {
+        let two = layout(2, None, false);
+        assert_eq!(two.panel.right - two.panel.left, 2.0 * CELL + 2.0 * PAD);
+        assert_eq!(two.panel.bottom - two.panel.top, CELL + 2.0 * PAD);
+        assert!(two.tip.is_none());
+        // A long name widens the window, not the panel, which keeps its height.
+        let named = layout(2, Some((1, 200.0)), false);
+        let tip = named.tip.unwrap();
+        assert!(tip.bottom < named.panel.top && tip.left >= SHADOW);
+        assert!(tip.right <= named.size.0 - SHADOW);
+        assert_eq!(named.panel.top, two.panel.top);
+        let cell = named.cells[1];
+        assert_eq!(tip.left + tip.right, cell.left + cell.right);
+        let many = layout(7, Some((6, 40.0)), true);
         assert_eq!(many.cells[5].top, many.cells[0].bottom);
-        for c in &many.cells {
-            assert!(c.left >= many.panel.left && c.right <= many.panel.right);
-            assert!(c.bottom <= many.caption.top);
-        }
-        assert!(many.caption.bottom <= many.panel.bottom);
-        // Empty: still a panel, with room for its message.
-        assert!(layout(0).cells.is_empty() && layout(0).size.0 >= MIN_WIDTH);
+        assert!(many.tip.unwrap().top > many.panel.bottom);
+        // Empty: still a panel, one cell large.
+        assert!(layout(0, None, false).cells.is_empty());
     }
 }

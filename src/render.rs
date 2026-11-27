@@ -1671,3 +1671,4 @@ impl Renderer {
 #[cfg(test)]
 mod offscreen;
 mod tray;
+pub use tray::tray_name;

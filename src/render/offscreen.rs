@@ -355,7 +355,7 @@ fn render_island_states() {
                 aumid: Some((*aumid).to_string()),
                 exe: None,
             };
-            let icon = loader.load_app(&app, None, 16)?;
+            let icon = loader.load_app(&app, None, 58)?;
             let (mut w, mut h) = (0, 0);
             unsafe { icon.small.GetSize(&mut w, &mut h) }.ok()?;
             let mut pixels = vec![0u8; (w * h * 4) as usize];
@@ -363,20 +363,19 @@ fn render_island_states() {
             Some(crate::tray::TrayIcon::sample(w, h, pixels, aumid))
         })
         .collect();
-        let layout = crate::tray_panel::layout(icons.len());
+        let name: Vec<u16> = "Windows Security - Actions recommended."
+            .encode_utf16()
+            .collect();
+        let tip = Some((1, renderer.tray_name_width(&name)));
+        let layout = crate::tray_panel::layout(icons.len(), tip, false);
+        let fill = D2D1_COLOR_F {
+            r: 0.11,
+            g: 0.11,
+            b: 0.118,
+            a: 1.0,
+        };
         let (w, h, pixels) = renderer
-            .tray_panel(
-                &layout,
-                &icons,
-                Some(1),
-                D2D1_COLOR_F {
-                    r: 0.027,
-                    g: 0.027,
-                    b: 0.031,
-                    a: 1.0,
-                },
-                5.0,
-            )
+            .tray_panel(&layout, &icons, Some(1), &name, fill, 3.0)
             .unwrap();
         write_bmp(
             &std::path::PathBuf::from(std::env::var("NB_SHOTS").unwrap()).join("tray.bmp"),

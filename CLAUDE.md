@@ -363,6 +363,9 @@ src/
 - Bấm: post callback cho app theo version (>=3 thêm `NIN_SELECT` / `WM_CONTEXTMENU`; >3 gói toạ độ +
   id), kèm `AllowSetForegroundWindow`. Chuột phải thì đóng bảng + thu dải; trái thì giữ bảng (còn
   double click). CHƯA thử bấm icon thật để mở menu.
+- Giao diện theo yêu cầu người dùng (giống bảng overflow của Windows): hộp gọn, ô 40 DIP, lề 4, góc
+  10, viền mờ 1 px; KHÔNG chữ trong bảng; tên icon (dòng đầu tooltip) nằm trong hộp nhỏ riêng PHÍA
+  TRÊN, giữa ô đang hover. Cửa sổ rộng ra theo tên, bảng đứng yên (neo theo tâm bảng).
 - Bảng: cửa sổ layered (`UpdateLayeredWindow`), ảnh do `Renderer::tray_panel` vẽ vào bitmap WIC; chuột
   báo về thanh qua `WM_APP_PANEL`; giữ dải mở qua `tray_hover`; `close_preview` đóng cả bảng.
 - Đo (release): nghỉ 15.1-15.5 MB, sau khi mở bảng / dải 18.7-20.1 MB (CHẠM ngân sách 20 MB, cần giảm).

@@ -68,7 +68,7 @@ use crate::morph::{self, Morph};
 use crate::pins::{self, Pins};
 use crate::preview::{self, Preview};
 use crate::render::{Badge, IslandView, MascotView, MusicView, RestView};
-use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene};
+use crate::render::{ButtonState, ButtonView, Pointer, Renderer, Scene, tray_name};
 use crate::status::{self, Status};
 use crate::tasks::AppId;
 use crate::tasks::{self, TaskList};
@@ -98,6 +98,13 @@ const OWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(2)
 /// Dock-like zoom of the icon under the pointer, and how fast it follows (s).
 const ZOOM_MAX: f32 = 0.20;
 const ZOOM_EASE: f32 = 0.05;
+/// The tray panel and its name box: a shade lighter than the island.
+const TRAY_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.11,
+    g: 0.11,
+    b: 0.118,
+    a: 1.0,
+};
 /// The resting pill: black like the Dynamic Island, with a faint hairline.
 const REST_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 0.027,
@@ -2701,24 +2708,36 @@ impl App {
         let (Some(view), Some(renderer)) = (&mut self.tray_view, &self.renderer) else {
             return;
         };
-        let layout = tray_panel::layout(view.icons.len());
+        let below = self.metrics.at_top;
+        // The name of the icon under the pointer (or that there are none).
+        let none: Vec<u16> = "Chưa có icon nào".encode_utf16().collect();
+        let (named, name) = if view.icons.is_empty() {
+            (Some(0), &none[..])
+        } else {
+            let icon = view.hover.and_then(|i| view.icons.get(i));
+            (view.hover, icon.map_or(&[][..], tray_name))
+        };
+        let tip = named
+            .filter(|_| !name.is_empty())
+            .map(|i| (i, renderer.tray_name_width(name)));
+        let layout = tray_panel::layout(view.icons.len(), tip, below);
         let Some((width, height, pixels)) =
-            renderer.tray_panel(&layout, &view.icons, view.hover, REST_FILL, scale)
+            renderer.tray_panel(&layout, &view.icons, view.hover, name, TRAY_FILL, scale)
         else {
             return;
         };
         let (bar, monitor) = (self.bar_rect, self.monitor_rect);
         let px = |dip: f32| (dip * scale).round() as i32;
+        // The panel (not the window, which the name may widen) stays on the "^".
         let anchor = bar.left + px((strip.tray.left + strip.tray.right) / 2.0);
-        let shadow = px(tray_panel::SHADOW);
         let gap = px(8.0);
-        let x = (anchor - width as i32 / 2)
+        let x = (anchor - px((layout.panel.left + layout.panel.right) / 2.0))
             .min(monitor.right - width as i32)
             .max(monitor.left);
-        let y = if self.metrics.at_top {
-            bar.top + px(strip.panel.bottom) + gap - shadow
+        let y = if below {
+            bar.top + px(strip.panel.bottom) + gap - px(layout.panel.top)
         } else {
-            bar.top + px(strip.panel.top) - gap - height as i32 + shadow
+            bar.top + px(strip.panel.top) - gap - px(layout.panel.bottom)
         };
         let cells = layout
             .cells
